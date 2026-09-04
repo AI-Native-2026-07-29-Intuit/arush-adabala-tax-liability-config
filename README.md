@@ -50,7 +50,18 @@ scripts/
 
 ## Four things that are deliberately not in `base/`
 
-**No `Namespace` object in `base/`.** The AppProject sets `clusterResourceWhitelist: []` — a full deny on every cluster-scoped kind. Argo CD classifies a resource as cluster- or namespace-scoped from the API server's discovery data, not from whether the manifest happens to carry a `namespace:` field, so a `Namespace` in the manifest set is rejected regardless of what `namespaceResourceWhitelist` says. The Applications carry `CreateNamespace=true` instead, which creates the destination namespace as part of the sync *operation* rather than as a managed resource.
+**No `Namespace` object in `base/`.** The AppProject sets `clusterResourceWhitelist: []` — a full deny on every cluster-scoped kind. Argo CD classifies a resource as cluster- or namespace-scoped from the API server's discovery data, not from whether the manifest happens to carry a `namespace:` field, so a `Namespace` in the manifest set is rejected regardless of what `namespaceResourceWhitelist` says.
+
+**And `CreateNamespace=true` does not rescue that — it is denied by the same list.** Argo CD implements the option by injecting a Namespace into the sync task list, and the injected resource is checked against `clusterResourceWhitelist` like any other. Measured with a scratch project carrying the identical `[]` deny, pointed at a namespace that did not exist:
+
+```
+Namespace  taxcalc-nsproof  SyncFailed  resource :Namespace is not permitted in project taxcalc-nsproof
+Phase: Failed
+$ kubectl get ns taxcalc-nsproof
+Error from server (NotFound): namespaces "taxcalc-nsproof" not found
+```
+
+So **namespaces here are strictly platform-provisioned**: a new environment must be added to `platform/00-namespaces.yaml` *before* it is added to the ApplicationSet's element list, or its first sync fails. `CreateNamespace=true` stays in the syncOptions because it is the correct setting the moment the project is granted the `Namespace` kind — but nothing depends on it today.
 
 **No `ResourceQuota` or `LimitRange` in `base/`.** Both are named in the AppProject's `namespaceResourceBlacklist`. A team that can edit its own quota does not have a quota.
 

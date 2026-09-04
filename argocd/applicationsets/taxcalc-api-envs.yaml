@@ -140,6 +140,11 @@ spec:
           # weekend syncWindow is the only thing gating prod today. See
           # taxcalc-api/GITOPS.md in the application repo.
         syncOptions:
+          # Inert under this project - clusterResourceWhitelist: [] refuses the
+          # Namespace Argo CD injects for it. A new env therefore needs its
+          # namespace added to platform/00-namespaces.yaml BEFORE it is added
+          # to the elements list above, or its first sync fails. See
+          # argocd/projects/taxcalc.yaml.
           - CreateNamespace=true
           - ServerSideApply=true
           - PrunePropagationPolicy=foreground

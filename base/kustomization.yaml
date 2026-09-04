@@ -11,10 +11,23 @@
 #   Namespace       - cluster-scoped. The AppProject sets
 #                     `clusterResourceWhitelist: []` (full deny), so an
 #                     Application in project `taxcalc` cannot create one.
-#                     The Applications carry `CreateNamespace=true` instead,
-#                     which is Argo CD creating the destination namespace as
-#                     part of the sync operation rather than as a managed
-#                     resource in the manifest set.
+#
+#                     AND `CreateNamespace=true` DOES NOT RESCUE THIS, which
+#                     was assumed and is false. Argo CD implements that option
+#                     by injecting a Namespace into the sync task list, and the
+#                     injected resource is checked against the SAME
+#                     clusterResourceWhitelist. Measured with a scratch project
+#                     carrying the identical `[]` deny, pointed at a namespace
+#                     that did not exist:
+#
+#                       Namespace  taxcalc-nsproof  SyncFailed
+#                         resource :Namespace is not permitted in project ...
+#                       Phase: Failed
+#
+#                     and the namespace was still absent afterwards. So
+#                     namespaces here are strictly platform-provisioned - see
+#                     platform/00-namespaces.yaml - and adding a fourth
+#                     environment means adding it there FIRST.
 #   ResourceQuota   - named in the AppProject's `namespaceResourceBlacklist`.
 #   LimitRange        Quota knobs are platform-team property: an app team that
 #                     can raise its own quota does not have a quota.

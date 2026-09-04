@@ -58,9 +58,23 @@ spec:
   #
   # This is also why base/ carries no Namespace object: Namespace is
   # cluster-scoped, so it is governed by THIS list and not by the
-  # namespaceResourceWhitelist below. The Applications create their
-  # destination namespaces with the `CreateNamespace=true` sync option
-  # instead. See base/kustomization.yaml and platform/00-namespaces.yaml.
+  # namespaceResourceWhitelist below.
+  #
+  # IT ALSO DISABLES `CreateNamespace=true`, which is not obvious and was
+  # assumed otherwise here until it was tested. Argo CD implements that sync
+  # option by injecting a Namespace into the sync task list, and that injected
+  # resource is checked against this very list - so under `[]` it is refused
+  # ("resource :Namespace is not permitted in project ...") and the sync fails
+  # rather than silently proceeding. Verified against a scratch project with
+  # the identical deny; the namespace was never created.
+  #
+  # The consequence is a real operational constraint, not a footnote:
+  # namespaces for this project are provisioned by the platform team via
+  # platform/00-namespaces.yaml, and a new environment must be added THERE
+  # before it is added to the ApplicationSet's element list. The syncOptions
+  # still carry CreateNamespace=true because it is the correct setting the
+  # moment this project is given `{group: "", kind: Namespace}` - but today it
+  # is inert, and no Application here depends on it.
   clusterResourceWhitelist: []
 
   # Namespace-scoped resources: only the kinds the W5 D3 manifests actually

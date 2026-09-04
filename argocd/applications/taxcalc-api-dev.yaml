@@ -56,7 +56,12 @@ spec:
       selfHeal:   true   # revert drift from a kubectl edit on the live cluster
       allowEmpty: false  # never sync an empty manifest set (deletes everything)
     syncOptions:
-      - CreateNamespace=true        # first sync creates taxcalc-dev if missing
+      # INERT UNDER THIS PROJECT, and kept deliberately. `clusterResourceWhitelist: []`
+      # refuses the Namespace that Argo CD injects for this option, so it
+      # cannot create taxcalc-dev; platform/00-namespaces.yaml does that.
+      # Tested, not assumed - see argocd/projects/taxcalc.yaml. Kept because it
+      # is the right setting the moment the project allows the Namespace kind.
+      - CreateNamespace=true
       - ServerSideApply=true        # avoids the 256 kB last-applied-config limit
       - PrunePropagationPolicy=foreground
       - PruneLast=true              # workloads pruned AFTER their dependencies

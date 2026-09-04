@@ -11,9 +11,13 @@
 # look correct in the dashboard and still fail closed (or open) at the moment
 # it matters.
 #
-# Six checks. Five are DENY paths - each creates a deliberately-illegal
-# Application and asserts the specific refusal - and the sixth is the positive
-# control that stops this script from passing by refusing everything:
+# Nine checks. Five are DENY paths - each creates a deliberately-illegal
+# Application and asserts the specific refusal. The sixth is the positive
+# control that stops this script from passing by refusing everything. The last
+# three are static and run offline: they assert that nobody has put a denied
+# kind back into base/, which is the mistake most likely to be made in good
+# faith, since this deliverable's own reference layout puts 00-namespace.yaml
+# there.
 #
 #   1  destination        namespace not in `destinations`          -> denied
 #   2  sourceRepos        a repo not on the allow-list             -> denied
@@ -22,6 +26,7 @@
 #   4  namespaceBlacklist ResourceQuota                            -> denied
 #   5  namespaceBlacklist LimitRange                               -> denied
 #   6  POSITIVE CONTROL   the real dev Application                 -> Synced
+#   7-9 STATIC           each overlay renders no denied kind       -> clean
 #
 # Checks 3-5 are driven from ONE scratch Application pointed at platform/,
 # which is exactly the set of objects deliberately excluded from base/. That
@@ -204,6 +209,43 @@ case "$DEV_STATE" in
   *) fail "positive control: $DEV_APP is not Synced" \
           "state='$DEV_STATE' - the project may be denying legitimate traffic too" ;;
 esac
+
+# ---------------------------------------------------------------------------
+# 7. STATIC CHECK - the overlays must not render a kind this project denies.
+#
+# Checks 1-5 prove the project refuses those kinds. This one proves nobody has
+# quietly put them back into base/, which is a different failure and a much
+# easier mistake to make: the reference layout for this deliverable puts
+# 00-namespace.yaml in base/, so "restoring" it looks like fixing a deviation
+# rather than breaking the sync.
+#
+# It runs offline against `kustomize build`, so it catches the mistake in
+# review rather than at the next sync - which matters because the sync failure
+# it prevents is total: a denied resource fails the whole operation, not just
+# itself.
+#
+# Secret is on the project's whitelist and would sync happily, so it is checked
+# here rather than above: a placeholder Secret in the manifest set overwrites
+# the real out-of-band password on the next reconcile. See
+# platform/secret/40-taxcalc-api.secret.yaml.
+# ---------------------------------------------------------------------------
+if command -v kustomize >/dev/null 2>&1; then
+  REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+  for env in dev staging prod; do
+    RENDERED=$(kustomize build "$REPO_ROOT/overlays/$env" 2>&1) || {
+      fail "static: overlays/$env does not build" "$RENDERED"; continue; }
+    BAD=$(printf '%s\n' "$RENDERED" \
+      | grep -E '^kind: (Namespace|ResourceQuota|LimitRange|Secret)$' | sort -u | tr '\n' ' ')
+    if [ -z "$BAD" ]; then
+      pass "static: overlays/$env renders no denied or out-of-band kind"
+    else
+      fail "static: overlays/$env renders a kind that must not be synced" \
+           "found: ${BAD}- Namespace/ResourceQuota/LimitRange are denied by the project; Secret would overwrite the out-of-band password. All belong in platform/."
+    fi
+  done
+else
+  echo "SKIP  static overlay check: kustomize not on PATH"
+fi
 
 echo
 echo "==> $PASS passed, $FAIL failed"
