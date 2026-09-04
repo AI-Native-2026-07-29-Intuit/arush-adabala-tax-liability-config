@@ -1,0 +1,138 @@
+# argocd/applicationsets/taxcalc-api-envs.yaml
+#
+# Templates one Application per environment. Adding a fourth env (canary, say)
+# is a four-line entry in the `elements:` list below - not a fourth
+# copy-pasted Application file that drifts from the other three the first time
+# someone fixes a sync option in only two of them.
+#
+# The matrix generator's two inner generators answer two different questions
+# and are combined as a cartesian product:
+#
+#   list      WHICH environments exist        (env, overlay, namespace, wave)
+#   clusters  WHICH clusters run workloads    (label selector on the registered
+#                                              cluster Secret)
+#
+# Today the clusters generator matches exactly one cluster, so 3 x 1 = 3
+# Applications. That is deliberate rather than premature: the same template
+# fans out to N labelled clusters with no change at all, and the parameters a
+# clusters generator injects - notably `{{server}}` - have to be plumbed
+# through the template from the start or adding the second cluster means
+# rewriting every destination.
+#
+# The local k3d cluster is registered by Argo CD's in-cluster default as a
+# Secret NAMED FOR THE CLUSTER URL, and the install does not label it. The
+# platform team labels it at install time; for the k3d lab, do it by hand:
+#
+#   kubectl -n argocd label secret <cluster-secret> \
+#     uptimecrew.example.internal/tier=workload
+#
+# A clusters generator with a selector that matches nothing produces ZERO
+# Applications and reports success - the ApplicationSet is Healthy, the
+# dashboard is green, and nothing is deployed. If `argocd app list --project
+# taxcalc` is empty after applying this file, that label is the first thing
+# to check.
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: taxcalc-api-envs
+  namespace: argocd
+spec:
+  # If an env falls out of the matrix, KEEP the existing Application and its
+  # workload running; a human re-reviews before any teardown. The default
+  # (delete) is the wrong default for prod: removing one line from the list
+  # below would otherwise delete a running environment on the next reconcile,
+  # with the resources-finalizer pruning every resource behind it.
+  syncPolicy:
+    preserveResourcesOnDeletion: true
+
+  generators:
+    - matrix:
+        generators:
+          # Inner generator A: the explicit env list.
+          - list:
+              elements:
+                - env:       dev
+                  overlay:   overlays/dev
+                  namespace: taxcalc-dev
+                  wave:      "0"
+                - env:       staging
+                  overlay:   overlays/staging
+                  namespace: taxcalc-staging
+                  wave:      "1"
+                - env:       prod
+                  overlay:   overlays/prod
+                  namespace: taxcalc-prod
+                  wave:      "2"
+
+          # Inner generator B: every cluster tagged tier=workload. Supplies
+          # `{{server}}` (and `{{name}}`) to the template below.
+          - clusters:
+              selector:
+                matchLabels:
+                  uptimecrew.example.internal/tier: workload
+
+  template:
+    metadata:
+      # Application names MUST be unique across the whole argocd namespace;
+      # compose them from the params rather than hardcoding.
+      name:      taxcalc-api-{{env}}
+      namespace: argocd
+      finalizers:
+        - resources-finalizer.argocd.argoproj.io
+      annotations:
+        # Sync-wave on the generated APPLICATION - a different axis from the
+        # sync-waves inside base/kustomization.yaml. This one orders the three
+        # Applications against each other so a single sync of the whole set
+        # lands dev before staging before prod. The waves inside the manifest
+        # set order resources within ONE Application (ConfigMap and the data
+        # stores before the Deployment).
+        argocd.argoproj.io/sync-wave: "{{wave}}"
+      labels:
+        env:  "{{env}}"
+        # Selected by the notifications ConfigMap's default subscription.
+        team: taxcalc
+    spec:
+      # Never "default" - see argocd/projects/taxcalc.yaml.
+      project: taxcalc
+      source:
+        repoURL:        https://github.com/AI-Native-2026-07-29-Intuit/arush-adabala-tax-liability-config.git
+        path:           "{{overlay}}"
+        targetRevision: main
+      destination:
+        server:    "{{server}}"
+        namespace: "{{namespace}}"
+      syncPolicy:
+        automated:
+          prune:      true
+          selfHeal:   true
+          allowEmpty: false
+          # PROD-ONLY EXCEPTION, left as a comment for a deliberate call:
+          # if the team decides prod should require manual sync, drop the
+          # automated stanza for env: prod via a templatePatch. This
+          # assignment leaves prod on the same automated stanza as dev and
+          # staging because a k3d cluster has no real users; the AppProject's
+          # weekend syncWindow is the only thing gating prod today. See
+          # taxcalc-api/GITOPS.md in the application repo.
+        syncOptions:
+          - CreateNamespace=true
+          - ServerSideApply=true
+          - PrunePropagationPolicy=foreground
+          - PruneLast=true
+          - ApplyOutOfSyncOnly=true
+        retry:
+          limit: 5
+          backoff:
+            duration:    10s
+            factor:      2
+            maxDuration: 3m
+
+      # Same reasoning as argocd/applications/taxcalc-api-dev.yaml: the
+      # overlay sets the replica count the Deployment is created with, the
+      # HorizontalPodAutoscaler owns it afterwards, and without this ignore
+      # selfHeal and the HPA overwrite each other forever.
+      ignoreDifferences:
+        - group: apps
+          kind:  Deployment
+          name:  taxcalc-api
+          jsonPointers:
+            - /spec/replicas

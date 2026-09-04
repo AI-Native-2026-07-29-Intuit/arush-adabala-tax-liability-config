@@ -1,0 +1,44 @@
+# overlays/prod/kustomization.yaml
+#
+# Same shape as overlays/dev/, four values apart: namespace, replica count,
+# log level and Ingress host. Read overlays/dev/kustomization.yaml first - it
+# carries the full commentary for each block.
+#
+# The AppProject's syncWindows block denies automated sync to the generated
+# `taxcalc-api-prod` Application from Friday 17:00 through Monday 05:00 UTC.
+# A merge to this directory during that window is still merged and still the
+# desired state; it simply does not promote until the window closes, unless a
+# human force-syncs (manualSync: true).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../base
+
+namespace: taxcalc-prod
+
+# Deliberately NOT rewritten by CI - see overlays/staging/kustomization.yaml.
+images:
+  - name:    uptimecrew/taxcalc-api
+    newName: uptimecrew/taxcalc-api
+    newTag:  "0.2.0"
+
+replicas:
+  - name:  taxcalc-api
+    count: 3
+
+patches:
+  - target: { kind: ConfigMap, name: taxcalc-api-config }
+    patch: |
+      - op: replace
+        path: /data/SPRING_PROFILES_ACTIVE
+        value: "k8s,prod"
+      - op: replace
+        path: /data/LOGGING_LEVEL_ROOT
+        value: "WARN"
+
+  - target: { kind: Ingress, name: taxcalc-api }
+    patch: |
+      - op: replace
+        path: /spec/rules/0/host
+        value: taxcalc.prod.uptimecrew.internal

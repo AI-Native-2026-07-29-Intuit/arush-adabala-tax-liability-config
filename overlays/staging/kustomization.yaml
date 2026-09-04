@@ -1,0 +1,42 @@
+# overlays/staging/kustomization.yaml
+#
+# Same shape as overlays/dev/, four values apart: namespace, replica count,
+# log level and Ingress host. Read overlays/dev/kustomization.yaml first - it
+# carries the full commentary for each block, including why
+# SPRING_PROFILES_ACTIVE keeps the `k8s` profile and why `replicas` is in
+# ignoreDifferences.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../base
+
+namespace: taxcalc-staging
+
+# Deliberately NOT rewritten by CI. `_bump-config.yml` bumps the dev overlay
+# only; promotion to staging is a human opening a PR that copies dev's tag
+# here, which is the whole point of having three overlays instead of one.
+images:
+  - name:    uptimecrew/taxcalc-api
+    newName: uptimecrew/taxcalc-api
+    newTag:  "0.2.0"
+
+replicas:
+  - name:  taxcalc-api
+    count: 2
+
+patches:
+  - target: { kind: ConfigMap, name: taxcalc-api-config }
+    patch: |
+      - op: replace
+        path: /data/SPRING_PROFILES_ACTIVE
+        value: "k8s,staging"
+      - op: replace
+        path: /data/LOGGING_LEVEL_ROOT
+        value: "INFO"
+
+  - target: { kind: Ingress, name: taxcalc-api }
+    patch: |
+      - op: replace
+        path: /spec/rules/0/host
+        value: taxcalc.staging.uptimecrew.internal

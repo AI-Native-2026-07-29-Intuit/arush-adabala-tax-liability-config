@@ -6,8 +6,7 @@
 # count, image tag, Spring profile, log level, Ingress host - is a patch in
 # overlays/{dev,staging,prod}/, never an edit here.
 #
-# THREE W5 D3 OBJECTS ARE DELIBERATELY ABSENT, and they are absent for the
-# same reason the AppProject exists at all:
+# FOUR W5 D3 OBJECTS ARE DELIBERATELY ABSENT:
 #
 #   Namespace       - cluster-scoped. The AppProject sets
 #                     `clusterResourceWhitelist: []` (full deny), so an
@@ -19,9 +18,17 @@
 #   ResourceQuota   - named in the AppProject's `namespaceResourceBlacklist`.
 #   LimitRange        Quota knobs are platform-team property: an app team that
 #                     can raise its own quota does not have a quota.
+#   Secret          - the W5 D3 file carries a PLACEHOLDER password, which was
+#                     inert under `kubectl apply` (CI reseeded the Secret
+#                     after applying) and is actively destructive under
+#                     continuous reconciliation: the first sync wrote the
+#                     placeholder over the real password and every api pod
+#                     started failing Postgres auth. See
+#                     platform/40-taxcalc-api.secret.yaml for the full
+#                     write-up and the out-of-band procedure.
 #
-# All three live in platform/00-namespaces.yaml and are applied out-of-band.
-# See that file's header and the repo README for the full reasoning.
+# All four live under platform/ and are applied out-of-band. See those files'
+# headers and the repo README for the full reasoning.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
@@ -30,7 +37,6 @@ resources:
   - 10-taxcalc-api.deployment.yaml
   - 20-taxcalc-api.service.yaml
   - 30-taxcalc-api.configmap.yaml
-  - 40-taxcalc-api.secret.yaml
   - 50-taxcalc-api.hpa.yaml
   - 60-taxcalc-api.ingress.yaml
   - 70-taxcalc-api.servicemonitor.yaml
@@ -45,8 +51,9 @@ resources:
 # the whole overlay with one wave number orders nothing. Waves only do work
 # when different resources carry different numbers.
 #
-# Wave -1: the config the api reads at boot (ConfigMap, Secret) and the
-#          backing stores it dials (postgres, redis, mongo). Argo CD does not
+# Wave -1: the config the api reads at boot (ConfigMap - the Secret is
+#          out-of-band, see above) and the backing stores it dials (postgres,
+#          redis, mongo). Argo CD does not
 #          advance to wave 0 until every wave -1 resource is Synced and
 #          Healthy, so on a first sync into an empty namespace the Deployment
 #          is not even created until Postgres is Running. Without this the
@@ -67,15 +74,6 @@ patches:
       kind: ConfigMap
       metadata:
         name: taxcalc-api-config
-        annotations:
-          argocd.argoproj.io/sync-wave: "-1"
-
-  - target: { kind: Secret, name: taxcalc-api-secrets }
-    patch: |
-      apiVersion: v1
-      kind: Secret
-      metadata:
-        name: taxcalc-api-secrets
         annotations:
           argocd.argoproj.io/sync-wave: "-1"
 
