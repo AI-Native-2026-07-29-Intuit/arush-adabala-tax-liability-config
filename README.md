@@ -97,6 +97,18 @@ kubectl -n argocd rollout restart deploy/argocd-notifications-controller
 
 `argocd/applications/taxcalc-api-dev.yaml` and the ApplicationSet both produce an Application named `taxcalc-api-dev`. Applying both puts two controllers in charge of one object. The standalone Application is the Task 1 anchor and is kept in the repo as the one concrete, non-templated Application a new contributor can read; once the ApplicationSet is applied, delete it from the cluster (`argocd app delete taxcalc-api-dev`) and leave the file.
 
+## Operating notes worth knowing before you touch this repo
+
+**A change freeze freezes self-healing too.** The AppProject's `syncWindows` deny block (Fri 17:00 → Mon 05:00 UTC) stops *all* automated sync to `taxcalc-api-prod`, `selfHeal` included. Patching a ConfigMap in `taxcalc-prod` during the window left the drift in place for 240 s with the controller logging `Sync prevented by sync window`; the identical patch in `taxcalc-dev` was reverted in **10 seconds**. That is not a bug, but it is a trade-off nobody mentions when adding a freeze: for its duration prod is unprotected against drift as well as against deploys, and only a human `manualSync` closes the gap.
+
+**`Deployment.spec.replicas` is in `ignoreDifferences`, so scaling is not drift here.** `base/50-taxcalc-api.hpa.yaml` sets `minReplicas: 2` while the overlays set 1 / 2 / 3 — Git owns the value the Deployment is *created* with, the HPA owns it thereafter. `kubectl scale` is therefore *not* reverted, and that is correct; use a ConfigMap value if you want to watch `selfHeal` work.
+
+**Never add `finalizers:` to the ApplicationSet template.** It silently defeats `preserveResourcesOnDeletion: true` — dropping an env from the list generator would then take its whole workload with it. See that file's header.
+
+**Everything directly under `platform/` must be safe to apply to a live cluster**, because `scripts/verify-appproject-guardrails.sh` syncs a scratch Application at that path. The one destructive file lives in `platform/secret/` for exactly that reason.
+
+**`service.slack` takes a bot token, not an incoming-webhook URL.** The controller sends it as a bearer credential to `chat.postMessage`; a webhook URL put there is never requested as a URL at all. An incoming webhook needs `service.webhook.<name>`.
+
 ## Full write-up
 
 The reasoning, the measurements and the things that did not work the first time are in the application repo:
