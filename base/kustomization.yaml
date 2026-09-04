@@ -1,0 +1,107 @@
+# base/kustomization.yaml
+#
+# The W5 D3 manifest set, copied verbatim out of the application repo
+# (arush-adabala-tax-liability/manifests/) and kept identical across every
+# environment. Everything that differs per environment - namespace, replica
+# count, image tag, Spring profile, log level, Ingress host - is a patch in
+# overlays/{dev,staging,prod}/, never an edit here.
+#
+# THREE W5 D3 OBJECTS ARE DELIBERATELY ABSENT, and they are absent for the
+# same reason the AppProject exists at all:
+#
+#   Namespace       - cluster-scoped. The AppProject sets
+#                     `clusterResourceWhitelist: []` (full deny), so an
+#                     Application in project `taxcalc` cannot create one.
+#                     The Applications carry `CreateNamespace=true` instead,
+#                     which is Argo CD creating the destination namespace as
+#                     part of the sync operation rather than as a managed
+#                     resource in the manifest set.
+#   ResourceQuota   - named in the AppProject's `namespaceResourceBlacklist`.
+#   LimitRange        Quota knobs are platform-team property: an app team that
+#                     can raise its own quota does not have a quota.
+#
+# All three live in platform/00-namespaces.yaml and are applied out-of-band.
+# See that file's header and the repo README for the full reasoning.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - 05-dev-dependencies.yaml
+  - 10-taxcalc-api.deployment.yaml
+  - 20-taxcalc-api.service.yaml
+  - 30-taxcalc-api.configmap.yaml
+  - 40-taxcalc-api.secret.yaml
+  - 50-taxcalc-api.hpa.yaml
+  - 60-taxcalc-api.ingress.yaml
+  - 70-taxcalc-api.servicemonitor.yaml
+
+# ---------------------------------------------------------------------------
+# Sync waves - INTRA-Application ordering, applied here rather than in each
+# overlay because the dependency order is a property of the manifest set and
+# does not vary by environment.
+#
+# Not `commonAnnotations`, which is what the reference layout uses to put the
+# Namespace in wave -1: commonAnnotations stamps EVERY resource, so annotating
+# the whole overlay with one wave number orders nothing. Waves only do work
+# when different resources carry different numbers.
+#
+# Wave -1: the config the api reads at boot (ConfigMap, Secret) and the
+#          backing stores it dials (postgres, redis, mongo). Argo CD does not
+#          advance to wave 0 until every wave -1 resource is Synced and
+#          Healthy, so on a first sync into an empty namespace the Deployment
+#          is not even created until Postgres is Running. Without this the
+#          Deployment races its own dependencies: the pods come up, fail the
+#          datasource check, and crash-loop through the startupProbe's 150s
+#          grace while the operator watches an unexplained Degraded app.
+# Wave  0: everything else (Deployment, Service, Ingress, HPA,
+#          ServiceMonitor) - Kubernetes resolves those among themselves.
+#
+# The ApplicationSet sets a wave on each generated APPLICATION too (dev=0,
+# staging=1, prod=2). Those are a different axis: this file orders resources
+# within one Application; that one orders Applications against each other.
+# ---------------------------------------------------------------------------
+patches:
+  - target: { kind: ConfigMap, name: taxcalc-api-config }
+    patch: |
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: taxcalc-api-config
+        annotations:
+          argocd.argoproj.io/sync-wave: "-1"
+
+  - target: { kind: Secret, name: taxcalc-api-secrets }
+    patch: |
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: taxcalc-api-secrets
+        annotations:
+          argocd.argoproj.io/sync-wave: "-1"
+
+  - target: { kind: Deployment, name: postgres }
+    patch: |
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: postgres
+        annotations:
+          argocd.argoproj.io/sync-wave: "-1"
+
+  - target: { kind: Deployment, name: redis }
+    patch: |
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: redis
+        annotations:
+          argocd.argoproj.io/sync-wave: "-1"
+
+  - target: { kind: Deployment, name: mongo }
+    patch: |
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: mongo
+        annotations:
+          argocd.argoproj.io/sync-wave: "-1"

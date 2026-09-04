@@ -1,0 +1,177 @@
+# platform/00-namespaces.yaml - the three destination namespaces, plus the
+# quota knobs that bound them.
+#
+# NOT part of base/ and NOT synced by Argo CD, deliberately. The AppProject
+# (argocd/projects/taxcalc.yaml) denies all three kinds to the taxcalc team:
+#
+#   Namespace      cluster-scoped, and `clusterResourceWhitelist: []` is a
+#                  full deny. Argo CD classifies a resource as cluster- or
+#                  namespace-scoped from the API server's own discovery data,
+#                  not from whether the manifest carries a `namespace:` field,
+#                  so listing Namespace under namespaceResourceWhitelist does
+#                  nothing for it.
+#   ResourceQuota  both explicitly listed in `namespaceResourceBlacklist`. A
+#   LimitRange     team that can edit its own ResourceQuota has no quota, and
+#                  a team that can edit its own LimitRange can hand itself the
+#                  scheduler defaults it likes.
+#
+# The platform team applies this file directly:
+#
+#   kubectl apply -f platform/00-namespaces.yaml
+#
+# Copied from the W5 D3 manifests/00-namespace.yaml, with the single-namespace
+# original fanned out to the three environments the ApplicationSet targets.
+# The LimitRange note below is the W5 D3 one, preserved verbatim because it is
+# still true and still surprising.
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: taxcalc-dev
+  labels:
+    app.kubernetes.io/name:       taxcalc-dev
+    app.kubernetes.io/component:  namespace
+    app.kubernetes.io/part-of:    taxcalc
+    app.kubernetes.io/managed-by: platform-team
+    uptimecrew.example.internal/env: dev
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: taxcalc-staging
+  labels:
+    app.kubernetes.io/name:       taxcalc-staging
+    app.kubernetes.io/component:  namespace
+    app.kubernetes.io/part-of:    taxcalc
+    app.kubernetes.io/managed-by: platform-team
+    uptimecrew.example.internal/env: staging
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: taxcalc-prod
+  labels:
+    app.kubernetes.io/name:       taxcalc-prod
+    app.kubernetes.io/component:  namespace
+    app.kubernetes.io/part-of:    taxcalc
+    app.kubernetes.io/managed-by: platform-team
+    uptimecrew.example.internal/env: prod
+
+# ---------------------------------------------------------------------------
+# ResourceQuota - total resource ceiling per environment. dev is the W5 D3
+# original; staging and prod carry the same ceiling, which is what makes the
+# quota a real constraint rather than decoration: prod runs 3 api replicas
+# plus the three dev-dependency Deployments against the same 4-CPU / 8Gi
+# request budget dev gets for 1.
+# ---------------------------------------------------------------------------
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: taxcalc-dev-quota
+  namespace: taxcalc-dev
+  labels:
+    app.kubernetes.io/name:       taxcalc-dev-quota
+    app.kubernetes.io/component:  namespace
+    app.kubernetes.io/part-of:    taxcalc
+    app.kubernetes.io/managed-by: platform-team
+spec:
+  hard:
+    requests.cpu:    "4"
+    requests.memory: 8Gi
+    limits.cpu:      "8"
+    limits.memory:   16Gi
+    pods:            "20"
+
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: taxcalc-staging-quota
+  namespace: taxcalc-staging
+  labels:
+    app.kubernetes.io/name:       taxcalc-staging-quota
+    app.kubernetes.io/component:  namespace
+    app.kubernetes.io/part-of:    taxcalc
+    app.kubernetes.io/managed-by: platform-team
+spec:
+  hard:
+    requests.cpu:    "4"
+    requests.memory: 8Gi
+    limits.cpu:      "8"
+    limits.memory:   16Gi
+    pods:            "20"
+
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: taxcalc-prod-quota
+  namespace: taxcalc-prod
+  labels:
+    app.kubernetes.io/name:       taxcalc-prod-quota
+    app.kubernetes.io/component:  namespace
+    app.kubernetes.io/part-of:    taxcalc
+    app.kubernetes.io/managed-by: platform-team
+spec:
+  hard:
+    requests.cpu:    "4"
+    requests.memory: 8Gi
+    limits.cpu:      "8"
+    limits.memory:   16Gi
+    pods:            "20"
+
+# ---------------------------------------------------------------------------
+# LimitRange - per-container defaults for pods that omit requests/limits.
+#
+# HEADS UP (carried over verbatim from W5 D3, because it is still true):
+# `default.cpu` here silently overrides the "omit limits.cpu" guidance for
+# EVERY container in these namespaces that doesn't set one, including
+# taxcalc-api. A LimitRange default is applied per-resource to any container
+# that leaves that resource unset, and Kubernetes offers no "unlimited"
+# sentinel to opt out. Drop `cpu` from the `default:` block if you want
+# genuinely unthrottled containers.
+# ---------------------------------------------------------------------------
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: taxcalc-dev-defaults
+  namespace: taxcalc-dev
+  labels:
+    app.kubernetes.io/managed-by: platform-team
+spec:
+  limits:
+    - type: Container
+      default:        { cpu: 500m, memory: 768Mi }
+      defaultRequest: { cpu: 100m, memory: 256Mi }
+
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: taxcalc-staging-defaults
+  namespace: taxcalc-staging
+  labels:
+    app.kubernetes.io/managed-by: platform-team
+spec:
+  limits:
+    - type: Container
+      default:        { cpu: 500m, memory: 768Mi }
+      defaultRequest: { cpu: 100m, memory: 256Mi }
+
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: taxcalc-prod-defaults
+  namespace: taxcalc-prod
+  labels:
+    app.kubernetes.io/managed-by: platform-team
+spec:
+  limits:
+    - type: Container
+      default:        { cpu: 500m, memory: 768Mi }
+      defaultRequest: { cpu: 100m, memory: 256Mi }

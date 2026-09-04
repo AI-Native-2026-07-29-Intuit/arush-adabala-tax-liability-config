@@ -1,0 +1,79 @@
+# overlays/dev/kustomization.yaml
+#
+# The dev overlay - the smallest viable patch over the W5 D3 base. The same
+# shape repeats at overlays/staging/ and overlays/prod/ with a different
+# namespace, replica count, Spring profile, log level and Ingress host; the
+# image tag is bumped in THIS overlay only, by CI (see below).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# The unchanged W5 D3 manifests, copied verbatim into base/. Identical across
+# every environment - if a change belongs in all three, it belongs there.
+resources:
+  - ../../base
+
+# Per-env namespace. Kustomize rewrites every resource's metadata.namespace at
+# build time, so the base files' own `namespace: taxcalc-dev` lines are
+# overwritten rather than respected - which is why base/ can stay a verbatim
+# copy of the W5 D3 originals instead of being stripped of them.
+namespace: taxcalc-dev
+
+# Image-tag rewrite. `.github/workflows/_bump-config.yml` in the application
+# repo runs `kustomize edit set image` against THIS file on every green build
+# of main, then opens a PR here. Do not hand-edit newTag; a human edit and the
+# bot's next rewrite will collide in the same three lines.
+#
+# The committed value is a real tag that exists in the cluster's image store
+# rather than the reference layout's `1f1f1f1f...` placeholder: a placeholder
+# tag resolves to ImagePullBackOff, which makes the Application permanently
+# Degraded and turns the deliberate-failure experiment in Task 4 into noise
+# that cannot be told apart from the failure being tested.
+images:
+  - name:    uptimecrew/taxcalc-api
+    newName: uptimecrew/taxcalc-api
+    newTag:  "0.2.0"
+
+# Per-env replica count. dev runs hot at one replica.
+#
+# The HPA in base/ has minReplicas: 2, so it will scale this back up to 2
+# within a reconcile - and because the Application sets selfHeal: true, Argo
+# CD would then fight the HPA over the same field forever. `Deployment.spec
+# .replicas` is therefore in ignoreDifferences on every generated Application
+# (see argocd/applicationsets/taxcalc-api-envs.yaml): Git owns the initial
+# value, the HPA owns it thereafter, and Argo CD stops calling the HPA's work
+# drift. This is the one field where "Git is the source of truth" is wrong.
+replicas:
+  - name:  taxcalc-api
+    count: 1
+
+# Per-env config patch - override the W5 D3 ConfigMap entries that should
+# differ between environments (Spring profile, log level).
+#
+# SPRING_PROFILES_ACTIVE stays "k8s,dev" rather than the reference layout's
+# bare "dev": application.yml only defines documents for `docker`, `k8s` and
+# `test`, and the k8s document is what supplies the in-cluster datasource,
+# Redis, Mongo and Kafka coordinates. Replacing it with `dev` would leave the
+# app on its default (localhost) datasource and it would never start. The
+# extra `dev` profile matches no document today and is there so that a future
+# `on-profile: dev` block has somewhere to land.
+#
+# LOGGING_LEVEL_ROOT is the key the base actually uses, not the reference
+# layout's LOG_LEVEL - Spring Boot's relaxed binding maps it to
+# logging.level.root; a LOG_LEVEL key would be read by nothing.
+patches:
+  - target: { kind: ConfigMap, name: taxcalc-api-config }
+    patch: |
+      - op: replace
+        path: /data/SPRING_PROFILES_ACTIVE
+        value: "k8s,dev"
+      - op: replace
+        path: /data/LOGGING_LEVEL_ROOT
+        value: "DEBUG"
+
+  # Per-env Ingress host. All three environments share one ingress-nginx on
+  # the k3d cluster, so the host header is the only thing separating them.
+  - target: { kind: Ingress, name: taxcalc-api }
+    patch: |
+      - op: replace
+        path: /spec/rules/0/host
+        value: taxcalc.dev.uptimecrew.internal

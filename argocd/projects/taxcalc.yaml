@@ -1,0 +1,155 @@
+# argocd/projects/taxcalc.yaml
+#
+# AppProject scoping the taxcalc capstone team. In practice the platform team
+# owns this file and the app team proposes changes to it via PR; it is kept in
+# this repo so that the guardrail and the thing it guards are reviewed side by
+# side.
+#
+# Every Application in this repository sets `spec.project: taxcalc`. None of
+# them may set `default` - the built-in `default` project permits '*' for
+# source repos, destinations and cluster-scoped resources, which is the same
+# as having no guardrail while looking like you do.
+#
+# The four allow-lists below answer four separate questions, and a wildcard in
+# any one of them silently voids the other three:
+#
+#   sourceRepos                WHICH git repos may an Application read from
+#   destinations               WHICH (cluster, namespace) pairs may it write to
+#   clusterResourceWhitelist   WHICH cluster-scoped kinds may it create
+#   namespaceResourceWhitelist WHICH namespaced kinds may it create
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: taxcalc
+  namespace: argocd
+  # Without this finalizer, deleting the AppProject leaves every Application
+  # that referenced it orphaned - still running, still syncing, no longer
+  # governed by any allow-list. The finalizer makes Argo CD prune them first.
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  description: taxcalc-api capstone - GitOps overlays + observability
+
+  # WHICH repos may an Application in this project use as source?
+  # Exactly one, spelled out in full. Globs are legal and deliberately not
+  # used: a '*' here is indistinguishable from leaving the Application in the
+  # `default` project, because a compromised or mistyped Application could
+  # then point at any repository on the internet and Argo CD would apply
+  # whatever it found there with cluster credentials.
+  sourceRepos:
+    - https://github.com/AI-Native-2026-07-29-Intuit/arush-adabala-tax-liability-config.git
+
+  # WHICH (cluster, namespace) pairs are legal?
+  # The k3d cluster is reachable via the in-cluster service DNS. Each env has
+  # its own namespace - explicit, not globbed. `{server: '*', namespace: '*'}`
+  # would let this project write into kube-system.
+  destinations:
+    - server:    https://kubernetes.default.svc
+      namespace: taxcalc-dev
+    - server:    https://kubernetes.default.svc
+      namespace: taxcalc-staging
+    - server:    https://kubernetes.default.svc
+      namespace: taxcalc-prod
+
+  # Cluster-scoped resources: the app team has NO business creating
+  # ClusterRoles, CustomResourceDefinitions, or PersistentVolumes. An empty
+  # whitelist is a full deny, and it is what stops a compromised config repo
+  # from smuggling in a privileged DaemonSet or a cluster-admin binding.
+  #
+  # This is also why base/ carries no Namespace object: Namespace is
+  # cluster-scoped, so it is governed by THIS list and not by the
+  # namespaceResourceWhitelist below. The Applications create their
+  # destination namespaces with the `CreateNamespace=true` sync option
+  # instead. See base/kustomization.yaml and platform/00-namespaces.yaml.
+  clusterResourceWhitelist: []
+
+  # Namespace-scoped resources: only the kinds the W5 D3 manifests actually
+  # use. Anything else is denied.
+  #
+  # Ingress is on this list and is NOT in the reference layout's: the W5 D3
+  # manifest set contains one (manifests/60-taxcalc-api.ingress.yaml), so
+  # omitting it would deny a resource this project's own base ships. An
+  # allow-list has to match the manifests it governs or the first sync fails.
+  #
+  # PrometheusRule is on the list and is NOT currently used - the Sloth-
+  # generated SLO rules still live in the application repo. It is listed so
+  # that moving them here later is a file move rather than a project change,
+  # and it costs nothing: the taxcalc namespaces are the only place this
+  # project can write at all.
+  namespaceResourceWhitelist:
+    - { group: "",                     kind: Service }
+    - { group: "",                     kind: ConfigMap }
+    - { group: "",                     kind: Secret }
+    - { group: "",                     kind: ServiceAccount }
+    - { group: apps,                   kind: Deployment }
+    - { group: autoscaling,            kind: HorizontalPodAutoscaler }
+    - { group: policy,                 kind: PodDisruptionBudget }
+    - { group: networking.k8s.io,      kind: NetworkPolicy }
+    - { group: networking.k8s.io,      kind: Ingress }
+    - { group: monitoring.coreos.com,  kind: ServiceMonitor }
+    - { group: monitoring.coreos.com,  kind: PrometheusRule }
+
+  # Explicitly block the quota knobs even though they are namespaced and would
+  # otherwise be reachable. The blacklist wins over the whitelist. A team that
+  # can edit its own ResourceQuota does not have a quota; a team that can edit
+  # its own LimitRange writes its own scheduler defaults. Both live in
+  # platform/00-namespaces.yaml, applied by the platform team.
+  namespaceResourceBlacklist:
+    - { group: "", kind: ResourceQuota }
+    - { group: "", kind: LimitRange }
+
+  # Sync windows: deny automated sync to prod over the weekend. Manual sync
+  # still works (manualSync: true), but the controller will not promote on its
+  # own - so a Friday-evening merge lands in Git, stays the desired state, and
+  # waits until Monday unless a human on call decides otherwise.
+  #
+  # The weekend freeze is a curriculum convention; real change-freeze
+  # schedules are decided per team. `schedule` is evaluated in UTC unless a
+  # `timeZone` is set, which is worth knowing before someone debugs why the
+  # window opened at what looked like the wrong hour.
+  syncWindows:
+    - kind:     deny
+      schedule: "0 17 * * 5"       # Friday 17:00
+      duration: 60h                # through Monday 05:00
+      applications:
+        - "taxcalc-api-prod"
+      manualSync: true             # a human can still force-sync on-call
+
+  # Project-scoped RBAC - two roles, not "any-developer-is-cluster-admin".
+  #
+  # These policies are scoped to this project: the `taxcalc/*` object pattern
+  # can never name an Application outside it, so this block cannot be used to
+  # widen access to another team's workloads even if it is written wrong.
+  #
+  # Both roles carry an explicit `deny` on `delete`. Deleting an Application
+  # whose finalizer prunes its resources is the fastest way to remove a
+  # running environment, and it is not an operation either role needs: rolling
+  # back is `git revert`, and retiring an environment is a change to the
+  # ApplicationSet's element list.
+  roles:
+    # Developers: read everything; sync dev and staging only. Cannot touch
+    # prod - promoting to prod is a releaser action, which is the whole reason
+    # for having two roles rather than one.
+    - name: developers
+      description: Read everything; sync dev and staging only.
+      policies:
+        - p, proj:taxcalc:developers, applications, get,    taxcalc/*,                    allow
+        - p, proj:taxcalc:developers, applications, sync,   taxcalc/taxcalc-api-dev,      allow
+        - p, proj:taxcalc:developers, applications, sync,   taxcalc/taxcalc-api-staging,  allow
+        - p, proj:taxcalc:developers, applications, delete, taxcalc/*,                    deny
+        - p, proj:taxcalc:developers, logs,          get,   taxcalc/*,                    allow
+      groups:
+        - uptimecrew:taxcalc-engineers
+
+    # Releasers: full sync including prod; still cannot override the
+    # project's allow-lists (those live above and are not RBAC-adjustable),
+    # and still cannot delete an Application.
+    - name: releasers
+      description: Full sync including prod. Cannot delete Applications.
+      policies:
+        - p, proj:taxcalc:releasers, applications, get,      taxcalc/*, allow
+        - p, proj:taxcalc:releasers, applications, sync,     taxcalc/*, allow
+        - p, proj:taxcalc:releasers, applications, action/*, taxcalc/*, allow
+        - p, proj:taxcalc:releasers, applications, delete,   taxcalc/*, deny
+      groups:
+        - uptimecrew:taxcalc-engineers-releasers

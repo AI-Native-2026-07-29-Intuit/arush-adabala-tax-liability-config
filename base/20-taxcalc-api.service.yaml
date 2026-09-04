@@ -1,0 +1,23 @@
+# manifests/20-taxcalc-api.service.yaml - stable in-cluster name.
+# ClusterIP only; external traffic comes through the Ingress (Topic 4).
+# Selector MUST match the Deployment's pod labels.
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: taxcalc-api
+  namespace: taxcalc-dev
+  labels:
+    app.kubernetes.io/name:       taxcalc-api
+    app.kubernetes.io/component:  api
+    app.kubernetes.io/part-of:    taxcalc
+    app.kubernetes.io/managed-by: kubectl
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: taxcalc-api
+  ports:
+    - name:       http
+      port:       8080
+      targetPort: http     # the *named* container port, not a number
+      protocol:   TCP

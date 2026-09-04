@@ -1,0 +1,156 @@
+# manifests/05-dev-dependencies.yaml - NOT part of the graded W5 D3 task
+# list (Tasks 1-4 only cover taxcalc-api's own Deployment/Service/
+# ConfigMap/Secret/HPA/Ingress). Deliberate gap, same reasoning as W5 D2's
+# Mongo addition: taxcalc-api's Flyway migration + JPA schema validation
+# run eagerly at context startup on every profile (not lazily, not behind
+# a feature flag), so without a *reachable* Postgres the container never
+# reaches "Started Application" at all - readiness would never turn UP
+# for any Task 2-4 DONE WHEN check, k8s profile health-group settings or
+# not. Minimal single-replica Postgres + Redis + Mongo (no PVC - ephemeral
+# is fine for this lab) mirror compose.yaml's images/db name/user exactly
+# so the ConfigMap's in-cluster DNS names resolve to something real.
+# Kafka's *broker* is intentionally NOT stood up here: spring-kafka's
+# consumer connects lazily/async and never blocks context startup once a
+# TCP connection attempt is possible (confirmed via the Task 1 pod logs -
+# "Started Application" logs while Kafka connection warnings continue
+# after readiness is already UP), so a broker isn't required to satisfy
+# any DONE WHEN check; the kafka health indicator is disabled instead
+# (application.yml's `k8s` profile). A bare Service with no backing pods
+# IS still required, though: KafkaConsumer's constructor resolves
+# bootstrap.servers via DNS synchronously (unlike the later TCP connect,
+# which is async/retried) - an unresolvable hostname throws
+# ConfigException("No resolvable bootstrap urls") and kills the whole
+# Spring context during startup, confirmed by a real crash here before
+# this Service was added. A Service with no matching pods still answers
+# DNS with its ClusterIP; only the TCP connect after that (silently
+# tolerated) actually reaches nothing.
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  namespace: taxcalc-dev
+  labels: { app.kubernetes.io/name: postgres, app.kubernetes.io/part-of: taxcalc }
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector:
+    matchLabels: { app.kubernetes.io/name: postgres }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: postgres }
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16
+          ports: [{ name: postgres, containerPort: 5432 }]
+          env:
+            - { name: POSTGRES_DB,       value: taxcalc_dev }
+            - { name: POSTGRES_USER,     value: taxcalc_dev }
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: taxcalc-api-secrets, key: SPRING_DATASOURCE_PASSWORD }
+          readinessProbe:
+            exec: { command: ["pg_isready", "-U", "taxcalc_dev", "-d", "taxcalc_dev"] }
+            periodSeconds: 5
+            failureThreshold: 5
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits:   { memory: 512Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: taxcalc-dev
+  labels: { app.kubernetes.io/name: postgres }
+spec:
+  selector: { app.kubernetes.io/name: postgres }
+  ports: [{ name: postgres, port: 5432, targetPort: postgres }]
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: taxcalc-dev
+  labels: { app.kubernetes.io/name: redis, app.kubernetes.io/part-of: taxcalc }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app.kubernetes.io/name: redis }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: redis }
+    spec:
+      containers:
+        - name: redis
+          image: redis:7
+          ports: [{ name: redis, containerPort: 6379 }]
+          readinessProbe:
+            exec: { command: ["redis-cli", "ping"] }
+            periodSeconds: 5
+            failureThreshold: 5
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits:   { memory: 128Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: taxcalc-dev
+  labels: { app.kubernetes.io/name: redis }
+spec:
+  selector: { app.kubernetes.io/name: redis }
+  ports: [{ name: redis, port: 6379, targetPort: redis }]
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mongo
+  namespace: taxcalc-dev
+  labels: { app.kubernetes.io/name: mongo, app.kubernetes.io/part-of: taxcalc }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app.kubernetes.io/name: mongo }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: mongo }
+    spec:
+      containers:
+        - name: mongo
+          image: mongo:7
+          ports: [{ name: mongo, containerPort: 27017 }]
+          readinessProbe:
+            tcpSocket: { port: mongo }   # mongosh's exec startup cost exceeded the default 1s probe timeout
+            periodSeconds: 5
+            failureThreshold: 5
+          resources:
+            requests: { cpu: 50m, memory: 128Mi }
+            limits:   { memory: 256Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mongo
+  namespace: taxcalc-dev
+  labels: { app.kubernetes.io/name: mongo }
+spec:
+  selector: { app.kubernetes.io/name: mongo }
+  ports: [{ name: mongo, port: 27017, targetPort: mongo }]
+
+---
+# DNS placeholder only - no Deployment/pods behind this Service, no real
+# broker. See the file header comment above for why it still has to exist.
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka
+  namespace: taxcalc-dev
+  labels: { app.kubernetes.io/name: kafka }
+spec:
+  selector: { app.kubernetes.io/name: kafka-broker-not-deployed-in-this-lab }
+  ports: [{ name: kafka, port: 9092, targetPort: 9092 }]

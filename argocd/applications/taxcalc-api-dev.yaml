@@ -1,0 +1,88 @@
+# argocd/applications/taxcalc-api-dev.yaml
+#
+# Single-env Application for the dev overlay - the anchor artefact. The
+# ApplicationSet (argocd/applicationsets/taxcalc-api-envs.yaml) generates the
+# matching staging and prod Applications from a template; this file stays as
+# one concrete, readable Application so a new contributor has something to
+# read that is not a template.
+#
+# IT IS NOT APPLIED ALONGSIDE THE APPLICATIONSET. The ApplicationSet's list
+# generator includes `dev`, so applying both puts two controllers in charge of
+# one Application name - the ApplicationSet controller reconciling it toward
+# the template while a standalone object of the same name sits in the cluster.
+# Task 1 applies this file; Task 3 applies the ApplicationSet and deletes this
+# Application from the cluster (`argocd app delete taxcalc-api-dev`), leaving
+# the file here as documentation. See the repo README.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: taxcalc-api-dev
+  namespace: argocd
+  # Mandatory. Without this finalizer, deleting the Application removes the
+  # Argo CD object and leaves the Deployment, Service, ConfigMap, Secret,
+  # Ingress, HPA and ServiceMonitor orphaned in taxcalc-dev - running, and no
+  # longer managed by anything.
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+  labels:
+    env:  dev
+    # Selected by the notifications ConfigMap's default subscription
+    # (argocd-system/notifications-cm.yaml).
+    team: taxcalc
+spec:
+  # MUST be the project name - never "default". `default` permits '*' for
+  # source repos, destinations and cluster resources, so an Application that
+  # lands there is unguarded no matter how careful this file is.
+  project: taxcalc
+
+  source:
+    repoURL:        https://github.com/AI-Native-2026-07-29-Intuit/arush-adabala-tax-liability-config.git
+    path:           overlays/dev
+    targetRevision: main
+    # No `kustomize.images` override here. The image tag is committed in
+    # overlays/dev/kustomization.yaml and rewritten there by CI's
+    # _bump-config workflow, so the rendered manifest and the file a human
+    # reads in Git are the same thing. Setting it here as well would create a
+    # second place the tag lives, and the Application would silently win.
+    kustomize: {}
+
+  destination:
+    server:    https://kubernetes.default.svc
+    namespace: taxcalc-dev
+
+  syncPolicy:
+    automated:
+      prune:      true   # remove resources deleted from Git
+      selfHeal:   true   # revert drift from a kubectl edit on the live cluster
+      allowEmpty: false  # never sync an empty manifest set (deletes everything)
+    syncOptions:
+      - CreateNamespace=true        # first sync creates taxcalc-dev if missing
+      - ServerSideApply=true        # avoids the 256 kB last-applied-config limit
+      - PrunePropagationPolicy=foreground
+      - PruneLast=true              # workloads pruned AFTER their dependencies
+      - ApplyOutOfSyncOnly=true     # skip already-converged resources
+    retry:
+      limit: 5
+      backoff:
+        duration:    10s
+        factor:      2
+        maxDuration: 3m
+
+  # THE ONE FIELD WHERE "GIT IS THE SOURCE OF TRUTH" IS WRONG.
+  #
+  # base/50-taxcalc-api.hpa.yaml sets minReplicas: 2; overlays/dev sets
+  # replicas: 1. Both are correct - Git holds the value the Deployment is
+  # CREATED with, and the HorizontalPodAutoscaler owns it from then on. Without
+  # this block the two controllers fight forever: the HPA scales to 2, Argo CD
+  # calls that drift, selfHeal writes 1 back, the HPA scales to 2 again. The
+  # Application never settles on Synced and the notifications wired up in
+  # Task 4 alert on a fight that is working as designed.
+  #
+  # Scoped to the one field on the one kind, not a blanket ignore - anything
+  # broader would also hide a real, unexplained edit to the Deployment spec.
+  ignoreDifferences:
+    - group: apps
+      kind:  Deployment
+      name:  taxcalc-api
+      jsonPointers:
+        - /spec/replicas

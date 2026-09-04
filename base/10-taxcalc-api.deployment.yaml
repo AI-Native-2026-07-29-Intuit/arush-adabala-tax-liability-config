@@ -1,0 +1,97 @@
+# manifests/10-taxcalc-api.deployment.yaml - the workload.
+# Pin the image by tag (NOT a moving label); set zero-downtime rollout
+# defaults; use the three-probe pattern from Topic 7; surface the
+# non-root UID from the W5 D1 distroless image; wire envFrom both the
+# ConfigMap and Secret.
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: taxcalc-api
+  namespace: taxcalc-dev
+  labels:
+    app.kubernetes.io/name:       taxcalc-api
+    app.kubernetes.io/component:  api
+    app.kubernetes.io/part-of:    taxcalc
+    app.kubernetes.io/managed-by: kubectl
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: taxcalc-api
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0   # never drop below `replicas` during a rollout
+      maxSurge:       1   # at most one extra pod during a rollout
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name:       taxcalc-api   # MUST match selector
+        app.kubernetes.io/component:  api
+        app.kubernetes.io/part-of:    taxcalc
+        app.kubernetes.io/managed-by: kubectl
+      annotations:
+        # Restart on config / secret content change. CI computes the
+        # hash; this placeholder is rewritten at apply time.
+        checksum/config: "replace-at-apply-time"
+        checksum/secret: "replace-at-apply-time"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser:    65532   # the distroless UID from W5 D1
+        fsGroup:      65532
+      containers:
+        - name:  taxcalc-api
+          image: uptimecrew/taxcalc-api:0.1.3
+          imagePullPolicy: IfNotPresent
+          ports:
+            - { name: http, containerPort: 8080 }
+          envFrom:
+            - configMapRef: { name: taxcalc-api-config }
+            - secretRef:    { name: taxcalc-api-secrets }
+          env:
+            # Make the JVM respect the cgroup memory limit, not host RAM.
+            - name: JAVA_TOOL_OPTIONS
+              value: "-XX:MaxRAMPercentage=75.0 -XX:+ExitOnOutOfMemoryError"
+
+          # ----- resources (requests = scheduler floor; limits = kubelet kill line)
+          #
+          # NOTE - `limits.cpu` is deliberately omitted here (Topic 6: a CPU
+          # limit causes CFS throttling on burst), but that intent does NOT
+          # survive admission in this namespace: 00-namespace.yaml's LimitRange
+          # carries `default: { cpu: 500m }`, and a LimitRange default is
+          # applied per-resource to any container that leaves that resource
+          # unset. The admitted pods therefore run with `limits.cpu: 500m`
+          # regardless of what this file says - verified with
+          # `kubectl get pod -o jsonpath='{...resources}'`, which reports
+          # limits {cpu: 500m, memory: 1Gi}. Both halves are required by the
+          # W5 D3 brief (Task 1 specifies the LimitRange's exact defaults;
+          # Task 3 specifies omitting limits.cpu) and Kubernetes offers no way
+          # to opt a container out of a LimitRange default - there is no
+          # "unlimited" sentinel. To actually get an unthrottled container,
+          # drop `cpu` from the LimitRange's `default:` block. See the README's
+          # W5 D3 section for the full write-up.
+          resources:
+            requests: { cpu: 250m, memory: 512Mi }
+            limits:   {            memory: 1Gi   }   # see NOTE above re: limits.cpu
+
+          # ----- three probes (Topic 7) -----------------------------------
+          startupProbe:                               # owns boot grace
+            httpGet: { path: /actuator/health/liveness, port: http }
+            periodSeconds:    5
+            failureThreshold: 30                       # 30 x 5s = 150s grace
+            timeoutSeconds:   3
+          livenessProbe:                               # "still alive?"
+            httpGet: { path: /actuator/health/liveness, port: http }
+            periodSeconds:       10
+            timeoutSeconds:      3
+            failureThreshold:    3
+            initialDelaySeconds: 0                      # startupProbe owns boot
+          readinessProbe:                               # "ready for traffic?"
+            httpGet: { path: /actuator/health/readiness, port: http }
+            periodSeconds:       5
+            timeoutSeconds:      3
+            failureThreshold:    3
+            successThreshold:    1
+            initialDelaySeconds: 0

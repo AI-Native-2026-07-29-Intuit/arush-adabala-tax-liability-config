@@ -1,0 +1,8 @@
+# Rendered output from `kustomize build` - never committed; the whole point of
+# this repo is that the overlay, not the render, is the source of truth.
+/rendered/
+*.rendered.yaml
+
+# A locally-materialised Secret must never reach Git. base/40-taxcalc-api.secret.yaml
+# carries a placeholder; real values come from a secrets manager (W6 D3: ESO).
+*.secret.local.yaml

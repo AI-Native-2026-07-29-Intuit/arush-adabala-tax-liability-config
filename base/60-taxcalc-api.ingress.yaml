@@ -1,0 +1,33 @@
+# manifests/60-taxcalc-api.ingress.yaml - external reach.
+# ingress-nginx is the cluster's Ingress controller (manifests/05-dev-
+# dependencies.yaml's header note doesn't cover it - it's deployed
+# separately, see the README's Week 5 Day 3 section for how). The k3d
+# cluster was created with --port "8080:80@loadbalancer", so a curl to
+# localhost:8080 with the matching Host header reaches this Ingress.
+# Use `ingressClassName` (NOT the deprecated annotation form).
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: taxcalc-api
+  namespace: taxcalc-dev
+  labels:
+    app.kubernetes.io/name:       taxcalc-api
+    app.kubernetes.io/component:  api
+    app.kubernetes.io/part-of:    taxcalc
+    app.kubernetes.io/managed-by: kubectl
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size:    "1m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "30"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: taxcalc.dev.uptimecrew.internal
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: taxcalc-api
+                port: { number: 8080 }

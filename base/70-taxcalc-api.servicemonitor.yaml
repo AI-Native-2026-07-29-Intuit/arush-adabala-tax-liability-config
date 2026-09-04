@@ -1,0 +1,44 @@
+# manifests/observability/taxcalc-api-servicemonitor.yaml
+#
+# A ServiceMonitor is the Prometheus Operator's way of saying "scrape every Pod behind this
+# Service, at this path, this often". The Operator watches these objects and rewrites the
+# Prometheus scrape configuration itself, so nobody ever edits prometheus.yml by hand.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: taxcalc-api
+  namespace: taxcalc-dev          # lives next to the Service it selects, not next to Prometheus
+  labels:
+    # CRITICAL, and silent when wrong: the Prometheus CR's serviceMonitorSelector defaults to
+    # `release: kube-prometheus-stack` in this chart. A ServiceMonitor without that label is
+    # simply never selected - no error, no failing target, just a dashboard with no data.
+    release: kube-prometheus-stack
+    app.kubernetes.io/name:       taxcalc-api
+    app.kubernetes.io/component:  api
+    app.kubernetes.io/part-of:    taxcalc
+    app.kubernetes.io/managed-by: kubectl
+spec:
+  selector:
+    matchLabels:
+      # Matches the Service authored on W5 D3 (manifests/20-taxcalc-api.service.yaml).
+      app.kubernetes.io/name: taxcalc-api
+  namespaceSelector:
+    matchNames: [taxcalc-dev]
+  endpoints:
+    - port: http                  # the Service port's NAME, never its number
+      path: /actuator/prometheus
+      interval: 15s               # matches the stack's default scrape interval
+      scrapeTimeout: 10s
+      metricRelabelings:
+        # Spring Boot tags http_server_requests with the thrown exception's class name on error
+        # responses. That is a per-bug label value that multiplies the series count for exactly
+        # the requests you care most about, and the RED panels only ever group by
+        # method/uri/status/outcome - so the LABEL is removed at scrape time. The same
+        # information is still on the span and in the log line.
+        #
+        # `labeldrop`, deliberately not `drop`: an `action: drop` keyed on a non-empty
+        # `exception` (the shape this is usually written as) discards the whole time series
+        # rather than the label, which would silently delete every 5xx series and leave the
+        # Errors panel permanently at zero - the one panel whose emptiness looks like good news.
+        - regex: exception
+          action: labeldrop
