@@ -37,11 +37,34 @@ metadata:
   name: taxcalc-api-envs
   namespace: argocd
 spec:
-  # If an env falls out of the matrix, KEEP the existing Application and its
+  # If an env falls out of the matrix, KEEP the existing Application's
   # workload running; a human re-reviews before any teardown. The default
   # (delete) is the wrong default for prod: removing one line from the list
-  # below would otherwise delete a running environment on the next reconcile,
-  # with the resources-finalizer pruning every resource behind it.
+  # below would otherwise tear down a running environment on the next
+  # reconcile.
+  #
+  # THIS SETTING ALONE IS NOT ENOUGH, AND THE OBVIOUS TEMPLATE DEFEATS IT.
+  # `preserveResourcesOnDeletion: true` is not a flag the controller checks at
+  # deletion time - it works by NOT putting `resources-finalizer.argocd
+  # .argoproj.io` on the generated Applications. An explicit `finalizers:`
+  # block in the template below therefore silently overrides it: the finalizer
+  # is present, so deleting the Application cascades to its resources exactly
+  # as if this line were absent.
+  #
+  # Measured, not assumed. With the finalizer in the template, removing the
+  # `staging` element from the list generator deleted the Application AND
+  # every resource behind it - `kubectl -n taxcalc-staging get deploy,pods`
+  # returned "No resources found" within 25 seconds, while this setting said
+  # they would be preserved. With the finalizer removed, the same edit leaves
+  # the Deployment, Service, ConfigMap, Ingress, HPA and ServiceMonitor
+  # running and merely stops managing them.
+  #
+  # The trade-off is real and is the point: a generated Application that is
+  # deleted now ORPHANS its resources rather than cleaning them up. That is
+  # the correct default for an env list - dropping a line is usually a
+  # refactor, not a decommission - and it is why the standalone
+  # argocd/applications/taxcalc-api-dev.yaml still carries the finalizer:
+  # deleting that one IS a decommission.
   syncPolicy:
     preserveResourcesOnDeletion: true
 
@@ -77,8 +100,11 @@ spec:
       # compose them from the params rather than hardcoding.
       name:      taxcalc-api-{{env}}
       namespace: argocd
-      finalizers:
-        - resources-finalizer.argocd.argoproj.io
+      # DELIBERATELY NO `finalizers:` HERE - see preserveResourcesOnDeletion
+      # above. Adding `resources-finalizer.argocd.argoproj.io` back to this
+      # template turns that setting into a no-op, and the failure is silent:
+      # the ApplicationSet still reports Healthy while an env dropped from the
+      # list takes its whole workload with it.
       annotations:
         # Sync-wave on the generated APPLICATION - a different axis from the
         # sync-waves inside base/kustomization.yaml. This one orders the three
