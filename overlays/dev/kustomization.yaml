@@ -31,7 +31,7 @@ namespace: taxcalc-dev
 images:
   - name:    uptimecrew/taxcalc-api
     newName: uptimecrew/taxcalc-api
-    newTag:  "0.0.0-does-not-exist"
+    newTag:  "0.2.0"
 
 # Per-env replica count. dev runs hot at one replica.
 #
