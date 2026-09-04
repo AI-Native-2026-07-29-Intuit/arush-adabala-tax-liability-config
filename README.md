@@ -13,7 +13,6 @@ base/                              W5 D3 manifests, copied verbatim, identical i
   10-taxcalc-api.deployment.yaml
   20-taxcalc-api.service.yaml
   30-taxcalc-api.configmap.yaml
-  40-taxcalc-api.secret.yaml
   50-taxcalc-api.hpa.yaml
   60-taxcalc-api.ingress.yaml
   70-taxcalc-api.servicemonitor.yaml
@@ -44,7 +43,12 @@ platform/
 
 A rollback is `git revert` on this repo. A drifted cluster is a controller alarm, not a discovery.
 
-## Three things that are deliberately not here
+```
+scripts/
+  verify-appproject-guardrails.sh  asserts the project actually refuses what it claims to
+```
+
+## Four things that are deliberately not in `base/`
 
 **No `Namespace` object in `base/`.** The AppProject sets `clusterResourceWhitelist: []` — a full deny on every cluster-scoped kind. Argo CD classifies a resource as cluster- or namespace-scoped from the API server's discovery data, not from whether the manifest happens to carry a `namespace:` field, so a `Namespace` in the manifest set is rejected regardless of what `namespaceResourceWhitelist` says. The Applications carry `CreateNamespace=true` instead, which creates the destination namespace as part of the sync *operation* rather than as a managed resource.
 
@@ -58,7 +62,17 @@ kubectl apply -f platform/00-namespaces.yaml
 kubectl apply -f platform/secret/40-taxcalc-api.secret.yaml
 ```
 
-**No secrets.** `base/40-taxcalc-api.secret.yaml` carries the W5 D3 placeholder (`replace-at-apply-time-from-secrets-manager`). The Slack webhook that `argocd-system/notifications-cm.yaml` references lives in the `argocd-notifications-secret`, created out-of-band with `kubectl create secret generic` and never committed. W6 D3 replaces the placeholder with External Secrets Operator + IRSA.
+**No `Secret` in `base/`, and this one was learned the hard way.** The W5 D3 file carried a placeholder password. Under `kubectl apply -f manifests/` that placeholder was *inert* — CI reseeded the Secret from a real store after applying, so the last writer held a real value. Continuous reconciliation removes that ordering: on the first sync Argo CD wrote the placeholder over the seeded password and every api pod started failing `FATAL: password authentication failed for user "taxcalc_dev"`. With `selfHeal: true` a hand re-seed survives exactly one reconcile interval, so the failure returns a few minutes later — strictly harder to debug than failing outright. A placeholder secret inside a continuously-reconciled manifest set is worse than no secret in the set at all. The shape lives in `platform/secret/40-taxcalc-api.secret.yaml`; the value is seeded out-of-band with **`delete` then `create`, never `apply`** (see that file for why the tracking label matters).
+
+The Slack webhook that `argocd-system/notifications-cm.yaml` references lives in `argocd-notifications-secret`, created out-of-band and never committed. W6 D3 replaces both with External Secrets Operator + IRSA.
+
+## Verifying the guardrails
+
+```bash
+./scripts/verify-appproject-guardrails.sh     # 6 passed, 0 failed
+```
+
+Five deny paths (`destinations`, `sourceRepos`, `clusterResourceWhitelist: []` vs `Namespace`, and the `ResourceQuota`/`LimitRange` blacklist) plus a positive control — the real dev Application must still be `Synced`, which is what stops the script from passing by refusing everything. It is validated against a deliberately permissive scratch AppProject; see the script header.
 
 ## Bootstrapping this into a cluster
 
