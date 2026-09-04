@@ -1,0 +1,124 @@
+# argocd-system/notifications-cm.yaml
+#
+# Wires argocd-notifications-controller to Slack. The webhook URL is held in
+# the argocd-notifications-secret:
+#
+#   kubectl -n argocd create secret generic argocd-notifications-secret \
+#     --from-literal=slack-token="$SLACK_WEBHOOK_URL"
+#
+# This ConfigMap declares only the triggers, the templates, and the named
+# service that POINTS AT the secret. Engineers do NOT commit the secret - it is
+# created out-of-band by the platform team, the same rule that moved
+# platform/secret/40-taxcalc-api.secret.yaml out of the synced manifest set.
+#
+# APPLY + RESTART. The controller reads this ConfigMap at startup and does not
+# watch it, so `kubectl apply` alone changes nothing:
+#
+#   kubectl apply -f argocd-system/notifications-cm.yaml -n argocd
+#   kubectl -n argocd rollout restart deploy/argocd-notifications-controller
+#
+# A ConfigMap edit that appears to do nothing is almost always a missed
+# restart.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: argocd-notifications-cm
+  namespace: argocd
+data:
+  # ----- Where to deliver notifications -------------------------------------
+  # `$slack-token` is resolved from the argocd-notifications-secret at
+  # runtime. The `service.slack` name is what `recipients: [slack:...]` below
+  # refers to.
+  service.slack: |
+    token: $slack-token
+
+  # ----- Triggers (WHEN to fire) --------------------------------------------
+  # The nil guard is NOT boilerplate. Written as the textbook
+  # `app.status.operationState.phase in ['Error','Failed']`, this trigger
+  # throws on any Application that has no recorded operation yet - a
+  # freshly-generated one, or one Argo CD has only ever compared and never
+  # synced:
+  #
+  #   level=error msg="failed to execute when condition: cannot fetch phase
+  #    from <nil> (1:27) | app.status.operationState.phase in ['Error',
+  #    'Failed']"
+  #
+  # Observed on taxcalc-api-staging within seconds of the first controller
+  # restart. It is logged at error level and otherwise swallowed, so the
+  # trigger simply does not evaluate for that Application - and the window in
+  # which it silently does not evaluate is exactly the window in which a
+  # brand-new environment is most likely to fail its first sync.
+  trigger.on-sync-failed: |
+    - description: Application sync failed.
+      send:   [app-sync-failed]
+      when:   app.status.operationState != nil and app.status.operationState.phase in ['Error', 'Failed']
+
+  # `health.status` is populated as soon as Argo CD compares an Application,
+  # so this one needs no nil guard - but it is written defensively anyway,
+  # because the failure mode above is silent and the cost here is one clause.
+  trigger.on-health-degraded: |
+    - description: Application health degraded.
+      send:   [app-health-degraded]
+      when:   app.status.health != nil and app.status.health.status == 'Degraded'
+
+  # NOTE: on-sync-succeeded is DELIBERATELY omitted, and this is the single
+  # most consequential line in the file. Subscribing every Application to a
+  # success trigger produces a deploy-firehose: on a busy day #taxcalc-deploys
+  # fills with green messages nobody reads, somebody mutes the channel, and
+  # the mute silences the FAILURES too. The channel then looks healthy
+  # precisely because it has stopped working.
+  #
+  # The rule is: alert on bad outcomes only. "What deployed when" is already
+  # answered better by two places that cannot be muted - the Git history of
+  # this repo, and the Argo CD UI's per-Application sync history.
+
+  # ----- Templates (HOW to render) ------------------------------------------
+  template.app-sync-failed: |
+    message: |
+      {{.app.metadata.name}} sync FAILED at {{.app.status.operationState.finishedAt}}.
+      Project:   {{.app.spec.project}}
+      Revision:  {{.app.status.operationState.syncResult.revision}}
+      Phase:     {{.app.status.operationState.phase}}
+      Message:   {{.app.status.operationState.message}}
+    slack:
+      attachments: |
+        [{
+          "title":  "{{.app.metadata.name}} sync failed",
+          "color":  "#E96D76",
+          "fields": [
+            {"title": "Project",  "value": "{{.app.spec.project}}", "short": true},
+            {"title": "Revision", "value": "{{.app.status.operationState.syncResult.revision}}", "short": true}
+          ]
+        }]
+
+  template.app-health-degraded: |
+    message: |
+      {{.app.metadata.name}} health is DEGRADED.
+      Project:   {{.app.spec.project}}
+      Status:    {{.app.status.health.status}}
+      Message:   {{.app.status.health.message}}
+    slack:
+      attachments: |
+        [{
+          "title":  "{{.app.metadata.name}} health degraded",
+          "color":  "#F2C744",
+          "fields": [
+            {"title": "Status",  "value": "{{.app.status.health.status}}", "short": true},
+            {"title": "Message", "value": "{{.app.status.health.message}}", "short": false}
+          ]
+        }]
+
+  # ----- Default subscriptions ----------------------------------------------
+  # Routes EVERY Application labelled team=taxcalc to the two triggers, so a
+  # new environment added to the ApplicationSet is alerted on the moment it is
+  # generated. The alternative - per-Application
+  # `notifications.argoproj.io/subscribe.*` annotations - is opt-in, and the
+  # Application most likely to be missing one is the one somebody added in a
+  # hurry.
+  #
+  # The template's `labels: { team: taxcalc }` is what makes this selector
+  # match; changing it silently unsubscribes the whole project.
+  subscriptions: |
+    - recipients: [slack:taxcalc-deploys]
+      triggers:   [on-sync-failed, on-health-degraded]
+      selector:   "team=taxcalc"
