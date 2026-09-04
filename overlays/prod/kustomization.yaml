@@ -37,6 +37,24 @@ patches:
         path: /data/LOGGING_LEVEL_ROOT
         value: "WARN"
 
+  # HPA floor, patched per env to MATCH the replica count above.
+  #
+  # base/50-taxcalc-api.hpa.yaml sets minReplicas: 2 for every environment,
+  # which silently overrides `replicas:` here: the HPA scales the Deployment
+  # back up to its own floor within a reconcile, and because
+  # Deployment.spec.replicas is in ignoreDifferences, Argo CD reports Synced
+  # while the live replica count disagrees with Git. dev asked for 1 and ran 2.
+  #
+  # Aligning the floor with the overlay's replica count is what makes Git and
+  # the HPA agree at rest. ignoreDifferences is still correct and still needed
+  # - it is what lets the HPA scale UP under load without Argo CD calling that
+  # drift - but the two no longer contradict each other at the floor.
+  - target: { kind: HorizontalPodAutoscaler, name: taxcalc-api }
+    patch: |
+      - op: replace
+        path: /spec/minReplicas
+        value: 3
+
   - target: { kind: Ingress, name: taxcalc-api }
     patch: |
       - op: replace
