@@ -1,10 +1,27 @@
 # argocd-system/notifications-cm.yaml
 #
-# Wires argocd-notifications-controller to Slack. The webhook URL is held in
-# the argocd-notifications-secret:
+# Wires argocd-notifications-controller to Slack. The credential is held in the
+# argocd-notifications-secret:
 #
 #   kubectl -n argocd create secret generic argocd-notifications-secret \
-#     --from-literal=slack-token="$SLACK_WEBHOOK_URL"
+#     --from-literal=slack-token="$SLACK_BOT_TOKEN"
+#
+# A BOT TOKEN (xoxb-...), NOT AN INCOMING-WEBHOOK URL - and the difference is
+# invisible until the first alert fires. `service.slack` is the Slack *API*
+# integration: the controller sends the token as a bearer credential to
+# https://slack.com/api/chat.postMessage and names the channel in
+# `recipients: [slack:taxcalc-deploys]`. Putting an incoming-webhook URL in
+# `slack-token` therefore does not post to that webhook at all; it is sent as
+# a token to chat.postMessage and rejected. Confirmed from the controller's own
+# outbound request during the Task 4 failure injection:
+#
+#   msg="Failed to notify recipient {slack taxcalc-deploys} ...:
+#    Post \"https://slack.com/api/chat.postMessage\": ..."
+#
+# The URL in that error is the whole finding - it is not the webhook URL that
+# was supplied. An incoming webhook needs `service.webhook.<name>` with a `url:`
+# field and `recipients: [<name>]` instead, which is a different service type
+# and a different subscription entry.
 #
 # This ConfigMap declares only the triggers, the templates, and the named
 # service that POINTS AT the secret. Engineers do NOT commit the secret - it is
