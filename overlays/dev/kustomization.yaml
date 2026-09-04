@@ -28,10 +28,47 @@ namespace: taxcalc-dev
 # tag resolves to ImagePullBackOff, which makes the Application permanently
 # Degraded and turns the deliberate-failure experiment in Task 4 into noise
 # that cannot be told apart from the failure being tested.
+#
+# This is THE IMAGE CI ACTUALLY PUSHED, not a local rebuild: tag
+# ec36057e... is the GHCR artefact from the taxcalc-api ci run on that main
+# commit, and it resolves to digest sha256:b1b3c2e7e530b670... which is
+# byte-identical to what `gh api .../packages/container/taxcalc-api/versions`
+# reports for that tag.
+#
+# TWO THINGS MAKE THIS WORK ON A LAPTOP, AND BOTH ARE WORTH KNOWING BEFORE
+# ANYONE COPIES THIS INTO A REAL CLUSTER:
+#
+#   1. The GHCR package is PRIVATE, and org policy blocks changing package
+#      visibility (recorded in the app repo's .github/PIPELINE.md). A real
+#      cluster therefore cannot pull this reference at all without an
+#      imagePullSecret holding a long-lived PAT - which sits badly beside the
+#      OIDC / no-long-lived-credentials premise the pipeline just established.
+#      The k3d lab sidesteps it entirely by SIDE-LOADING: the image is pulled
+#      on the host (where docker is already authenticated) and pushed into the
+#      nodes' image stores with `k3d image import`, so the kubelet never
+#      contacts a registry. `imagePullPolicy: IfNotPresent` in the base is what
+#      makes that work.
+#
+#   2. CI publishes linux/amd64 ONLY, and k3d nodes on Apple Silicon are
+#      arm64. This image runs anyway because the Rancher Desktop VM has binfmt
+#      registered, so containerd executes it under emulation - verified with a
+#      throwaway pod before committing this (`java -version` from the image's
+#      own jlinked JRE returned Temurin 21.0.12 on an arm64 node). It is
+#      EMULATED, so it is slower than a native build; that is acceptable for a
+#      lab and is not acceptable for anything measuring latency. The real fix
+#      is a multi-arch build (`platforms: linux/amd64,linux/arm64`) in
+#      _build-and-push.yml, which is not free here - the Dockerfile's builder
+#      stage runs Gradle and the jlink stage builds a custom JRE, both of
+#      which are slow under QEMU.
+#
+# Reproduce the side-load with:
+#   docker pull --platform linux/amd64 ghcr.io/ai-native-2026-07-29-intuit/taxcalc-api:<sha>
+#   k3d image import -c taxcalc ghcr.io/ai-native-2026-07-29-intuit/taxcalc-api:<sha>
+#   # ...and once per agent node - `-c` imported into the server node only here
 images:
   - name:    uptimecrew/taxcalc-api
-    newName: uptimecrew/taxcalc-api
-    newTag:  "0.2.0"
+    newName: ghcr.io/ai-native-2026-07-29-intuit/taxcalc-api
+    newTag:  "ec36057e457f27aa342bd0616797d8d86a670a7d"
 
 # Per-env replica count. dev runs hot at one replica.
 #
