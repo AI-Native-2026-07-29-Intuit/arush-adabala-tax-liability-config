@@ -30,6 +30,7 @@ argocd-system/
   notifications-cm.yaml            on-sync-failed + on-health-degraded -> #taxcalc-deploys
 platform/
   00-namespaces.yaml               Namespaces + ResourceQuota + LimitRange - NOT synced by Argo CD
+  secret/40-taxcalc-api.secret.yaml  Secret SHAPE only; real value seeded out-of-band
 ```
 
 ## The reconcile loop
@@ -53,6 +54,8 @@ Both live in `platform/00-namespaces.yaml` and are applied out-of-band by the pl
 
 ```bash
 kubectl apply -f platform/00-namespaces.yaml
+# Secret SHAPE (placeholder) - then overwrite with a real value, see that file
+kubectl apply -f platform/secret/40-taxcalc-api.secret.yaml
 ```
 
 **No secrets.** `base/40-taxcalc-api.secret.yaml` carries the W5 D3 placeholder (`replace-at-apply-time-from-secrets-manager`). The Slack webhook that `argocd-system/notifications-cm.yaml` references lives in the `argocd-notifications-secret`, created out-of-band with `kubectl create secret generic` and never committed. W6 D3 replaces the placeholder with External Secrets Operator + IRSA.
@@ -62,6 +65,8 @@ kubectl apply -f platform/00-namespaces.yaml
 ```bash
 # Namespaces + quotas (platform team, out-of-band)
 kubectl apply -f platform/00-namespaces.yaml
+# Secret SHAPE (placeholder) - then overwrite with a real value, see that file
+kubectl apply -f platform/secret/40-taxcalc-api.secret.yaml
 
 # The guardrail first - an Application applied before its project is rejected
 kubectl apply -f argocd/projects/taxcalc.yaml -n argocd
