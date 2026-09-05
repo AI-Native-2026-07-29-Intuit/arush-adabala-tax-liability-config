@@ -1,7 +1,0 @@
-# TEMPORARY - Task 4 notification verification. A Namespace is cluster-scoped
-# and the taxcalc AppProject sets clusterResourceWhitelist: [], so syncing this
-# fails the whole operation and fires on-sync-failed. Reverted immediately.
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: taxcalc-deliberate-sync-failure
