@@ -108,20 +108,30 @@ data:
           ]
         }]
 
+  # `.app.status.health.message` IS OFTEN EMPTY, and rendering it bare prints
+  # the literal string "<no value>" into the channel - observed on
+  # taxcalc-api-prod and -staging. Argo CD populates that field only when a
+  # resource reports a specific reason; when an Application degrades because
+  # aggregate pod readiness dropped, there is no message at all. An alert that
+  # says DEGRADED and gives no reason is worse than useless: it is the kind of
+  # thing people learn to skim, which is the same failure mode the omitted
+  # on-sync-succeeded trigger exists to avoid.
   template.app-health-degraded: |
     message: |
       {{.app.metadata.name}} health is DEGRADED.
       Project:   {{.app.spec.project}}
       Status:    {{.app.status.health.status}}
-      Message:   {{.app.status.health.message}}
+      Sync:      {{.app.status.sync.status}} @ {{.app.status.sync.revision}}
+      Message:   {{if .app.status.health.message}}{{.app.status.health.message}}{{else}}(none reported - Argo CD leaves this empty when an Application degrades on aggregate pod readiness rather than a specific resource. Check the resource tree; if every pod is Running with no restarts, suspect the node/VM rather than the workload.){{end}}
     slack:
       attachments: |
         [{
           "title":  "{{.app.metadata.name}} health degraded",
           "color":  "#F2C744",
           "fields": [
-            {"title": "Status",  "value": "{{.app.status.health.status}}", "short": true},
-            {"title": "Message", "value": "{{.app.status.health.message}}", "short": false}
+            {"title": "Status",   "value": "{{.app.status.health.status}}", "short": true},
+            {"title": "Revision", "value": "{{.app.status.sync.revision}}", "short": true},
+            {"title": "Message",  "value": "{{if .app.status.health.message}}{{.app.status.health.message}}{{else}}(none reported - check the resource tree){{end}}", "short": false}
           ]
         }]
 
