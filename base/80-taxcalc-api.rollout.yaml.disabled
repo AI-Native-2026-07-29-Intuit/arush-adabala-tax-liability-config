@@ -1,0 +1,111 @@
+# base/80-taxcalc-api.rollout.yaml.disabled
+#
+# W6 D5 lands this.
+#
+# Produced by the W6 D2 `argocd-author` audit pass:
+#
+#   /argocd-author taxcalc-api --namespace-prefix taxcalc --strategy canary --secrets-mode eso
+#
+# The generator scaffolded a Rollout before Argo Rollouts was installed. That
+# is CORRECT behaviour for `--strategy canary`, not a defect, so this artefact
+# is kept rather than discarded - "the CRD is missing" is an argument about
+# when to apply something, not about whether it is the right thing to apply.
+# It is commented out (and the file carries a .disabled suffix so Kustomize
+# cannot pick it up even if someone adds a glob to base/kustomization.yaml)
+# because applying it today fails three separate ways:
+#
+#   1. No argoproj.io/Rollout CRD on this cluster - the API server rejects it.
+#   2. `Rollout` and `AnalysisTemplate` are absent from the AppProject's
+#      namespaceResourceWhitelist, so the sync would be denied even with the
+#      CRD present. The generator added both; adopt that change WITH the
+#      install, not before it.
+#   3. A Rollout and the existing Deployment both select
+#      app.kubernetes.io/name=taxcalc-api. Two controllers owning one pod set
+#      fight indefinitely. base/10-taxcalc-api.deployment.yaml must be removed
+#      from base/kustomization.yaml in the same commit that enables this.
+#
+# The AnalysisTemplate query is the W5 D5 success-rate SLI. W6 D5 gates the
+# canary on p99 latency, which needs the multi-arch build first: the dev image
+# currently runs under binfmt emulation at ~8-9x idle CPU, and a p99 measured
+# against an emulated binary says nothing about production. See the emulation
+# section above.
+#
+# ---------------------------------------------------------------------------
+# apiVersion: argoproj.io/v1alpha1
+# kind: Rollout
+# metadata:
+#   name: taxcalc-api
+#   labels:
+#     app.kubernetes.io/name: taxcalc-api
+#   annotations:
+#     argocd.argoproj.io/sync-wave: "0"
+# spec:
+#   replicas: 1
+#   revisionHistoryLimit: 3
+#   selector:
+#     matchLabels:
+#       app.kubernetes.io/name: taxcalc-api
+#   strategy:
+#     canary:
+#       canaryService: taxcalc-api-canary
+#       stableService: taxcalc-api
+#       trafficRouting:
+#         nginx:
+#           stableIngress: taxcalc-api
+#       steps:
+#         - setWeight: 10
+#         - pause: { duration: 2m }
+#         - analysis:
+#             templates:
+#               - templateName: taxcalc-api-success-rate
+#         - setWeight: 50
+#         - pause: { duration: 5m }
+#         - analysis:
+#             templates:
+#               - templateName: taxcalc-api-success-rate
+#         - setWeight: 100
+#   template:
+#     metadata:
+#       labels:
+#         app.kubernetes.io/name: taxcalc-api
+#     spec:
+#       containers:
+#         - name: taxcalc-api
+#           image: uptimecrew/taxcalc-api:PLACEHOLDER
+#           ports:
+#             - { name: http, containerPort: 8080 }
+#           envFrom:
+#             - configMapRef: { name: taxcalc-api-config }
+#             - secretRef: { name: taxcalc-api-secrets }
+#           startupProbe:
+#             httpGet: { path: /actuator/health/liveness, port: http }
+#             failureThreshold: 30
+#             periodSeconds: 5
+#           livenessProbe:
+#             httpGet: { path: /actuator/health/liveness, port: http }
+#             periodSeconds: 10
+#           readinessProbe:
+#             httpGet: { path: /actuator/health/readiness, port: http }
+#             periodSeconds: 10
+#           resources:
+#             requests: { cpu: 250m, memory: 512Mi }
+#             limits:   { cpu: "1", memory: 1Gi }
+# ---
+# apiVersion: argoproj.io/v1alpha1
+# kind: AnalysisTemplate
+# metadata:
+#   name: taxcalc-api-success-rate
+# spec:
+#   metrics:
+#     - name: success-rate
+#       interval: 1m
+#       count: 3
+#       successCondition: result[0] >= 0.99
+#       failureLimit: 1
+#       provider:
+#         prometheus:
+#           address: http://prometheus-operated.observability.svc:9090
+#           query: |
+#             sum(rate(http_server_requests_seconds_count{job="taxcalc-api",status!~"5.."}[2m]))
+#             /
+#             sum(rate(http_server_requests_seconds_count{job="taxcalc-api"}[2m]))
