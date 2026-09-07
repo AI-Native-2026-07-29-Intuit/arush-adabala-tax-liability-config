@@ -1,0 +1,16 @@
+# TEMPORARY - W6 D2 Task 4 verification, reverted by the follow-up PR.
+#
+# A Namespace is cluster-scoped, and the taxcalc AppProject sets
+# clusterResourceWhitelist: [] (a full deny). Argo CD therefore refuses this
+# resource at SYNC time, which fails the whole sync operation and drives
+# status.operationState.phase to Failed - firing on-sync-failed.
+#
+# Chosen over the spec's suggested "non-existent image tag" deliberately: a bad
+# tag leaves the sync SUCCEEDING and degrades health instead, so it exercises
+# on-health-degraded and takes the Deployment's full progressDeadlineSeconds
+# (600s) to show up. This fails the sync itself, which is what the task asks to
+# watch, and lands as soon as the retry budget is spent.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: taxcalc-deliberate-sync-failure
