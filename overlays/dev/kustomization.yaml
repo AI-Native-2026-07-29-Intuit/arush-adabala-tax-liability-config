@@ -10,7 +10,7 @@ kind: Kustomization
 # The unchanged W5 D3 manifests, copied verbatim into base/. Identical across
 # every environment - if a change belongs in all three, it belongs there.
 resources:
-  - ../../base
+- ../../base
 
 # Per-env namespace. Kustomize rewrites every resource's metadata.namespace at
 # build time, so the base files' own `namespace: taxcalc-dev` lines are
@@ -66,9 +66,9 @@ namespace: taxcalc-dev
 #   k3d image import -c taxcalc ghcr.io/ai-native-2026-07-29-intuit/taxcalc-api:<sha>
 #   # ...and once per agent node - `-c` imported into the server node only here
 images:
-  - name:    uptimecrew/taxcalc-api
-    newName: ghcr.io/ai-native-2026-07-29-intuit/taxcalc-api
-    newTag:  "ec36057e457f27aa342bd0616797d8d86a670a7d"
+- name: uptimecrew/taxcalc-api
+  newName: uptimecrew/taxcalc-api
+  newTag: 9d3c9e8b74b4f06799da2044833fe09abb9bd872
 
 # Per-env replica count. dev runs hot at one replica.
 #
@@ -80,8 +80,8 @@ images:
 # value, the HPA owns it thereafter, and Argo CD stops calling the HPA's work
 # drift. This is the one field where "Git is the source of truth" is wrong.
 replicas:
-  - name:  taxcalc-api
-    count: 1
+- count: 1
+  name: taxcalc-api
 
 # Per-env config patch - override the W5 D3 ConfigMap entries that should
 # differ between environments (Spring profile, log level).
@@ -97,15 +97,6 @@ replicas:
 # LOGGING_LEVEL_ROOT is the key the base actually uses, not the reference
 # layout's LOG_LEVEL - Spring Boot's relaxed binding maps it to
 # logging.level.root; a LOG_LEVEL key would be read by nothing.
-patches:
-  - target: { kind: ConfigMap, name: taxcalc-api-config }
-    patch: |
-      - op: replace
-        path: /data/SPRING_PROFILES_ACTIVE
-        value: "k8s,dev"
-      - op: replace
-        path: /data/LOGGING_LEVEL_ROOT
-        value: "DEBUG"
 
   # Per-env Ingress host. All three environments share one ingress-nginx on
   # the k3d cluster, so the host header is the only thing separating them.
@@ -121,14 +112,29 @@ patches:
   # the HPA agree at rest. ignoreDifferences is still correct and still needed
   # - it is what lets the HPA scale UP under load without Argo CD calling that
   # drift - but the two no longer contradict each other at the floor.
-  - target: { kind: HorizontalPodAutoscaler, name: taxcalc-api }
-    patch: |
-      - op: replace
-        path: /spec/minReplicas
-        value: 1
 
-  - target: { kind: Ingress, name: taxcalc-api }
-    patch: |
-      - op: replace
-        path: /spec/rules/0/host
-        value: taxcalc.dev.uptimecrew.internal
+patches:
+- patch: |
+    - op: replace
+      path: /data/SPRING_PROFILES_ACTIVE
+      value: "k8s,dev"
+    - op: replace
+      path: /data/LOGGING_LEVEL_ROOT
+      value: "DEBUG"
+  target:
+    kind: ConfigMap
+    name: taxcalc-api-config
+- patch: |
+    - op: replace
+      path: /spec/minReplicas
+      value: 1
+  target:
+    kind: HorizontalPodAutoscaler
+    name: taxcalc-api
+- patch: |
+    - op: replace
+      path: /spec/rules/0/host
+      value: taxcalc.dev.uptimecrew.internal
+  target:
+    kind: Ingress
+    name: taxcalc-api
