@@ -26,6 +26,7 @@ on:
   pull_request:
     paths:
       - "cfn/**"
+      - "scripts/cfn-guardrails.sh"
       - ".github/workflows/cfn-validate.yml"
 
 permissions:
@@ -79,6 +80,19 @@ jobs:
       # the justification in the diff where a reviewer argues with it.
       - name: cfn-nag
         run: cfn_nag_scan --input-path cfn --fail-on-warnings --output-format txt
+
+      # Static half of scripts/cfn-guardrails.sh - no AWS call, no credentials,
+      # so it gates every PR regardless of whether an account exists.
+      #
+      # It asserts the cross-stack contract from the templates themselves:
+      # taxcalc-app-dev must still consume taxcalc-network-dev by !ImportValue.
+      # That catches the mistake most likely to be made in good faith - swapping
+      # an import for a hardcoded subnet id because the import was awkward -
+      # which neither cfn-lint nor cfn-nag has an opinion about, and which
+      # silently removes the protection that stops a network rebuild from
+      # orphaning the app stack.
+      - name: cross-stack guardrails (static)
+        run: ./scripts/cfn-guardrails.sh --static
 
       # The AWS half is guarded on vars.AWS_ACCOUNT_ID rather than assumed.
       # configure-aws-credentials cannot do anything with an empty
