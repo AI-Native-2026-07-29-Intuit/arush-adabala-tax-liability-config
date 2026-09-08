@@ -1,0 +1,272 @@
+# cfn/taxcalc-bootstrap-dev.yaml
+#
+# TASK 1 baseline stack: the first CloudFormation stack this capstone deploys.
+# It creates two things that every later stack depends on:
+#
+#   1. A hardened S3 bucket for CFN artefacts - the destination for
+#      `aws cloudformation package` when a template outgrows the 51,200-byte
+#      inline --template-body limit.
+#   2. The IAM role GitHub Actions assumes via OIDC to deploy every other
+#      stack in this repo (W6 D1 shipped the OIDC federation; this role is
+#      the CloudFormation-scoped consumer of it).
+#
+# The role's policy enumerates Action explicitly and scopes Resource to the
+# `taxcalc-*` stack ARN pattern. Never Action: '*' / Resource: '*' - a deploy
+# role that can create any stack can create a stack that grants itself
+# administrator, which makes every other control in this file decorative.
+#
+# Deploy with the ChangeSet flow (never `deploy` / `update-stack` directly):
+#   aws cloudformation create-change-set \
+#     --stack-name taxcalc-bootstrap-dev \
+#     --change-set-name initial --change-set-type CREATE \
+#     --capabilities CAPABILITY_NAMED_IAM \
+#     --template-body file://cfn/taxcalc-bootstrap-dev.yaml \
+#     --parameters ParameterKey=EnvName,ParameterValue=dev \
+#     --region us-east-1
+#   aws cloudformation describe-change-set ...   # review, paste diff into PR
+#   aws cloudformation execute-change-set ...
+#
+# CAPABILITY_NAMED_IAM (not CAPABILITY_IAM) because CfnDeployRole sets an
+# explicit RoleName - CFN requires the stronger acknowledgement whenever an
+# IAM principal's name is fixed by the template rather than generated.
+AWSTemplateFormatVersion: "2010-09-09"
+Description: taxcalc bootstrap stack - artefact bucket starter + CFN deploy role.
+
+Parameters:
+  EnvName:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: >-
+      Deployment environment. Selects the bucket name suffix and tags every
+      resource; this stack is otherwise environment-independent.
+
+  RetentionDays:
+    Type: Number
+    Default: 30
+    MinValue: 7
+    MaxValue: 3650
+    Description: >-
+      NoncurrentVersionExpiration in days for the bootstrap bucket's lifecycle
+      rule. Parameterised rather than hardcoded because dev keeps 30 days of
+      superseded templates while prod is held to its audit retention; the
+      MinValue floor of 7 stops a typo from making the bucket effectively
+      unversioned.
+
+  GitHubOrg:
+    Type: String
+    Default: AI-Native-2026-07-29-Intuit
+    Description: >-
+      GitHub organisation that owns the repo allowed to assume CfnDeployRole.
+      Consumed by the OIDC trust policy's sub claim - the org half of the
+      prefix is matched exactly, so a fork in another org cannot assume it.
+
+  GitHubRepo:
+    Type: String
+    Default: arush-adabala-tax-liability-config
+    Description: >-
+      Repository whose Actions workflows may assume CfnDeployRole. This is the
+      gitops config repo (the one holding cfn/), NOT the application repo -
+      CloudFormation templates live here, so this is where deploys run from.
+
+Resources:
+  # --- The bootstrap artefact bucket. Hardened from day one: public access
+  # blocked on all four toggles, SSE-KMS by default, versioning on, and a
+  # lifecycle rule that reaps superseded versions so versioning does not
+  # become an unbounded storage bill.
+  #
+  # DeletionPolicy AND UpdateReplacePolicy are both Retain. They cover two
+  # different destruction paths and neither implies the other: DeletionPolicy
+  # covers `delete-stack`, UpdateReplacePolicy covers an update that changes
+  # an immutable property (BucketName is immutable - changing it replaces the
+  # bucket) and would otherwise delete the old one after creating the new.
+  # Retain on only DeletionPolicy still loses the data on a rename.
+  BootstrapBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W35
+            reason: >-
+              Server access logging is deliberately off. The only writer is
+              CloudFormation itself (via `aws cloudformation package`) and the
+              only reader is the CFN service principal; S3 data-plane events
+              for this bucket are covered by the account's CloudTrail data
+              event selector, which is account-scoped infrastructure rather
+              than per-bucket config. A dedicated log bucket here would need
+              its own logging exemption anyway, moving the suppression rather
+              than removing it.
+    Properties:
+      # Globally-unique name. AWS::AccountId disambiguates across cohort
+      # members running this same stack in different accounts; without it the
+      # second person to deploy gets BucketAlreadyExists from another account's
+      # bucket and cannot tell why.
+      BucketName: !Sub "uptimecrew-taxcalc-bootstrap-${EnvName}-${AWS::AccountId}"
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: alias/aws/s3
+            # S3 Bucket Keys cut KMS GenerateDataKey calls (and their per-call
+            # charge) by reusing one key per bucket per short window.
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        # All four toggles. Anything less is wrong for an internal bucket -
+        # BlockPublicAcls stops new public ACLs while IgnorePublicAcls
+        # neutralises ones already attached; the Policy pair is the same split
+        # for bucket policies. Setting two of four leaves a live path.
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-old-versions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: !Ref RetentionDays
+      OwnershipControls:
+        Rules:
+          # BucketOwnerEnforced disables ACLs outright, so object ownership can
+          # never diverge from the bucket owner.
+          - ObjectOwnership: BucketOwnerEnforced
+      Tags:
+        - {Key: Env, Value: !Ref EnvName}
+        - {Key: Project, Value: taxcalc}
+
+  # --- Bucket policy: deny any request not using TLS.
+  # PublicAccessBlock governs *who* may reach the bucket; this governs *how*.
+  # Without it a signed request over plain HTTP is accepted and the payload
+  # (a template that may embed parameter values) crosses the network in clear.
+  BootstrapBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref BootstrapBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyNonTLS
+            Effect: Deny
+            Principal: "*"
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+              - s3:ListBucket
+            Resource:
+              # Both ARNs: the bucket ARN is what ListBucket is authorised
+              # against, the /* form is what object actions are authorised
+              # against. One without the other leaves half the API uncovered.
+              - !GetAtt BootstrapBucket.Arn
+              - !Sub "${BootstrapBucket.Arn}/*"
+            Condition:
+              Bool:
+                "aws:SecureTransport": "false"
+
+  # --- The CFN-deploy IAM role for GitHub Actions to assume.
+  # Trust policy: OIDC federation, sub-claim pinned to this gitops repo's main
+  # branch and its pull_request workflow refs. NEVER a wildcard sub claim - a
+  # trust policy that matches `repo:*` trusts every repository on GitHub.
+  CfnDeployRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: >-
+              The explicit RoleName is load-bearing, not cosmetic. GitHub
+              Actions must name the role in `role-to-assume` before this stack
+              is queried, so the ARN has to be predictable from the account id
+              alone - a CFN-generated name would have to be read out of the
+              stack and written into repo variables on every replacement.
+              W28's real warning (an update needing replacement will fail) is
+              accepted: replacing this role means re-pinning the trust policy
+              by hand anyway.
+    Properties:
+      RoleName: taxcalc-api-cfn-deploy
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub "arn:aws:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com"
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              # StringEquals on aud: the audience is the single literal
+              # sts.amazonaws.com. A StringLike here would be strictly weaker
+              # for no benefit - there is no pattern to match.
+              StringEquals:
+                "token.actions.githubusercontent.com:aud": sts.amazonaws.com
+              # StringLike (not StringEquals) on sub: branch and PR refs differ
+              # per workflow run, so the tail genuinely varies. The org/repo
+              # prefix is still exact - the wildcard only ever covers the ref.
+              StringLike:
+                "token.actions.githubusercontent.com:sub":
+                  - !Sub "repo:${GitHubOrg}/${GitHubRepo}:ref:refs/heads/main"
+                  - !Sub "repo:${GitHubOrg}/${GitHubRepo}:pull_request"
+      Policies:
+        - PolicyName: cfn-deploy-narrow
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # CFN itself: only THIS capstone's stacks. Twelve actions, each
+              # named - the ChangeSet lifecycle, the read paths a PR reviewer
+              # needs, and the three drift-detection calls Task 4 runs.
+              - Sid: CfnStackOps
+                Effect: Allow
+                Action:
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:DescribeStackResources
+                  - cloudformation:GetTemplate
+                  - cloudformation:ValidateTemplate
+                  - cloudformation:DetectStackDrift
+                  - cloudformation:DescribeStackDriftDetectionStatus
+                  - cloudformation:DescribeStackResourceDrifts
+                Resource:
+                  - !Sub "arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/taxcalc-*"
+                  - !Sub "arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:changeSet/taxcalc-*"
+              # S3 read on the bootstrap bucket (for packaged templates).
+              - Sid: BootstrapBucketRead
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt BootstrapBucket.Arn
+                  - !Sub "${BootstrapBucket.Arn}/*"
+              # IAM: only PassRole, and only to roles the stacks themselves
+              # create. Unscoped PassRole is the classic privilege-escalation
+              # path - it lets the holder hand any role, including an admin
+              # role, to a service that will then act as it.
+              - Sid: PassStackRoles
+                Effect: Allow
+                Action: iam:PassRole
+                Resource:
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/taxcalc-*"
+      Tags:
+        - {Key: Env, Value: !Ref EnvName}
+        - {Key: Project, Value: taxcalc}
+
+Outputs:
+  BootstrapBucketName:
+    Description: Globally-unique bootstrap bucket name.
+    Value: !Ref BootstrapBucket
+    Export: {Name: !Sub "${AWS::StackName}-BucketName"}
+
+  BootstrapBucketArn:
+    Description: Bootstrap bucket ARN, for policies in later stacks.
+    Value: !GetAtt BootstrapBucket.Arn
+    Export: {Name: !Sub "${AWS::StackName}-BucketArn"}
+
+  CfnDeployRoleArn:
+    Description: ARN the GitHub Actions cfn-validate workflow assumes via OIDC.
+    Value: !GetAtt CfnDeployRole.Arn
+    Export: {Name: !Sub "${AWS::StackName}-CfnDeployRoleArn"}
