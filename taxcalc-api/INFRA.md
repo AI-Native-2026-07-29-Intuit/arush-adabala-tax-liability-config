@@ -13,30 +13,40 @@
 
 ## Status — read this before using anything below as evidence
 
-**No stack in this document has been deployed.** There is no AWS account wired
-to this repository: `aws sts get-caller-identity` fails with `NoCredentials` on
-the default profile and `InvalidClientTokenId` on the only configured profile
-(`floci`, whose static key is expired), and `vars.AWS_ACCOUNT_ID` is unset on
+**No stack in this document has been deployed to AWS.** There is no AWS account
+wired to this repository: `aws sts get-caller-identity` fails with
+`NoCredentials` on the default profile, and `vars.AWS_ACCOUNT_ID` is unset on
 the repo, which is what keeps `cfn-validate.yml`'s AWS steps skipped rather
 than red.
 
-So this document separates cleanly into two halves, and the split is marked
-throughout:
+All four stacks **were** deployed against **[floci](https://github.com/floci-io/floci)**,
+the local AWS emulator this repo already uses for exactly this gap (W5 D4, W6
+D1 — see the application repo's README). `AWS_ENDPOINT_URL=http://localhost:4566`
+plus dummy credentials, no template or command changes. That closes more than
+expected and — more usefully — **fails in three specific places, one of which
+returns the opposite of the right answer.** The whole comparison is in
+"Verified against floci" below.
 
 | | Ran | Evidence |
 |---|---|---|
 | `cfn-lint` 1.22.3 | **yes** | 0 errors on all four templates |
 | `cfn_nag_scan` 0.8.10 `--fail-on-warnings` | **yes** | 0 failures, 0 warnings on all four — after fixing one real failure, below |
-| Export/import name cross-check | **yes** | every `!ImportValue` in the app stack resolves to an export the network stack declares |
-| `aws cloudformation validate-template` | no | needs credentials |
-| ChangeSet create → describe → execute | no | needs credentials |
-| `detect-stack-drift` | no | needs credentials |
-| Cross-stack delete refusal | no | needs credentials |
+| Export/import name cross-check | **yes** | every `!ImportValue` resolves to a declared export |
+| ChangeSet `create → describe → execute` | **yes**, floci | all four stacks `CREATE_COMPLETE`; resource-level diffs below |
+| `Conditions` gating NAT-per-AZ | **yes**, floci | same template: dev 22 resources, staging 30 |
+| `!Cidr` + `!GetAZs` subnet maths | **yes**, floci | six /24s, `10.41.0.0/24` … `10.41.5.0/24` |
+| Cross-stack SG pairing | **yes**, floci | DB SG ingress `GroupId` == the network's exported `AppSgId` |
+| Secrets Manager dynamic reference | **yes**, floci | 32-char generated password, absent from template, state and events |
+| UPDATE ChangeSet `Replacement: False` | **yes**, floci | `Modify` on the artefact bucket, no replacement |
+| `aws cloudformation validate-template` | **no** — floci's is a **stub** | it passes a template with a fictional resource type |
+| `!Split` into a list-typed property | **no** — floci gap | works in an Output, fails as `SubnetIds` |
+| `detect-stack-drift` | **no** — not implemented | `UnknownAction ... is not supported` |
+| Cross-stack delete refusal | **no — floci gives the WRONG answer** | it deleted a stack whose exports were in use |
 
-Everything in the second group has its exact command recorded below with the
-output to expect, so it is a matter of running them once an account exists —
-not of writing anything new. **Nothing in this file is a transcript of a run
-that did not happen.**
+**Nothing in this file is a transcript of a run that did not happen**, and
+every row above says which engine produced it. An emulator result is not an
+AWS result; the three failures below are the reason that distinction is kept
+in the table rather than mentioned once and forgotten.
 
 ---
 
@@ -169,7 +179,8 @@ executed without a snapshot, whatever the PR says it does.
 
 ## Drift detection
 
-*(Commands recorded; not yet run — see Status.)*
+*(Commands recorded. Not run: needs a real account — floci does not implement
+the drift API at all, see "Verified against floci".)*
 
 ```bash
 aws cloudformation detect-stack-drift \
@@ -205,7 +216,8 @@ scheduled `detect-stack-drift` job belongs on the W6 D5 list.
 
 ## Cross-stack reference health check
 
-*(Not yet run — see Status.)*
+*(Not verified. Attempted against floci, which returned the **opposite** of the
+correct behaviour — see "Verified against floci".)*
 
 ```bash
 aws cloudformation delete-stack --stack-name taxcalc-network-dev --region us-east-1
@@ -222,6 +234,178 @@ That refusal is the safety `Export.Name` buys, and it is the argument for
 such protection — the network stack deletes cleanly, and the app stack keeps
 pointing at subnets that no longer exist until the next operation that
 touches them fails for a reason that names the subnet rather than the cause.
+
+---
+
+## Verified against floci, and the three places it does not hold
+
+This machine has no AWS account, so all four stacks were deployed against
+**floci 2.0.1**, the local AWS emulator this repo already uses for this gap
+(W5 D4's SAM stack, W6 D1's OIDC roles). No template, parameter or command
+changed — only the endpoint:
+
+```bash
+export AWS_ENDPOINT_URL=http://localhost:4566 AWS_PROFILE=floci AWS_REGION=us-east-1
+```
+
+`bootstrap`, `artifacts`, `network` and `app` all reached `CREATE_COMPLETE`
+through the real `create-change-set` → `describe-change-set` →
+`execute-change-set` flow.
+
+### What it genuinely established
+
+**The `Conditions` gate, proved from both sides of the same template.** The
+dev ChangeSet contains 22 resources; the identical template with
+`EnvName=staging` contains 30. The diff is exactly the HA set, which is the
+claim the Condition is making:
+
+```
+only in staging:  NatEipB NatEipC NatGatewayB NatGatewayC
+                  PrivateRouteTableB PrivateRouteTableC
+                  PrivateDefaultRouteB PrivateDefaultRouteC
+                  PrivateAssocBHA PrivateAssocCHA
+only in dev:      PrivateAssocBDev PrivateAssocCDev
+```
+
+**The `!Cidr` arithmetic.** `!Cidr [!Ref VpcCidr, 6, 8]` against `10.41.0.0/16`
+produced exactly six /24s — `10.41.0.0/24` through `10.41.5.0/24`, indices 0–2
+public and 3–5 private. Worth checking rather than assuming; the `count` and
+`cidrBits` arguments are easy to transpose and the failure is a silently
+wrong subnet plan.
+
+**The cross-stack security-group pairing, end to end.** The network stack
+exported `AppSgId = sg-5c531547b49b1b62b`; the app stack's DB SG came up with:
+
+```json
+{"IpProtocol": "tcp", "FromPort": 5432, "ToPort": 5432,
+ "UserIdGroupPairs": [{"GroupId": "sg-5c531547b49b1b62b",
+                       "Description": "Postgres from app SG only."}],
+ "IpRanges": []}
+```
+
+`IpRanges: []` is the part that matters — the rule is SG-membership only, with
+no CIDR fallback. This is the property the decision-4 trade-off was made to
+preserve, now measured rather than argued.
+
+**The password never appears anywhere.** Secrets Manager generated a 32-char
+value; `MasterUsername` resolved to `taxcalc_master`, so the dynamic reference
+worked. Searching the stored template, the stack state and the full event
+history for the literal password:
+
+```
+get-template          literal password present: False
+describe-stacks       literal password present: False
+describe-stack-events literal password present: False
+stored template still holds the resolve directive: True
+```
+
+That is the central security claim of the app stack, and it holds.
+
+**`Replacement: False` on an UPDATE.** Changing `TransitionToIaDays` 90 → 120
+produced `Action: Modify`, `Replacement: "False"` on the bucket — a
+modify-in-place, which is what a lifecycle change should be.
+
+### Where it does not hold — and one answer that is actively wrong
+
+**1. `validate-template` is a stub. Do not count it as a check.** It returns
+`{"Parameters": [], "Capabilities": [], "CapabilitiesReason": ""}` for all four
+templates — despite each declaring 2–5 Parameters, and despite the bootstrap
+stack requiring `CAPABILITY_NAMED_IAM`. Fed a template with a fictional
+resource type, a dangling `!Ref` and a malformed `!GetAtt`, it still returns
+success:
+
+```
+$ aws cloudformation validate-template --template-body file://garbage.yaml
+{"Parameters": [], "Capabilities": [], "CapabilitiesReason": ""}   # exit 0
+
+$ cfn-lint garbage.yaml
+E3006 Resource type 'AWS::Totally::Fictional' does not exist in 'us-east-1'
+```
+
+`cfn-lint` catches what floci waves through. This is why `cfn-validate.yml`
+keeps cfn-lint and cfn-nag ungated and lets only `validate-template` skip: the
+two that always run are the two carrying the information.
+
+**2. `Fn::Split` does not resolve into a list-typed resource property.** The
+app stack's `DbSubnetGroup` failed with `The request must contain the parameter
+SubnetIds`. Isolated to floci rather than assumed, with three probes:
+
+| Spelling | Result |
+|---|---|
+| `SubnetIds: ["subnet-a", "subnet-b", "subnet-c"]` | `CREATE_COMPLETE` |
+| `SubnetIds: !Split [",", !ImportValue "…-PrivateSubnets"]` | `ROLLBACK` — SubnetIds missing |
+| the same `!Split` + `!ImportValue` in an **Output** | resolves correctly |
+
+So the import resolves and the split resolves; only the list-into-property path
+is missing. **The committed template is unchanged** — that spelling is the
+documented AWS pattern and the one the cohort reference prescribes. The rest of
+the app stack was verified with a local-only probe that substitutes a literal
+list for that one property; it is not committed and exists only in the
+scratchpad.
+
+**3. `detect-stack-drift` is not implemented at all.**
+
+```
+An error occurred (UnknownAction) when calling the DetectStackDrift operation:
+Action DetectStackDrift is not supported.
+```
+
+Same for `DescribeStackDriftDetectionStatus` and `DescribeStackResourceDrifts`.
+There is no local path to the drift Done-When; it needs an account.
+
+**4. The one that matters most: floci deleted a stack whose exports were in
+use.** With `taxcalc-app-dev` importing `VpcId`, `PrivateSubnets` and
+`AppSgId`:
+
+```
+$ aws cloudformation delete-stack --stack-name taxcalc-network-dev
+$ aws cloudformation describe-stacks --stack-name taxcalc-network-dev
+An error occurred (ValidationError): Stack with id taxcalc-network-dev does not exist
+$ aws cloudformation list-exports --query "length(Exports[?starts_with(Name,'taxcalc-network-dev')])"
+0
+```
+
+Real CloudFormation refuses this outright — `Export taxcalc-network-dev-PrivateSubnets
+cannot be deleted as it is in use by taxcalc-app-dev`. **floci does not enforce
+export-in-use protection**, so it does not merely fail to verify the safety
+property `Export.Name` buys: it demonstrates the opposite one. An engineer who
+ran this against the emulator and believed it would conclude that
+`!ImportValue` buys no protection at all, and would be wrong.
+
+This is the same trap the W6 D1 write-up recorded for OIDC, where floci issued
+credentials against a forged web-identity token: **the emulator's most
+confident answers are the ones worth trusting least.** It is a good CFN
+engine and a poor CFN *service* — it models resources well and the
+control-plane guarantees around them barely at all.
+
+### Fidelity gaps worth knowing before reusing this setup
+
+`describe-db-instances` on the deployed RDS instance disagrees with the
+template on three properties — floci stores them and reports defaults:
+
+| Property | Template | floci reports |
+|---|---|---|
+| `StorageEncrypted` | `true` | `false` |
+| `DeletionProtection` | `true` | `null` |
+| `BackupRetentionPeriod` | `7` | `1` |
+
+Same class as the SnapStart gap recorded for W5 D4. None of them is a template
+defect; all three need a real account to confirm. `describe-change-set` also
+returns `Scope: []` where AWS populates `["Properties"]`, and
+`Parameters: null` where AWS echoes the resolved parameter set.
+
+### What this changes about the four blocked items
+
+| Item | Before | After |
+|---|---|---|
+| ChangeSet flow | not run | **run** — all four stacks, real diffs |
+| `validate-template` | not run | still not meaningfully verified — floci's is a stub |
+| `detect-stack-drift` | not run | still not run — floci has no drift API |
+| Cross-stack delete refusal | not run | still not verified — floci returns the opposite |
+
+Two of the four are now closed by better evidence than a green command: the
+ChangeSet flow, and the resource-level behaviour underneath it. The other two
+need an account, and the reason is now measured rather than asserted.
 
 ---
 
@@ -507,8 +691,10 @@ that justifies it.
 
 ## What this substrate does NOT do (yet)
 
-- **Nothing is deployed.** See Status. Every command above is recorded, none
-  has been run against an account.
+- **Nothing is deployed to AWS.** All four stacks deploy cleanly against floci
+  through the full ChangeSet flow, but drift detection, the export-in-use
+  refusal and a meaningful `validate-template` all need a real account — see
+  "Verified against floci" for exactly which claims that leaves open.
 - **No VPC flow logs.** `cfn-nag` W60 is suppressed against this. The
   destination belongs with the W6 D5 observability work rather than as a
   second, divergent log group here.
