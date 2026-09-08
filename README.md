@@ -30,6 +30,15 @@ argocd-system/
 platform/
   00-namespaces.yaml               Namespaces + ResourceQuota + LimitRange - NOT synced by Argo CD
   secret/40-taxcalc-api.secret.yaml  Secret SHAPE only; real value seeded out-of-band
+cfn/                               W6 D3 - the AWS substrate everything above runs on
+  taxcalc-bootstrap-dev.yaml       artefact bucket + the OIDC role CI assumes to deploy
+  taxcalc-network-dev.yaml         3-AZ VPC, 6 subnets, Conditions-gated NAT, app SG
+  taxcalc-app-dev.yaml             RDS + Secrets Manager; consumes the network by !ImportValue
+  taxcalc-artifacts-dev.yaml       hardened S3 artefact bucket
+.github/workflows/
+  cfn-validate.yml                 cfn-lint + cfn-nag + validate-template on every cfn/ PR
+taxcalc-api/
+  INFRA.md                         the substrate write-up - stacks, ordering, ChangeSets, drift
 ```
 
 ## The reconcile loop
@@ -47,6 +56,33 @@ A rollback is `git revert` on this repo. A drifted cluster is a controller alarm
 scripts/
   verify-appproject-guardrails.sh  asserts the project actually refuses what it claims to
 ```
+
+## The AWS substrate under all of this (W6 D3)
+
+Everything above assumes an account, a network and a bucket to deploy into. `cfn/` describes them as raw-YAML CloudFormation — four stacks, split along blast-radius lines rather than by convenience, so that the thing which changes weekly does not share a stack with the thing deployed once.
+
+```
+1. taxcalc-bootstrap-dev    role/taxcalc-api-cfn-deploy + the package bucket
+2. taxcalc-artifacts-dev    hardened artefact bucket; imports nothing
+3. taxcalc-network-dev      exports VpcId, VpcCidr, {Public,Private}Subnets, AppSgId
+4. taxcalc-app-dev          imports 3 by !ImportValue; fails at CREATE if 3 is absent
+```
+
+Only edge 3 → 4 is enforced by CloudFormation itself, and that is the point of `!ImportValue` over copied subnet ids: an export in use cannot be deleted, and neither can the stack that owns it. A hardcoded id gives no such protection — it just goes stale when the network is rebuilt.
+
+**Every stack deploys through `create-change-set` → `describe-change-set` → `execute-change-set`, never `aws cloudformation deploy`** (which creates a ChangeSet and immediately executes it, removing the review that is the whole point). The field to read in the diff is `Replacement` on each `ResourceChange`: `True` on an RDS instance or an S3 bucket means destroy-and-recreate, which is data loss unless `UpdateReplacePolicy: Retain` is set — which is why every data resource here carries both Retain policies rather than just `DeletionPolicy`.
+
+**Nothing is deployed yet.** No AWS account is wired to this repo, so the ChangeSet flow, `detect-stack-drift`, the cross-stack delete refusal and `aws cloudformation validate-template` are recorded in [`taxcalc-api/INFRA.md`](taxcalc-api/INFRA.md) with their exact commands and expected output, and marked as not run. What *has* run, on all four templates: `cfn-lint` **0 errors**, `cfn_nag_scan --fail-on-warnings` **0 failures, 0 warnings**.
+
+```bash
+pip install cfn-lint==1.22.3 && cfn-lint cfn/*.yaml
+# Ruby 3.3 specifically - cfn-nag 0.8.10 pulls kwalify 0.7.2, which calls
+# StringScanner#peep, removed in Ruby 4.0. On 4.x the scan dies in the require
+# chain before it reads a template.
+gem install cfn-nag -v 0.8.10 && cfn_nag_scan --input-path cfn --fail-on-warnings
+```
+
+**The drift asymmetry is worth knowing before trusting this layer.** The Kubernetes half of this repo self-heals: a drifted ConfigMap in `taxcalc-dev` is reverted in about 10 seconds, measured. The AWS half has no equivalent — `detect-stack-drift` is a point-in-time poll somebody runs, nothing schedules it, and unsupported resource types come back `NOT_CHECKED` rather than failing loudly. **This layer does not even alarm on drift, let alone correct it.** A scheduled detection job is on the W6 D5 list.
 
 ## Four things that are deliberately not in `base/`
 
@@ -126,3 +162,8 @@ The reasoning, the measurements and the things that did not work the first time 
 
 - [`taxcalc-api/GITOPS.md`](https://github.com/AI-Native-2026-07-29-Intuit/arush-adabala-tax-liability/blob/main/taxcalc-api/GITOPS.md) — repo layout, reconcile loop, drift behaviour, project-scoped RBAC, what this layer does not do yet, and the `argocd-author` Skill audit notes.
 - The application repo's `README.md`, Week 6 Day 2 section.
+
+The AWS substrate write-up lives **here**, because the templates do:
+
+- [`taxcalc-api/INFRA.md`](taxcalc-api/INFRA.md) — the four stacks, deploy ordering, the ChangeSet flow and what to read in `describe-change-set`, export naming, drift detection, the cross-stack delete refusal, six decisions that departed from the reference layout, every `cfn-nag` suppression with its reasoning, and the `cfn-author` Skill audit.
+- The application repo's `README.md`, Week 6 Day 3 section.
