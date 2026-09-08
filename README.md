@@ -55,6 +55,7 @@ A rollback is `git revert` on this repo. A drifted cluster is a controller alarm
 ```
 scripts/
   verify-appproject-guardrails.sh  asserts the project actually refuses what it claims to
+  cfn-guardrails.sh                backfills the CFN guarantees the emulator does not provide
 ```
 
 ## The AWS substrate under all of this (W6 D3)

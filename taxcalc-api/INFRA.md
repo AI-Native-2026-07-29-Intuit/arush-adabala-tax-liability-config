@@ -394,18 +394,97 @@ defect; all three need a real account to confirm. `describe-change-set` also
 returns `Scope: []` where AWS populates `["Properties"]`, and
 `Parameters: null` where AWS echoes the resolved parameter set.
 
+### Two more gaps the guardrails script then found
+
+Writing the checks below turned up two things the manual pass had missed,
+which is the argument for automating them:
+
+**The S3 hardening mostly does not survive floci.** `PublicAccessBlock` is not
+stored at all (`NoSuchPublicAccessBlockConfiguration` — not "stored wrong",
+*absent*), and `BucketEncryption` comes back `AES256` where the template says
+`aws:kms` with `alias/aws/s3`. Both buckets are affected.
+
+**Phantom resources: `CREATE_COMPLETE` in CloudFormation, absent from S3.**
+`describe-stack-resources` reports `ArtefactBucketPolicy` as
+`CREATE_COMPLETE`; `get-bucket-policy` on the same bucket returns
+`NoSuchBucketPolicy`. Same for `BootstrapBucketPolicy`. The control plane says
+the resource exists and the data plane disagrees.
+
+That last one is the worst failure mode in this whole exercise. A deny-non-TLS
+policy that CloudFormation believes it applied and S3 has never heard of is
+strictly **worse than no policy at all**, because the stack is green and the
+control reads as satisfied. Nothing in a `describe-stacks` output would ever
+show it.
+
+## Resolving the gaps: `scripts/cfn-guardrails.sh`
+
+The three gaps cannot be fixed in floci, but none of them has to be left as
+prose in a document either. `scripts/cfn-guardrails.sh` supplies a local
+answer to each, following the same pattern as
+`scripts/verify-appproject-guardrails.sh`: a guardrail nobody has watched
+refuse anything is decoration.
+
+```bash
+./scripts/cfn-guardrails.sh                       # all seven checks
+./scripts/cfn-guardrails.sh --static              # no AWS call at all (CI)
+./scripts/cfn-guardrails.sh guard-delete <stack>  # the safe delete wrapper
+```
+
+| Gap | Resolution |
+|---|---|
+| No export-in-use refusal | `guard-delete` refuses a producer whose exports are imported, from an import graph derived from `cfn/*.yaml`. Use it instead of raw `delete-stack` on any endpoint check 4 reports as unenforced. |
+| `validate-template` is a stub | Check 5 canaries the endpoint with a fictional resource type and reports its validator as non-authoritative, so the weakness is detected rather than remembered. |
+| No drift API | Check 6 compares declared-in-template against live-in-API for the security-critical properties — a hand-rolled drift check for the fields that matter. |
+| *(found by the above)* phantom resources | Check 7 asks S3 whether every `AWS::S3::BucketPolicy` CFN claims to have created actually exists. |
+
+Two design points worth keeping if this is ever extended:
+
+**The import graph comes from the templates, not from `ListImports`.**
+`ListImports` is unsupported on floci, and on real AWS it only knows about
+stacks that already exist — so a template that *will* import an export is
+invisible to it until it is deployed. Reading `cfn/` catches the dependency at
+review time, which is when it is cheap to fix.
+
+**The script measures the endpoint rather than assuming it.** Check 4 stands up
+two disposable probe stacks, deletes the producer while the consumer imports
+it, and reports which behaviour it got — then cleans up. So the same script is
+honest against floci and against a real account, and a mismatch is classified
+as a **parity gap** on an emulator (`AWS_ENDPOINT_URL` set) and a **failure**
+on real AWS, where it would be genuine drift.
+
+Current result against floci:
+
+```
+6 passed, 0 failed, 9 parity gap(s)
+```
+
+The nine gaps are: no native export protection, a non-authoritative
+`validate-template`, PAB not stored, SSE downgraded to AES256, three RDS
+properties dropped, and two phantom bucket policies. **Zero of them are
+template defects** — which is precisely why they are counted separately.
+
+`--static` runs checks 1–3 plus the `0.0.0.0/0` assertion with **no AWS call
+of any kind**, and is wired into `cfn-validate.yml`. That gates the cross-stack
+contract on every PR without an account: it fails if anyone swaps an
+`!ImportValue` for a hardcoded subnet id, which neither `cfn-lint` nor
+`cfn-nag` has an opinion about. Verified by doing exactly that to a scratch
+copy — 2 passed, 2 failed — and then restoring it.
+
 ### What this changes about the four blocked items
 
 | Item | Before | After |
 |---|---|---|
 | ChangeSet flow | not run | **run** — all four stacks, real diffs |
-| `validate-template` | not run | still not meaningfully verified — floci's is a stub |
-| `detect-stack-drift` | not run | still not run — floci has no drift API |
-| Cross-stack delete refusal | not run | still not verified — floci returns the opposite |
+| `validate-template` | not run | floci's is a stub; **check 5 now detects that automatically**, and CI never lets `cfn-lint` skip |
+| `detect-stack-drift` | not run | no drift API on floci; **check 6 stands in** for the security-critical properties |
+| Cross-stack delete refusal | not run | floci returns the opposite; **`guard-delete` supplies the refusal locally**, and `--static` gates it in CI |
 
-Two of the four are now closed by better evidence than a green command: the
-ChangeSet flow, and the resource-level behaviour underneath it. The other two
-need an account, and the reason is now measured rather than asserted.
+None of the three gaps is closed *in floci* — they cannot be. All three now
+have a local mechanism that provides the guarantee or detects its absence, so
+the failure mode is caught rather than trusted. The two items still needing a
+real account are `detect-stack-drift` proper (the API, not the stand-in) and a
+`validate-template` whose result means something; both are one
+`gh variable set AWS_ACCOUNT_ID` away, and neither requires a file to change.
 
 ---
 
