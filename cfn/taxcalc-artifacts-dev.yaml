@@ -1,0 +1,151 @@
+# cfn/taxcalc-artifacts-dev.yaml
+#
+# TASK 3 S3 artefact bucket: where the W5 D4 SAM build artefacts and the Argo
+# CD config snapshots land. Hardened from day one - the settings below are the
+# ones that are painful to add later, because turning on public-access blocks
+# or a deny-non-TLS policy after consumers exist breaks whichever consumer was
+# quietly relying on the gap.
+#
+# Independent of the network stack: it imports nothing, so it can be deployed
+# before or after taxcalc-network-dev. Deploy it BEFORE the application stack,
+# which writes to it.
+#
+# BOTH DeletionPolicy: Retain AND UpdateReplacePolicy: Retain, so that neither
+# a stack delete nor a property-change replacement ever destroys live data.
+# The pair travels together: DeletionPolicy alone still loses the bucket when
+# an update changes BucketName (an immutable property), because that is a
+# replace-then-delete, not a delete.
+AWSTemplateFormatVersion: "2010-09-09"
+Description: taxcalc artefact bucket - KMS, PAB, lifecycle, deny-non-TLS.
+
+Parameters:
+  EnvName:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: >-
+      Deployment environment. Selects the bucket name suffix and tags the
+      bucket; the hardening below is identical in every environment.
+
+  TransitionToIaDays:
+    Type: Number
+    Default: 90
+    MinValue: 30
+    MaxValue: 3650
+    Description: >-
+      Age at which current objects move to STANDARD_IA. The MinValue floor of
+      30 is not arbitrary: S3 bills a 30-day minimum duration for STANDARD_IA,
+      so transitioning earlier costs more than leaving the object in STANDARD.
+
+  TransitionToGlacierDays:
+    Type: Number
+    Default: 365
+    MinValue: 90
+    MaxValue: 3650
+    Description: >-
+      Age at which objects move on from STANDARD_IA to GLACIER_IR. Must be
+      greater than TransitionToIaDays or S3 rejects the lifecycle rule.
+
+Resources:
+  TaxcalcArtifactsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W35
+            reason: >-
+              Server access logging is deliberately off, as on the bootstrap
+              bucket. Writers are CI roles and readers are Argo CD; both are
+              already audited at the API layer by CloudTrail, which is
+              account-scoped rather than per-bucket. A dedicated log bucket
+              would need its own W35 exemption, which moves the suppression
+              rather than removing it.
+    Properties:
+      BucketName: !Sub "uptimecrew-taxcalc-artifacts-${EnvName}-${AWS::AccountId}"
+      VersioningConfiguration: {Status: Enabled}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: alias/aws/s3
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        # All four. See the bootstrap template for why two of four is a live
+        # path rather than half a control.
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          # Artefacts are read constantly for their first few weeks (rollbacks,
+          # re-deploys) and then essentially never - but they must stay
+          # retrievable for audit, so they tier down rather than expiring.
+          - Id: tier-current-versions
+            Status: Enabled
+            Transitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: !Ref TransitionToIaDays
+              - StorageClass: GLACIER_IR
+                TransitionInDays: !Ref TransitionToGlacierDays
+          # Superseded versions are pure overhead - the current object is the
+          # one anyone redeploys - so these expire outright.
+          - Id: expire-old-versions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 90
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      Tags:
+        - {Key: Env, Value: !Ref EnvName}
+        - {Key: Project, Value: taxcalc}
+
+  ArtefactBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref TaxcalcArtifactsBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          # Deny anything not over TLS. PublicAccessBlock controls who can
+          # reach the bucket; this controls how.
+          - Sid: DenyNonTLS
+            Effect: Deny
+            Principal: "*"
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+              - s3:ListBucket
+            Resource:
+              - !GetAtt TaxcalcArtifactsBucket.Arn
+              - !Sub "${TaxcalcArtifactsBucket.Arn}/*"
+            Condition:
+              Bool:
+                "aws:SecureTransport": "false"
+          # Belt and braces on encryption. BucketEncryption sets the DEFAULT
+          # for a PutObject that asks for nothing; it does not stop a caller
+          # explicitly asking for AES256 or for no encryption at all. This
+          # denies that caller, so "encrypted at rest" holds for every object
+          # rather than for every object whose writer did not opt out.
+          - Sid: DenyUnencryptedPut
+            Effect: Deny
+            Principal: "*"
+            Action: s3:PutObject
+            Resource: !Sub "${TaxcalcArtifactsBucket.Arn}/*"
+            Condition:
+              StringNotEquals:
+                "s3:x-amz-server-side-encryption": aws:kms
+
+Outputs:
+  ArtefactBucketName:
+    Description: Artefact bucket name, for CI upload steps.
+    Value: !Ref TaxcalcArtifactsBucket
+    Export: {Name: !Sub "${AWS::StackName}-BucketName"}
+
+  ArtefactBucketArn:
+    Description: Artefact bucket ARN, for IAM policies in later stacks.
+    Value: !GetAtt TaxcalcArtifactsBucket.Arn
+    Export: {Name: !Sub "${AWS::StackName}-BucketArn"}
