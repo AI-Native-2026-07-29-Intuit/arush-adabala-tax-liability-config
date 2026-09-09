@@ -258,6 +258,67 @@ The intended exercise: add a tag to the artefact bucket in the console, expect
 `MODIFIED` and a `PropertyDifferences` entry naming the added tag; revert the
 console edit; re-run and expect `IN_SYNC`.
 
+### Workaround: `cfn-guardrails.sh detect-drift`
+
+Tags cannot carry this exercise on floci. Its CloudFormation provider does
+not apply *any* declared tag to *any* resource type measured in this repo —
+EC2 (VPC, subnet, SG), IAM (`CfnDeployRole`) and RDS all come back with an
+empty tag set regardless of what the template declares. A tag comparison
+would report every resource "drifted" from the instant it is created, which
+is not the exercise and proves nothing about drift specifically.
+
+`VersioningConfiguration` on the artefact bucket is different: check 6 above
+already shows floci applies and reports it correctly — a `PASS`, not a
+`GAP` — so it starts from a genuine `IN_SYNC` baseline, the same shape of
+property real `detect-stack-drift` would check. `detect-drift` compares the
+template's declared `Status` against live `get-bucket-versioning`, and emits
+`describe-stack-resource-drifts`-shaped JSON so the output pastes directly
+into a PR body:
+
+```bash
+./scripts/cfn-guardrails.sh detect-drift taxcalc-artifacts-dev
+```
+
+Baseline:
+
+```json
+[{"LogicalResourceId": "TaxcalcArtifactsBucket", "ResourceType": "AWS::S3::Bucket",
+  "StackResourceDriftStatus": "IN_SYNC", "PropertyDifferences": []}]
+```
+
+Simulated console edit (a real S3 API call this script does not control —
+the closest floci analogue to editing in the console) and re-check:
+
+```bash
+aws s3api put-bucket-versioning --bucket uptimecrew-taxcalc-artifacts-dev \
+  --versioning-configuration Status=Suspended
+./scripts/cfn-guardrails.sh detect-drift taxcalc-artifacts-dev
+```
+
+```json
+[{"LogicalResourceId": "TaxcalcArtifactsBucket", "ResourceType": "AWS::S3::Bucket",
+  "StackResourceDriftStatus": "MODIFIED",
+  "PropertyDifferences": [{"PropertyPath": "/VersioningConfiguration/Status",
+    "ExpectedValue": "Enabled", "ActualValue": "Suspended", "DifferenceType": "NOT_EQUAL"}]}]
+```
+
+Revert and re-check — back to `IN_SYNC`:
+
+```bash
+aws s3api put-bucket-versioning --bucket uptimecrew-taxcalc-artifacts-dev \
+  --versioning-configuration Status=Enabled
+./scripts/cfn-guardrails.sh detect-drift taxcalc-artifacts-dev   # -> IN_SYNC again
+```
+
+All three runs verified live, 2026-09-09. **Read what this does and does not
+establish.** It proves the declared-vs-live comparison logic works and gives
+a pasteable `DRIFTED` → revert → `IN_SYNC` cycle in the shape the deliverable
+asks for. It does **not** exercise the real `detect-stack-drift` API, which
+remains `UnknownAction` on this endpoint — that gap has no floci-side fix,
+only a real account closes it. It also only covers one property on one
+resource; it is not a general drift detector the way check 6 is (six
+properties, two resource types).
+
 **Two things worth knowing before relying on this.** Drift detection does not
 cover every resource type — unsupported resources come back
 `NOT_CHECKED`, and a stack full of them can report `IN_SYNC` while being
@@ -614,6 +675,59 @@ UserIdGroupPairs[].GroupId == the app stack's exported DbSgId
 
 — so the committed template's design is not in question; the failure and the
 unrecoverable state are both floci's.
+
+### Recovery, 2026-09-09: back to a clean four-stack baseline
+
+Re-verifying this section from a fresh session reproduced every floci defect
+above independently, before this addendum was read: `Fn::If` inside
+`SecurityGroupEgress` fails the EC2 API — not only on the UPDATE this section
+describes, but on a **plain CREATE** of the unmodified committed template,
+every time, regardless of which branch `HasDbSg` selects. Isolated to a
+6-line disposable probe (one VPC, one SG, one `!If` egress rule) that fails
+identically. A `docker restart` on the floci container changed nothing,
+which rules out corrupted in-memory state as the cause — this is the
+template construct itself, unconditionally, on this floci build.
+
+Re-running the UPDATE against the graded `taxcalc-network-dev` (before
+finding check 8's disposable-probe alternative above) reproduced the exact
+failure mode this section already documents: `describe-change-set` promised
+`Replacement: "False"`, `execute-change-set` replaced the VPC and Internet
+Gateway anyway, then failed mid-flight into `UPDATE_ROLLBACK_FAILED`. floci's
+`ContinueUpdateRollback` returns `UnknownAction` — one more unimplemented
+recovery path beyond the four already exhausted above.
+
+**This time both stacks were fully recovered, rather than left as debris:**
+
+1. Disabled termination protection, deleted `taxcalc-app-dev` then
+   `taxcalc-network-dev` (delete succeeds even from `UPDATE_ROLLBACK_FAILED`).
+2. `./scripts/cfn-guardrails.sh reap-orphans 10.41.0.0/16` — dry run first,
+   then `GUARD_DELETE_APPLY=true` — removed 2 orphaned VPCs (the pre-update
+   one and the half-replaced one the failed UPDATE left behind) and 1
+   orphaned NAT Gateway. Exactly the debris this function was written for.
+3. Redeployed `taxcalc-network-dev` from a **local-only, uncommitted copy**
+   of the template with the Postgres-egress `Fn::If` replaced by its pass-1
+   branch inlined as a plain `CidrIp` rule — the same branch `HasDbSg=false`
+   already selects, spelled without the construct floci cannot parse. Same
+   category of fix as `cfn-guardrails.sh reconcile-s3`: an emulator-parity
+   shim for the local demo environment only. **The committed
+   `cfn/taxcalc-network-dev.yaml` is byte-for-byte unchanged** — this is not
+   the deployable artifact, and was never copied over it.
+4. Re-enabled termination protection; redeployed `taxcalc-app-dev` from the
+   committed template unmodified.
+5. `./scripts/cfn-guardrails.sh` (full and `--static`) both green: 6 passed /
+   0 failed / 11 parity gaps live, 4 passed / 0 failed static — the same
+   shape as every other run in this document, confirming the rebuild
+   restored the intended baseline rather than a different one.
+
+One consequence worth flagging for any future reader of this file: **the
+network stack currently running against this floci instance is the shim,
+not the committed template**, for the one Postgres-egress property. Every
+other claim elsewhere in this document that reads "verified live" against
+`taxcalc-network-dev` — the SG pairing, the subnet maths, the exports — was
+re-confirmed against this rebuild and still holds, because the shim and the
+committed template are identical everywhere except that one `Fn::If`. Only
+the egress-rule construct itself remains unverified live, exactly as the top
+status table already says (`Fn::If inside a security-group rule — no`).
 
 **2d. Declaring `SecurityGroupEgress` does not remove the default allow-all
 rule.** On real AWS, an explicit `SecurityGroupEgress` list **replaces** the

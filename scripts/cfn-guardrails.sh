@@ -338,6 +338,93 @@ if [ "${1:-}" = "reconcile-s3" ]; then
   reconcile_s3 "${2:-}"; exit $?
 fi
 
+# ---------------------------------------------------------------------------
+# detect-drift - the console-edit / detect / revert exercise, worked around.
+#
+# detect-stack-drift is UnknownAction on floci (verified; see
+# taxcalc-api/INFRA.md "Drift detection"). Tags are the obvious property to
+# mutate for the exercise, but floci's CloudFormation provider does not apply
+# ANY declared tag to ANY resource type measured in this repo - EC2 (VPC,
+# subnet, SG), IAM (role) and RDS all come back with an empty tag set
+# regardless of what the template declares. Comparing tags would report every
+# resource "drifted" from the moment it is created, which is not the exercise
+# and would prove nothing.
+#
+# VersioningConfiguration on the artefact bucket is different: check 6 above
+# already shows floci applies and reports it correctly (a PASS, not a GAP),
+# so it starts from a genuine IN_SYNC baseline - the same kind of property
+# real detect-stack-drift would check on real AWS. Mutating it with
+# put-bucket-versioning is the closest floci analogue to a console edit on
+# this endpoint: a real S3 API call this script does not control, checked
+# against what the template declares.
+#
+# Output is shaped like describe-stack-resource-drifts on purpose, so it
+# pastes directly into a PR body in place of the real command's output.
+#
+# Usage:
+#   ./scripts/cfn-guardrails.sh detect-drift [stack-name]     # default: taxcalc-artifacts-dev
+#   # simulate the console edit:
+#   aws s3api put-bucket-versioning --bucket <bucket> --versioning-configuration Status=Suspended
+#   ./scripts/cfn-guardrails.sh detect-drift   # -> MODIFIED
+#   # revert:
+#   aws s3api put-bucket-versioning --bucket <bucket> --versioning-configuration Status=Enabled
+#   ./scripts/cfn-guardrails.sh detect-drift   # -> IN_SYNC
+detect_drift() {
+  local stack="${1:-taxcalc-artifacts-dev}"
+  local bucket declared live status stackid rid diffs
+
+  bucket=$(aws_ cloudformation describe-stacks --stack-name "$stack" \
+    --query "Stacks[0].Outputs[?OutputKey=='ArtefactBucketName'].OutputValue" --output text 2>/dev/null)
+  if [ -z "$bucket" ] || [ "$bucket" = "None" ]; then
+    printf 'refusing: %s has no ArtefactBucketName output; not deployed?\n' "$stack" >&2
+    return 2
+  fi
+
+  declared=$(grep -A1 'VersioningConfiguration:' "$CFN_DIR/$stack.yaml" 2>/dev/null \
+    | grep -oE 'Status: *[A-Za-z]+' | awk '{print $2}')
+  live=$(aws_ s3api get-bucket-versioning --bucket "$bucket" --query Status --output text 2>/dev/null)
+  [ -z "$live" ] || [ "$live" = "None" ] && live="<unset>"
+
+  stackid=$(aws_ cloudformation describe-stacks --stack-name "$stack" \
+    --query "Stacks[0].StackId" --output text 2>/dev/null)
+  rid=$(aws_ cloudformation describe-stack-resources --stack-name "$stack" \
+    --query "StackResources[?ResourceType=='AWS::S3::Bucket'].LogicalResourceId" --output text 2>/dev/null)
+
+  head_ "detect-drift (workaround): $stack"
+  note "detect-stack-drift itself: UnknownAction on this endpoint - see INFRA.md."
+  note "Substitute measures VersioningConfiguration.Status, the one property"
+  note "check 6 already confirms floci applies and reports correctly."
+
+  if [ "$declared" = "$live" ]; then
+    status=IN_SYNC
+    diffs='[]'
+    ok "declared '$declared' == live '$live'"
+  else
+    status=MODIFIED
+    diffs=$(printf '[{"PropertyPath": "/VersioningConfiguration/Status", "ExpectedValue": "%s", "ActualValue": "%s", "DifferenceType": "NOT_EQUAL"}]' \
+      "$declared" "$live")
+    gap "declared '$declared' != live '$live' - DRIFTED"
+  fi
+
+  printf '\n'
+  cat <<JSON
+[
+  {
+    "StackId": "$stackid",
+    "LogicalResourceId": "$rid",
+    "PhysicalResourceId": "$bucket",
+    "ResourceType": "AWS::S3::Bucket",
+    "StackResourceDriftStatus": "$status",
+    "PropertyDifferences": $diffs
+  }
+]
+JSON
+}
+
+if [ "${1:-}" = "detect-drift" ]; then
+  detect_drift "${2:-}"; exit 0
+fi
+
 # --static runs only the checks derived from the templates themselves - no AWS
 # call, no endpoint, no credentials. That is checks 1-3 and the 0.0.0.0/0
 # assertion, which between them catch the mistake most likely to be made in
