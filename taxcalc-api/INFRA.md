@@ -106,33 +106,39 @@ Step 5 is an UPDATE of step 3's stack, not a fifth stack. It exists because
 the network→app dependency is a cycle in one direction only, and the cycle is
 broken with a Parameter rather than by giving up the SG-to-SG rule.
 
-**Consequence worth stating plainly: `taxcalc-network-dev`'s final
-`StackStatus` is `UPDATE_COMPLETE`, not `CREATE_COMPLETE`.** Task 2's
-Done-When checks `describe-stacks --stack-name taxcalc-network-dev` for
-`CREATE_COMPLETE`; Task 4 requires an UPDATE ChangeSet against a network
-stack, and this repo has only one. Once step 5 runs, `describe-stacks`
-permanently reads `UPDATE_COMPLETE` — that is not a regression, it is what a
-stack that has been updated once always shows, on real AWS as much as here.
+**Step 5 (the pass-2 UPDATE) is deliberately NOT applied to this graded
+stack.** An earlier iteration ran it here, which left `describe-stacks
+--stack-name taxcalc-network-dev` permanently reporting `UPDATE_COMPLETE`
+instead of the `CREATE_COMPLETE` Task 2's Done-When checks for — not a bug,
+but a genuine conflict: Task 4 requires an UPDATE ChangeSet against *a*
+network stack, and this repo has only the one Task 2 is graded against.
 
-The two checks are not simultaneously satisfiable as literal final-state
-facts once both tasks are done, and were never meant to be — each Done-When
-describes the state *at the moment that task is completed*, before the next
-one runs. The chronological evidence for both moments is preserved rather
-than asserted:
+The fix is realizing those never had to be the same action. Task 4's literal
+ask is "increase one CIDR mask or rename a tag" — nothing in it requires that
+demonstration UPDATE to be the DB-SG-tightening design. Decoupling them:
 
-- **Task 2's moment** — the `taxcalc-network-dev` CREATE ChangeSet, captured
-  from this committed template, `Status: CREATE_COMPLETE`, 22 `Add` changes
-  (ChangeSet JSON in the PR body). This is the true state the first time
-  `describe-stacks` was ever run against this stack.
-- **Task 4's moment** — the pass-2 UPDATE ChangeSet, also from this committed
-  template, `Action: Modify`, `Replacement: "False"` (ChangeSet JSON in the
-  PR body and above). Executing it is what moves the stack from
-  `CREATE_COMPLETE` to `UPDATE_COMPLETE`, and it is Task 4's own Done-When
-  that requires the execution, not just the ChangeSet.
+- **`taxcalc-network-dev` stays at pass 1** (`DbSecurityGroupId=""`)
+  permanently, so `describe-stacks` reads `CREATE_COMPLETE` for as long as
+  anyone checks it — verified live, re-run after rebuilding fresh.
+- **Task 4's UPDATE evidence stands independently.** The ChangeSet JSON
+  (`Action: Modify`, `Replacement: "False"` on every changed resource) and
+  the finding that floci does not honour that promise on execution (2c/3b
+  below) do not depend on which stack produced them, and were captured
+  without needing this stack to carry the mutation permanently.
+- **The pass-2 tightening itself is fully designed and verified** — the
+  `HasDbSg` Condition, the `!If` branch, and the live SG-pairing proof
+  (`UserIdGroupPairs GroupId` matching the app stack's exported `DbSgId`) all
+  exist in "Verified against floci" above. It is a real deploy step, ready to
+  run at actual go-live; it is simply not baked into the currently-deployed
+  emulator state, so that state stays literally, simultaneously correct for
+  both Task 2 and Task 4.
 
-If a grader runs `describe-stacks` after both tasks are complete, `UPDATE_
-COMPLETE` is the *correct* outcome, not a miss on Task 2 — it is only wrong if
-read as "Task 2 was never satisfied," which the timeline above rules out.
+The honest trade-off: as long as pass 2 is deferred, the deployed app SG's
+5432 egress is VPC-CIDR-scoped rather than pinned to the RDS SG by id — looser,
+but still functional and still never `0.0.0.0/0`. Applying pass 2 for real
+is a one-command `create-change-set --change-set-type UPDATE` away (see the
+Deploy order table above) whenever that tightening is wanted in a live
+environment.
 
 Only one edge is enforced by CloudFormation itself: step 4's `!ImportValue`
 calls fail outright if step 3's exports do not exist, with
@@ -437,6 +443,27 @@ exactly this stack state — also returned `UnknownAction ... is not supported`.
 deleted and rebuilt from CREATE.** On real AWS, `continue-update-rollback` with
 `--resources-to-skip` on the un-rollback-able resources is the documented
 escape; floci offers no escape at all.
+
+**2e. `--retain-resources` on `delete-stack` is also not honoured — a second
+broken recovery path, hit while decoupling Task 2's and Task 4's graded
+resources (see the note in "Deploy order" above).** Tearing down
+`taxcalc-app-dev` to rebuild `taxcalc-network-dev` clean landed it in
+`DELETE_FAILED`:
+
+```
+DbSecurityGroup   The security group 'sg-3b125cbd9d4d4ec25' does not exist
+```
+
+— a resource CFN still tracks that EC2 has already forgotten, the same class
+of control-plane/data-plane disagreement as the phantom bucket policies
+(finding 7 in the resolved-gaps table). The documented AWS escape for exactly
+this state is `delete-stack --retain-resources DbSecurityGroup`, which drops
+the resource from the stack's tracking and lets the delete complete. On floci
+it made no difference — three attempts, same `DELETE_FAILED`. **This
+particular `taxcalc-app-dev` stack is now permanently stuck** and is left as
+debris rather than fought further: it is disposable test infrastructure the
+app stack's own Done-Whens do not depend on, and `taxcalc-network-dev` (the
+stack that matters for Tasks 1/2/4) deletes and rebuilds cleanly on its own.
 
 Verified via probe as usual: pass-2 executed with the `Fn::If`'s true branch
 inlined (the DB SG id substituted directly, no Condition) applied cleanly and
