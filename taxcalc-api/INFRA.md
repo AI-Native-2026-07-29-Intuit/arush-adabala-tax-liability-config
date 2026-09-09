@@ -917,7 +917,7 @@ NAT Gateway(s) found`.
 | `validate-template` is a stub | Check 5 canaries the endpoint with a fictional resource type and reports its validator as non-authoritative, so the weakness is detected rather than remembered. |
 | No drift API | Check 6 compares declared-in-template against live-in-API for the security-critical properties — a hand-rolled drift check for the fields that matter. |
 | *(found by the above)* phantom resources | Check 7 asks S3 whether every `AWS::S3::BucketPolicy` CFN claims to have created actually exists. |
-| CFN drops PAB, SSE and the bucket policy | `reconcile-s3` reads all three **out of the template** (`cfn-extract-s3.rb`) and applies them over the S3 API, which floci honours. Refuses to run against real AWS, where CFN applies them itself and doing this by hand would be drift. |
+| CFN drops PAB, SSE, `LifecycleConfiguration` and the bucket policy | `reconcile-s3` reads all four **out of the template** (`cfn-extract-s3.rb`) and applies them over the S3 API, which floci honours. Refuses to run against real AWS, where CFN applies them itself and doing this by hand would be drift. |
 | Declared `SecurityGroupEgress` doesn't remove the default allow-all | Check 9 creates a disposable SG with one declared rule and checks whether the `-1`/`0.0.0.0/0` default survives. Reports whether a live SG scan can be trusted on this endpoint. |
 
 Two design points worth keeping if this is ever extended:
@@ -947,9 +947,10 @@ is not honoured, and a declared `SecurityGroupEgress` that does not remove the
 default allow-all rule. **Zero of them are template defects** — which is
 precisely why they are counted separately.
 
-Four gaps that used to be on that list — PAB not stored, SSE downgraded to
-AES256, and the two phantom bucket policies — are now closed by
-`reconcile-s3`. **Closed in the data plane, not in CloudFormation.** Check 7
+Five gaps that used to be on that list — PAB not stored, SSE downgraded to
+AES256, the two phantom bucket policies, and the STANDARD_IA lifecycle
+transition never applying — are now closed by `reconcile-s3`. **Closed in the
+data plane, not in CloudFormation.** Check 7
 says so in its own output rather than leaving the reader to infer it:
 
 ```
@@ -977,6 +978,7 @@ copy — 2 passed, 2 failed — and then restoring it.
 | `taxcalc-app-dev` → `CREATE_COMPLETE` | probe template only | **the committed template**, clean `CREATE`, both imports resolved to concrete ids |
 | PAB all four true | not stored | **`reconcile-s3`** applies it from the template; CFN still drops it |
 | Bucket policy non-TLS Deny | phantom | **`reconcile-s3`** applies it from the template; CFN still drops it |
+| S3 lifecycle → STANDARD_IA | never applied | **`reconcile-s3`** applies it from the template (`Id`→`ID`, `TransitionInDays`→`Days`, `!Ref` params resolved to Defaults); CFN still drops it |
 | Delete of network stack refused | not run | **refused by CloudFormation** — via termination protection, *not* export-in-use |
 | `validate-template` | not run | floci's is a stub; **check 5 now detects that automatically**, and CI never lets `cfn-lint` skip |
 | `detect-stack-drift` | not run | no drift API on floci; **check 6 stands in** for the security-critical properties |

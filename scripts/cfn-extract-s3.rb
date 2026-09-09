@@ -1,14 +1,14 @@
 #!/usr/bin/env ruby
 #
-# cfn-extract-s3.rb - read the three S3 hardening settings out of a
-# CloudFormation template and print them as the JSON the S3 API expects.
+# cfn-extract-s3.rb - read the S3 hardening settings out of a CloudFormation
+# template and print them as the JSON the S3 API expects.
 #
 # Used by `cfn-guardrails.sh reconcile-s3`, which exists because floci's
 # CloudFormation provider for S3 ACCEPTS PublicAccessBlockConfiguration,
-# BucketEncryption and AWS::S3::BucketPolicy, reports CREATE_COMPLETE, and
-# then never applies any of them to its own S3 backend. floci's S3 stores all
-# three correctly when they arrive over the S3 API - measured - so the gap is
-# in the CFN-to-S3 wiring, not in S3.
+# BucketEncryption, AWS::S3::BucketPolicy and LifecycleConfiguration, reports
+# CREATE_COMPLETE, and then never applies any of them to its own S3 backend.
+# floci's S3 stores all four correctly when they arrive over the S3 API -
+# measured - so the gap is in the CFN-to-S3 wiring, not in S3.
 #
 # The values are read FROM THE TEMPLATE rather than typed into the script, so
 # what gets applied is the template's own configuration. A hand-maintained
@@ -59,10 +59,19 @@ tpl    = to_ruby(Psych.parse(File.read(ARGV[0])))
 bucket = ARGV[1]
 arn    = "arn:aws:s3:::#{bucket}"
 
+# Parameter Defaults, for resolving !Ref TransitionToIaDays and similar
+# inside LifecycleConfiguration. to_ruby already coerced unquoted numeric
+# Defaults to real Integers, so a Number Parameter comes out typed correctly
+# for the S3 API without any further conversion here.
+param_defaults = (tpl['Parameters'] || {}).each_with_object({}) do |(name, spec), h|
+  h[name] = spec['Default'] if spec.is_a?(Hash) && spec.key?('Default')
+end
+
 # Resolve only the intrinsics that actually occur inside these properties:
-# !GetAtt <Bucket>.Arn and !Sub "${<Bucket>.Arn}/*". Anything else is left
-# alone and will surface as a visible non-string rather than a wrong value.
-def resolve(o, arn)
+# !GetAtt <Bucket>.Arn, !Sub "${<Bucket>.Arn}/*", and !Ref <Parameter>.
+# Anything else is left alone and will surface as a visible non-string rather
+# than a wrong value.
+def resolve(o, arn, param_defaults)
   case o
   when Hash
     if o.size == 1
@@ -73,10 +82,12 @@ def resolve(o, arn)
         return arn if parts.last == 'Arn'
       when 'Fn::Sub'
         return v.gsub(/\$\{[A-Za-z0-9:]+\.Arn\}/, arn) if v.is_a?(String)
+      when 'Fn::Ref'
+        return param_defaults[v] if v.is_a?(String) && param_defaults.key?(v)
       end
     end
-    o.transform_values { |x| resolve(x, arn) }
-  when Array then o.map { |x| resolve(x, arn) }
+    o.transform_values { |x| resolve(x, arn, param_defaults) }
+  when Array then o.map { |x| resolve(x, arn, param_defaults) }
   else o
   end
 end
@@ -100,9 +111,34 @@ if sse.is_a?(Hash) && sse['ServerSideEncryptionConfiguration'].is_a?(Array)
   } }
 end
 
+# CloudFormation and the S3 API also disagree on lifecycle rule shape:
+#   Id                -> ID
+#   Transitions[].TransitionInDays -> Transitions[].Days
+# and the modern PutBucketLifecycleConfiguration API requires a Filter (or
+# Prefix) on every rule - a rule with neither is rejected outright. These
+# templates' rules apply to the whole bucket, so an empty Filter is the
+# correct translation of "no prefix restriction," not a stand-in value.
+lifecycle = props['LifecycleConfiguration']
+if lifecycle.is_a?(Hash) && lifecycle['Rules'].is_a?(Array)
+  lifecycle = { 'Rules' => lifecycle['Rules'].map { |rule|
+    r = rule.dup
+    r['ID'] = r.delete('Id') if r.key?('Id')
+    r['Filter'] = {} unless r.key?('Filter') || r.key?('Prefix')
+    if r['Transitions'].is_a?(Array)
+      r['Transitions'] = r['Transitions'].map { |t|
+        t = t.dup
+        t['Days'] = t.delete('TransitionInDays') if t.key?('TransitionInDays')
+        t
+      }
+    end
+    r
+  } }
+end
+
 out = {
-  'pab'    => props['PublicAccessBlockConfiguration'],
-  'sse'    => sse,
-  'policy' => resolve((pol['Properties'] || {})['PolicyDocument'], arn)
+  'pab'       => props['PublicAccessBlockConfiguration'],
+  'sse'       => sse,
+  'policy'    => resolve((pol['Properties'] || {})['PolicyDocument'], arn, param_defaults),
+  'lifecycle' => resolve(lifecycle, arn, param_defaults)
 }
 puts JSON.pretty_generate(out)

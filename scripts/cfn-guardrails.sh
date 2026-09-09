@@ -244,14 +244,14 @@ fi
 # accepted and then dropped.
 #
 # floci's CFN provider for AWS::S3::Bucket and AWS::S3::BucketPolicy is a
-# no-op for three properties: PublicAccessBlockConfiguration, BucketEncryption
-# and the bucket policy. All three report CREATE_COMPLETE - the policy even
-# gets a fabricated physical id like bucket-policy-80a48155 - and none of them
-# reaches S3. That is the worst failure mode in this whole exercise: the stack
-# is green, describe-stacks agrees, and the deny-non-TLS rule S3 is supposed to
-# be enforcing does not exist.
+# no-op for four properties: PublicAccessBlockConfiguration, BucketEncryption,
+# LifecycleConfiguration and the bucket policy. All four report CREATE_COMPLETE
+# - the policy even gets a fabricated physical id like bucket-policy-80a48155 -
+# and none of them reaches S3. That is the worst failure mode in this whole
+# exercise: the stack is green, describe-stacks agrees, and the deny-non-TLS
+# rule S3 is supposed to be enforcing does not exist.
 #
-# floci's S3 accepts all three over the S3 API (measured), so this reads them
+# floci's S3 accepts all four over the S3 API (measured), so this reads them
 # out of the template and PUTs them, then reads them back to prove it.
 #
 # It REFUSES to run against real AWS. There, CloudFormation applies these
@@ -321,6 +321,31 @@ reconcile_s3() {
         ok "bucket policy - aws:SecureTransport false => Deny"
       else
         bad "deny-non-TLS statement is not present after put"; rc=1
+      fi
+    fi
+
+    # --- lifecycle configuration
+    if echo "$extracted" | jq -e '.lifecycle != null' >/dev/null; then
+      aws_ s3api put-bucket-lifecycle-configuration --bucket "$bucket" \
+        --lifecycle-configuration "$(echo "$extracted" | jq -c .lifecycle)" >/dev/null 2>&1
+      local live_ia
+      live_ia=$(aws_ s3api get-bucket-lifecycle-configuration --bucket "$bucket" \
+        --query "Rules[].Transitions[?StorageClass=='STANDARD_IA'].Days" --output text 2>/dev/null)
+      declared_ia=$(echo "$extracted" | jq -r '.lifecycle.Rules[].Transitions[]? | select(.StorageClass=="STANDARD_IA") | .Days' 2>/dev/null)
+      if [ -n "$declared_ia" ]; then
+        if [ "$live_ia" = "$declared_ia" ]; then
+          ok "lifecycle - STANDARD_IA transition at ${live_ia}d, matches template"
+        else
+          bad "lifecycle STANDARD_IA transition: template says ${declared_ia}d, live is ${live_ia:-unset}"; rc=1
+        fi
+      else
+        # e.g. taxcalc-bootstrap-dev, which has only NoncurrentVersionExpiration
+        if aws_ s3api get-bucket-lifecycle-configuration --bucket "$bucket" \
+             --query 'Rules[0].ID' --output text >/dev/null 2>&1; then
+          ok "lifecycle - rule present"
+        else
+          bad "lifecycle configuration did not stick"; rc=1
+        fi
       fi
     fi
   done
