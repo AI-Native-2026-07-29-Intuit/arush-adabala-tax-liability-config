@@ -459,7 +459,25 @@ of control-plane/data-plane disagreement as the phantom bucket policies
 (finding 7 in the resolved-gaps table). The documented AWS escape for exactly
 this state is `delete-stack --retain-resources DbSecurityGroup`, which drops
 the resource from the stack's tracking and lets the delete complete. On floci
-it made no difference — three attempts, same `DELETE_FAILED`. **This
+it made no difference — three attempts, same `DELETE_FAILED`.
+
+**A fourth and fifth path were tried before calling this unrecoverable.**
+`continue-update-rollback` (the escape for `UPDATE_ROLLBACK_FAILED`, finding
+2c) returns `UnknownAction ... is not supported` outright — not implemented,
+not attempted, a flat refusal. `delete-stack --deletion-mode
+FORCE_DELETE_STACK` — AWS's purpose-built 2024 answer to exactly this
+"CloudFormation still owns a resource the underlying service has already
+forgotten" class of stuck stack — was accepted, briefly moved the stack to
+`DELETE_IN_PROGRESS`, and then failed with the identical
+`DbSecurityGroup ... does not exist` reason. Accepting the flag without
+implementing its actual semantics is worse than rejecting it outright, in the
+same way a `Replacement: False` that is not honoured (finding 3b) is worse
+than an honest error: both look like progress until the outcome proves they
+were not.
+
+Every documented CloudFormation recovery path for a stuck stack has now been
+tried and exhausted: plain `delete-stack`, `--retain-resources`,
+`--deletion-mode FORCE_DELETE_STACK`, and `continue-update-rollback`. **This
 particular `taxcalc-app-dev` stack is now permanently stuck** and is left as
 debris rather than fought further: it is disposable test infrastructure the
 app stack's own Done-Whens do not depend on, and `taxcalc-network-dev` (the
