@@ -63,7 +63,7 @@ Resources:
               would need its own W35 exemption, which moves the suppression
               rather than removing it.
     Properties:
-      BucketName: !Sub "uptimecrew-taxcalc-artifacts-${EnvName}-${AWS::AccountId}"
+      BucketName: !Sub "uptimecrew-taxcalc-artifacts-${EnvName}"
       VersioningConfiguration: {Status: Enabled}
       BucketEncryption:
         ServerSideEncryptionConfiguration:
