@@ -18,7 +18,8 @@
 #                     template over the size limit.
 #
 # Running the same checks locally before pushing:
-#   pip install cfn-lint==1.22.3 && cfn-lint cfn/*.yaml
+#   pip install cfn-lint==1.56.1 cfn-lint-serverless==0.3.5
+#   cfn-lint cfn/*.yaml -a cfn_lint_serverless.rules
 #   gem install cfn-nag -v 0.8.10 && cfn_nag_scan --input-path cfn --fail-on-warnings
 name: cfn-validate
 
@@ -55,8 +56,11 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install cfn-lint
-        run: pip install cfn-lint==1.22.3
+      # cfn-lint-serverless requires cfn-lint>=1.44.0, which is why the pin
+      # moved off 1.22.3. Both are pinned exactly: an unpinned rule pack can
+      # start failing a green PR on a day nobody touched the templates.
+      - name: Install cfn-lint + the serverless rule pack
+        run: pip install cfn-lint==1.56.1 cfn-lint-serverless==0.3.5
 
       - name: Set up Ruby (for cfn-nag)
         uses: ruby/setup-ruby@a4effe49ee8ee5b8b5091268c473a4628afb5651 # v1.211.0
@@ -71,8 +75,19 @@ jobs:
       - name: Install cfn-nag
         run: gem install cfn-nag -v 0.8.10 --no-document
 
-      - name: cfn-lint
-        run: cfn-lint cfn/*.yaml
+      # -a appends the serverless rule pack (ES*/WS* rules: Lambda tracing and
+      # memory/timeout defaults, API Gateway logging and throttling, SQS/SNS
+      # redrive policies, EventBridge DLQs).
+      #
+      # It finds nothing today, and that is the correct result rather than a
+      # wasted step: cfn/ currently holds a VPC, an RDS instance, two S3
+      # buckets and an IAM role, and no Transform. Verified the pack is
+      # genuinely wired rather than silently inert - a scratch SQS queue with
+      # no RedrivePolicy trips ES6000 through this exact invocation. It starts
+      # earning its place when W6 D4's LLM cost-monitoring Lambda stack lands
+      # in cfn/, which is the point of wiring it before then rather than after.
+      - name: cfn-lint (with cfn-lint-serverless rules)
+        run: cfn-lint cfn/*.yaml -a cfn_lint_serverless.rules
 
       # --fail-on-warnings, so a WARN is a red check rather than a line of log
       # nobody reads. Anything deliberately accepted is suppressed at the

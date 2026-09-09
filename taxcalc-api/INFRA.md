@@ -1313,16 +1313,34 @@ waiver silently applies to resources added later that nobody argued about.
 Suppressing at the resource puts the justification in the diff. All six
 suppressions above are written that way.
 
-**Rejected — the `cfn-lint-serverless` profile in CI.** The task text asks for
-`cfn-lint` with the `cfn-lint-serverless` rule pack. It is not wired up.
-That pack adds rules about Lambda, API Gateway and SAM transforms; `cfn/` here
-contains a VPC, an RDS instance, two S3 buckets and an IAM role, and no
-`Transform` of any kind. Every rule in it is inapplicable, so it would add an
-install step and a dependency to this repo's only CI job in exchange for
-scanning for resource types that are not present. It becomes correct in W6 D4,
-when the LLM cost-monitoring Lambda stack lands in `cfn/` — and that is the
-change that should add it, so the dependency arrives with the first template
-that justifies it.
+**Initially deferred, then wired in — `cfn-lint-serverless` in CI.** The
+original call here was to skip it: `cfn/` holds a VPC, an RDS instance, two S3
+buckets and an IAM role, no `Transform` of any kind, so every one of the
+pack's 17 rules (`ES*`/`WS*` — Lambda tracing, memory/timeout defaults, API
+Gateway logging and throttling, SQS/SNS redrive policies, EventBridge DLQs)
+is inapplicable today. That reasoning was sound but incomplete: it treated
+"finds nothing" as "does nothing," without checking whether the pack was
+actually being invoked correctly.
+
+It was not, on the first attempt. Appending `-a cfn_lint_serverless.rules`
+against `cfn-lint==1.22.3` loads the module without error and reports zero
+findings — indistinguishable from a correctly-wired pack finding nothing.
+Confirmed as a false negative by running the identical command against a
+scratch `AWS::SQS::Queue` with no `RedrivePolicy`: silence, where `ES6000`
+should fire. The pack declares `cfn-lint>=1.44.0`; **1.22.3 loads it as an
+inert no-op rather than refusing to start**, which is worse than an
+`ImportError` — a version mismatch that fails loudly is a five-minute fix, one
+that fails silently is a rule pack nobody notices is not running.
+
+Repeating the same probe against `cfn-lint==1.56.1` fires `ES6000` correctly,
+so the pack itself works; only the pin was wrong. `cfn-validate.yml` now
+installs `cfn-lint==1.56.1 cfn-lint-serverless==0.3.5` and runs
+`cfn-lint cfn/*.yaml -a cfn_lint_serverless.rules`. Both versions pinned
+exactly, for the same reason every action SHA in this workflow is pinned: an
+unpinned rule pack can start failing a green PR on a day nobody touched the
+templates. Zero findings against the current four templates remains the
+correct result — verified as a true negative this time, not assumed — and the
+pack earns its keep the moment W6 D4's Lambda stack lands in `cfn/`.
 
 ---
 
@@ -1357,9 +1375,9 @@ that justifies it.
 ## Running the checks locally
 
 ```bash
-# cfn-lint
-pip install cfn-lint==1.22.3
-cfn-lint cfn/*.yaml
+# cfn-lint + the serverless rule pack
+pip install cfn-lint==1.56.1 cfn-lint-serverless==0.3.5
+cfn-lint cfn/*.yaml -a cfn_lint_serverless.rules
 
 # cfn-nag. Ruby 3.3 specifically - cfn-nag 0.8.10 pulls kwalify 0.7.2, which
 # calls StringScanner#peep. That was removed in Ruby 4.0, so on 4.x the scan
