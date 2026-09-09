@@ -139,6 +139,106 @@ if [ "${1:-}" = "guard-delete" ]; then
   guard_delete "$2"; exit $?
 fi
 
+# ---------------------------------------------------------------------------
+# reap-orphans - clean up resources floci's delete-stack leaks.
+#
+# MEASURED this session, twice: deleting a taxcalc-network-dev stack on floci
+# removes the CloudFormation stack record but leaves the underlying VPC and
+# its NAT Gateways running. Every rebuild during iteration therefore adds one
+# more orphaned VPC (with its own subnets, IGW, route tables, SGs) and one
+# more orphaned NAT Gateway to the account - nothing this repo's templates
+# create, so `aws ec2 describe-vpcs` for this CIDR silently accumulates
+# false positives across a session. Nine orphaned VPCs and four orphaned NAT
+# Gateways were found and removed by hand before this existed.
+#
+# "Live" is defined as "owned by a CloudFormation stack that is not
+# DELETE_COMPLETE" - read from describe-stack-resources across every stack,
+# never assumed from a naming convention. Anything matching this repo's VPC
+# CIDR or carrying Tags Project=taxcalc that is NOT in that live set is an
+# orphan. Dependents (IGW, subnets, non-main route tables, non-default SGs)
+# are torn down before the VPC itself, in the order EC2 requires.
+reap_orphans() {
+  local vpc_cidr="${1:-10.41.0.0/16}"
+  echo "Live VPCs and NAT Gateways (owned by a non-deleted stack):"
+  local live_vpcs="" live_nats=""
+  for stk in $(aws_ cloudformation list-stacks \
+      --stack-status-filter CREATE_COMPLETE UPDATE_COMPLETE UPDATE_ROLLBACK_COMPLETE \
+      --query 'StackSummaries[].StackName' --output text 2>/dev/null); do
+    for v in $(aws_ cloudformation describe-stack-resources --stack-name "$stk" \
+        --query "StackResources[?ResourceType=='AWS::EC2::VPC'].PhysicalResourceId" --output text 2>/dev/null); do
+      live_vpcs="$live_vpcs $v"; note "$stk owns VPC $v"
+    done
+    for n in $(aws_ cloudformation describe-stack-resources --stack-name "$stk" \
+        --query "StackResources[?ResourceType=='AWS::EC2::NatGateway'].PhysicalResourceId" --output text 2>/dev/null); do
+      live_nats="$live_nats $n"; note "$stk owns NAT Gateway $n"
+    done
+  done
+
+  echo
+  echo "Orphaned VPCs (CIDR $vpc_cidr, not owned by any live stack):"
+  local orphan_vpcs
+  orphan_vpcs=$(aws_ ec2 describe-vpcs --filters "Name=cidr,Values=$vpc_cidr" \
+    --query 'Vpcs[].VpcId' --output text 2>/dev/null)
+  local removed_vpcs=0
+  for v in $orphan_vpcs; do
+    case " $live_vpcs " in *" $v "*) continue ;; esac
+    removed_vpcs=$((removed_vpcs+1))
+    if [ "${GUARD_DELETE_APPLY:-false}" != "true" ]; then
+      note "would delete $v and its dependents (dry run)"
+      continue
+    fi
+    for igw in $(aws_ ec2 describe-internet-gateways \
+        --filters "Name=attachment.vpc-id,Values=$v" \
+        --query 'InternetGateways[].InternetGatewayId' --output text 2>/dev/null); do
+      aws_ ec2 detach-internet-gateway --internet-gateway-id "$igw" --vpc-id "$v" >/dev/null 2>&1
+      aws_ ec2 delete-internet-gateway --internet-gateway-id "$igw" >/dev/null 2>&1
+    done
+    for sn in $(aws_ ec2 describe-subnets --filters "Name=vpc-id,Values=$v" \
+        --query 'Subnets[].SubnetId' --output text 2>/dev/null); do
+      aws_ ec2 delete-subnet --subnet-id "$sn" >/dev/null 2>&1
+    done
+    for rt in $(aws_ ec2 describe-route-tables --filters "Name=vpc-id,Values=$v" \
+        --query 'RouteTables[?Associations[0].Main!=`true`].RouteTableId' --output text 2>/dev/null); do
+      aws_ ec2 delete-route-table --route-table-id "$rt" >/dev/null 2>&1
+    done
+    for sg in $(aws_ ec2 describe-security-groups --filters "Name=vpc-id,Values=$v" \
+        --query "SecurityGroups[?GroupName!='default'].GroupId" --output text 2>/dev/null); do
+      aws_ ec2 delete-security-group --group-id "$sg" >/dev/null 2>&1
+    done
+    aws_ ec2 delete-vpc --vpc-id "$v" >/dev/null 2>&1
+    note "deleted $v"
+  done
+  [ "$removed_vpcs" -eq 0 ] && note "none"
+
+  echo
+  echo "Orphaned NAT Gateways (available, not owned by any live stack):"
+  local removed_nats=0
+  for n in $(aws_ ec2 describe-nat-gateways --filter Name=state,Values=available \
+      --query 'NatGateways[].NatGatewayId' --output text 2>/dev/null); do
+    case " $live_nats " in *" $n "*) continue ;; esac
+    removed_nats=$((removed_nats+1))
+    if [ "${GUARD_DELETE_APPLY:-false}" != "true" ]; then
+      note "would delete $n (dry run)"
+      continue
+    fi
+    aws_ ec2 delete-nat-gateway --nat-gateway-id "$n" >/dev/null 2>&1
+    note "deleted $n"
+  done
+  [ "$removed_nats" -eq 0 ] && note "none"
+
+  echo
+  if [ "${GUARD_DELETE_APPLY:-false}" = "true" ]; then
+    printf 'Removed %d orphaned VPC(s), %d orphaned NAT Gateway(s).\n' "$removed_vpcs" "$removed_nats"
+  else
+    printf '%d orphaned VPC(s), %d orphaned NAT Gateway(s) found.\n' "$removed_vpcs" "$removed_nats"
+    printf '(dry run - set GUARD_DELETE_APPLY=true to actually delete)\n'
+  fi
+}
+
+if [ "${1:-}" = "reap-orphans" ]; then
+  reap_orphans "${2:-}"; exit 0
+fi
+
 # --static runs only the checks derived from the templates themselves - no AWS
 # call, no endpoint, no credentials. That is checks 1-3 and the 0.0.0.0/0
 # assertion, which between them catch the mistake most likely to be made in

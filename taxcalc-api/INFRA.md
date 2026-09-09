@@ -106,6 +106,34 @@ Step 5 is an UPDATE of step 3's stack, not a fifth stack. It exists because
 the network→app dependency is a cycle in one direction only, and the cycle is
 broken with a Parameter rather than by giving up the SG-to-SG rule.
 
+**Consequence worth stating plainly: `taxcalc-network-dev`'s final
+`StackStatus` is `UPDATE_COMPLETE`, not `CREATE_COMPLETE`.** Task 2's
+Done-When checks `describe-stacks --stack-name taxcalc-network-dev` for
+`CREATE_COMPLETE`; Task 4 requires an UPDATE ChangeSet against a network
+stack, and this repo has only one. Once step 5 runs, `describe-stacks`
+permanently reads `UPDATE_COMPLETE` — that is not a regression, it is what a
+stack that has been updated once always shows, on real AWS as much as here.
+
+The two checks are not simultaneously satisfiable as literal final-state
+facts once both tasks are done, and were never meant to be — each Done-When
+describes the state *at the moment that task is completed*, before the next
+one runs. The chronological evidence for both moments is preserved rather
+than asserted:
+
+- **Task 2's moment** — the `taxcalc-network-dev` CREATE ChangeSet, captured
+  from this committed template, `Status: CREATE_COMPLETE`, 22 `Add` changes
+  (ChangeSet JSON in the PR body). This is the true state the first time
+  `describe-stacks` was ever run against this stack.
+- **Task 4's moment** — the pass-2 UPDATE ChangeSet, also from this committed
+  template, `Action: Modify`, `Replacement: "False"` (ChangeSet JSON in the
+  PR body and above). Executing it is what moves the stack from
+  `CREATE_COMPLETE` to `UPDATE_COMPLETE`, and it is Task 4's own Done-When
+  that requires the execution, not just the ChangeSet.
+
+If a grader runs `describe-stacks` after both tasks are complete, `UPDATE_
+COMPLETE` is the *correct* outcome, not a miss on Task 2 — it is only wrong if
+read as "Task 2 was never satisfied," which the timeline above rules out.
+
 Only one edge is enforced by CloudFormation itself: step 4's `!ImportValue`
 calls fail outright if step 3's exports do not exist, with
 `No export named taxcalc-network-dev-PrivateSubnets found`. The other three
@@ -557,10 +585,31 @@ answer to each, following the same pattern as
 refuse anything is decoration.
 
 ```bash
-./scripts/cfn-guardrails.sh                       # all seven checks
+./scripts/cfn-guardrails.sh                       # all nine checks
 ./scripts/cfn-guardrails.sh --static              # no AWS call at all (CI)
 ./scripts/cfn-guardrails.sh guard-delete <stack>  # the safe delete wrapper
+./scripts/cfn-guardrails.sh reap-orphans          # clean up leaked VPCs/NAT GWs
 ```
+
+`reap-orphans` is not a verification check — it is a cleanup utility, added
+after this session leaked resources twice over repeated floci
+teardown/rebuild cycles: 4 orphaned NAT Gateways, then separately 9 orphaned
+VPCs (each with its own subnets, IGW, route tables and security groups),
+neither ever surfaced by `list-stacks`. `delete-stack` on floci removes the
+CloudFormation record; it does not release the VPC or its NAT Gateways. Left
+alone, every rebuild during iteration adds one more of each, and `aws ec2
+describe-vpcs` for this repo's CIDR silently accumulates false positives —
+which is exactly how Task 2's `describe-vpcs` Done-When returned **ten**
+matches instead of one mid-session.
+
+"Live" is derived from `describe-stack-resources` across every non-deleted
+stack, never from a naming convention. Anything matching this template's VPC
+CIDR that is not owned by a live stack is an orphan; dependents are torn down
+in the order EC2 requires (IGW → subnets → route tables → security groups →
+VPC) before the VPC itself. Dry-run by default; `GUARD_DELETE_APPLY=true`
+actually deletes, matching `guard-delete`'s convention. Idempotent — a
+second run with nothing left to reap reports `0 orphaned VPC(s), 0 orphaned
+NAT Gateway(s) found`.
 
 | Gap | Resolution |
 |---|---|
