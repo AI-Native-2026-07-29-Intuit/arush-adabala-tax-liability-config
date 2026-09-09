@@ -228,7 +228,7 @@ Resources:
       Domain: vpc
       Tags: [{Key: Name, Value: !Sub "taxcalc-${EnvName}-nat-eip-b"}]
 
-  NatGatewayB:
+  NatGatewayBPerAz:
     Type: AWS::EC2::NatGateway
     Condition: IsProdLike
     Properties:
@@ -244,7 +244,7 @@ Resources:
       Domain: vpc
       Tags: [{Key: Name, Value: !Sub "taxcalc-${EnvName}-nat-eip-c"}]
 
-  NatGatewayC:
+  NatGatewayCPerAz:
     Type: AWS::EC2::NatGateway
     Condition: IsProdLike
     Properties:
@@ -312,7 +312,7 @@ Resources:
     Properties:
       RouteTableId: !Ref PrivateRouteTableB
       DestinationCidrBlock: 0.0.0.0/0
-      NatGatewayId: !Ref NatGatewayB
+      NatGatewayId: !Ref NatGatewayBPerAz
 
   PrivateAssocBHA:
     Type: AWS::EC2::SubnetRouteTableAssociation
@@ -338,7 +338,7 @@ Resources:
     Properties:
       RouteTableId: !Ref PrivateRouteTableC
       DestinationCidrBlock: 0.0.0.0/0
-      NatGatewayId: !Ref NatGatewayC
+      NatGatewayId: !Ref NatGatewayCPerAz
 
   PrivateAssocCHA:
     Type: AWS::EC2::SubnetRouteTableAssociation

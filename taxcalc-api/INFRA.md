@@ -23,9 +23,9 @@ All four stacks **were** deployed against **[floci](https://github.com/floci-io/
 the local AWS emulator this repo already uses for exactly this gap (W5 D4, W6
 D1 — see the application repo's README). `AWS_ENDPOINT_URL=http://localhost:4566`
 plus dummy credentials, no template or command changes. That closes more than
-expected and — more usefully — **fails in five specific places, two of which
-return the opposite of the right answer.** The whole comparison is in
-"Verified against floci" below.
+expected and — more usefully — **fails in seven specific places, two of which
+return the opposite of the right answer and one of which leaves a stack
+unrecoverable.** The whole comparison is in "Verified against floci" below.
 
 | | Ran | Evidence |
 |---|---|---|
@@ -277,7 +277,7 @@ dev ChangeSet contains 22 resources; the identical template with
 claim the Condition is making:
 
 ```
-only in staging:  NatEipB NatEipC NatGatewayB NatGatewayC
+only in staging:  NatEipB NatEipC NatGatewayBPerAz NatGatewayCPerAz
                   PrivateRouteTableB PrivateRouteTableC
                   PrivateDefaultRouteB PrivateDefaultRouteC
                   PrivateAssocBHA PrivateAssocCHA
@@ -381,6 +381,64 @@ branch, which is byte-identical to what pass 1 produces anyway.
 Note that `create-change-set` succeeds on the real template in both cases; it
 is only `execute-change-set` that fails. So the ChangeSet diffs in the PR come
 from the committed templates, not from the probes.
+
+**2c. On an UPDATE, the same `Fn::If` gap is worse: floci's own rollback also
+fails, and the stack gets stuck.** Running the network stack's pass-2 UPDATE
+(tightening 5432 egress to the DB SG) from the real template hit the same
+`Fn::If` rejection as 2b — expected, since the live stack already carried the
+egress rule from the CREATE. What was not expected is what came next:
+
+```
+UPDATE_FAILED   TaxcalcAppSecurityGroup   A security group rule must specify
+                                          exactly one of CidrIp, CidrIpv6, a
+                                          prefix list, or a security group.
+UPDATE_FAILED   Vpc                       Rollback is not implemented for
+                                          AWS::EC2::VPC
+UPDATE_FAILED   InternetGateway           Rollback is not implemented for
+                                          AWS::EC2::InternetGateway
+UPDATE_FAILED   PublicRouteTable          Rollback is not implemented for
+                                          AWS::EC2::RouteTable
+UPDATE_FAILED   PublicSubnetA/B/C         Rollback is not implemented for
+                                          AWS::EC2::Subnet
+UPDATE_ROLLBACK_FAILED
+```
+
+`aws cloudformation continue-update-rollback` — the standard recovery path for
+exactly this stack state — also returned `UnknownAction ... is not supported`.
+**The stack was unrecoverable through the CloudFormation API and had to be
+deleted and rebuilt from CREATE.** On real AWS, `continue-update-rollback` with
+`--resources-to-skip` on the un-rollback-able resources is the documented
+escape; floci offers no escape at all.
+
+Verified via probe as usual: pass-2 executed with the `Fn::If`'s true branch
+inlined (the DB SG id substituted directly, no Condition) applied cleanly and
+tightened the egress correctly —
+
+```
+UserIdGroupPairs[].GroupId == the app stack's exported DbSgId
+```
+
+— so the committed template's design is not in question; the failure and the
+unrecoverable state are both floci's.
+
+**2d. Declaring `SecurityGroupEgress` does not remove the default allow-all
+rule.** On real AWS, an explicit `SecurityGroupEgress` list **replaces** the
+security group's auto-created `0.0.0.0/0`/all-protocols default — AWS
+documents this directly, and it is why the app SG's inline comment says
+"Egress is enumerated, which REPLACES the default allow-all." On floci it does
+not: a fresh security group declaring only a 443 rule still carries
+
+```json
+{"IpProtocol": "-1", "IpRanges": [{"CidrIp": "0.0.0.0/0"}]}
+```
+
+alongside it, both on `CREATE` and surviving an `UPDATE`. Isolated with a
+disposable single-rule SG — the wildcard rule was present immediately after
+`CREATE_COMPLETE`, before any update was attempted, so this is not an
+update-specific artefact. **A security group inspected on this endpoint can
+look unrestricted even when its template enumerates a tight egress list** —
+the live scan is not trustworthy evidence here; only the template is.
+`scripts/cfn-guardrails.sh` check 9 measures this on every run.
 
 **3. `detect-stack-drift` is not implemented at all.**
 
@@ -511,6 +569,7 @@ refuse anything is decoration.
 | `validate-template` is a stub | Check 5 canaries the endpoint with a fictional resource type and reports its validator as non-authoritative, so the weakness is detected rather than remembered. |
 | No drift API | Check 6 compares declared-in-template against live-in-API for the security-critical properties — a hand-rolled drift check for the fields that matter. |
 | *(found by the above)* phantom resources | Check 7 asks S3 whether every `AWS::S3::BucketPolicy` CFN claims to have created actually exists. |
+| Declared `SecurityGroupEgress` doesn't remove the default allow-all | Check 9 creates a disposable SG with one declared rule and checks whether the `-1`/`0.0.0.0/0` default survives. Reports whether a live SG scan can be trusted on this endpoint. |
 
 Two design points worth keeping if this is ever extended:
 
@@ -530,14 +589,15 @@ on real AWS, where it would be genuine drift.
 Current result against floci:
 
 ```
-6 passed, 0 failed, 10 parity gap(s)
+6 passed, 0 failed, 11 parity gap(s)
 ```
 
-The ten gaps are: no native export protection, a non-authoritative
+The eleven gaps are: no native export protection, a non-authoritative
 `validate-template`, PAB not stored, SSE downgraded to AES256, three RDS
-properties dropped, two phantom bucket policies, and a `Replacement: False`
-that is not honoured. **Zero of them are
-template defects** — which is precisely why they are counted separately.
+properties dropped, two phantom bucket policies, a `Replacement: False` that
+is not honoured, and a declared `SecurityGroupEgress` that does not remove the
+default allow-all rule. **Zero of them are template defects** — which is
+precisely why they are counted separately.
 
 `--static` runs checks 1–3 plus the `0.0.0.0/0` assertion with **no AWS call
 of any kind**, and is wired into `cfn-validate.yml`. That gates the cross-stack

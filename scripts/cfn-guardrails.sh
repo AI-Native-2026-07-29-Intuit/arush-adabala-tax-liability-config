@@ -457,6 +457,58 @@ else
 fi
 trap - EXIT; upd_cleanup
 
+head_ '9. Does this endpoint REMOVE the default egress rule when SecurityGroupEgress is declared?'
+# On real AWS, an explicit SecurityGroupEgress list REPLACES the security
+# group's auto-created "allow all, 0.0.0.0/0" default - AWS documents this
+# directly. It is why every enumerated-egress SG in this repo's templates is
+# commented "REPLACES the default allow-all". Measured with a disposable SG
+# declaring only 443: if the -1/0.0.0.0/0 rule is still present after create,
+# the enumerated list is being treated as ADDITIVE on this endpoint, and any
+# "no unrestricted egress" claim about a deployed SG cannot be trusted here -
+# only the template is trustworthy, not what got deployed from it.
+EGP=cfn-guard-egress-probe
+TMPE=$(mktemp -d)
+cat > "$TMPE/sg.yaml" <<'YAML'
+AWSTemplateFormatVersion: "2010-09-09"
+Resources:
+  Vpc: {Type: AWS::EC2::VPC, Properties: {CidrBlock: 10.95.0.0/16}}
+  Sg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: disposable probe - only 443 declared
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - {IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0}
+YAML
+egress_cleanup() {
+  aws_ cloudformation delete-stack --stack-name "$EGP" >/dev/null 2>&1
+  aws_ cloudformation wait stack-delete-complete --stack-name "$EGP" >/dev/null 2>&1
+  rm -rf "$TMPE"
+}
+trap egress_cleanup EXIT
+if aws_ cloudformation create-stack --stack-name "$EGP" --template-body "file://$TMPE/sg.yaml" >/dev/null 2>&1 &&
+   aws_ cloudformation wait stack-create-complete --stack-name "$EGP" >/dev/null 2>&1; then
+  SGID=$(aws_ cloudformation describe-stack-resources --stack-name "$EGP" \
+    --query "StackResources[?LogicalResourceId=='Sg'].PhysicalResourceId" --output text 2>/dev/null)
+  HASWILD=$(aws_ ec2 describe-security-groups --group-ids "$SGID" \
+    --query "length(SecurityGroups[0].IpPermissionsEgress[?IpProtocol=='-1'])" --output text 2>/dev/null)
+  if [ "${HASWILD:-0}" = "0" ]; then
+    ok "default allow-all egress removed once SecurityGroupEgress was declared"
+  else
+    if is_emulator; then
+      gap "the -1/0.0.0.0/0 default egress rule survived a declared SecurityGroupEgress"
+      note "the enumerated list is ADDITIVE here, not a replacement. A security"
+      note "group inspected on this endpoint can look far more permissive than"
+      note "its template - trust the template's egress list, not a live scan."
+    else
+      bad "real AWS left the default allow-all egress rule in place - investigate"
+    fi
+  fi
+else
+  gap "egress-replace probe stack could not be created; not measured"
+fi
+trap - EXIT; egress_cleanup
+
 head_ 'Result'
 printf '%d passed, %d failed, %d parity gap(s)\n' "$PASS" "$FAIL" "$GAP"
 if [ "$GAP" -gt 0 ]; then
