@@ -41,6 +41,18 @@ Parameters:
     AllowedPattern: "^10\\.\\d{1,3}\\.0\\.0/16$"
     ConstraintDescription: Must be a 10.x.0.0/16 block, e.g. 10.41.0.0/16.
 
+  DbSecurityGroupId:
+    Type: String
+    Default: ""
+    Description: >-
+      The application stack's DB security group id, so the app SG's Postgres
+      egress can be pinned to that SG rather than to a CIDR. Empty on the
+      first deploy and supplied on a later UPDATE - see "Two-pass deploy" in
+      taxcalc-api/INFRA.md. A Parameter and NOT an !ImportValue on purpose:
+      importing here would be a cross-stack CYCLE, because the app stack
+      already imports AppSgId from this stack. Leaving it empty is safe - the
+      egress rule falls back to the VPC CIDR, which is functional but looser.
+
 Mappings:
   # Per-env scale hints, consumed by the application stack via !FindInMap when
   # it imports this network's VpcCidr. Kept here so one file owns the
@@ -61,6 +73,14 @@ Conditions:
   # prod-like counterpart, and CFN has no "else" - each branch needs its own
   # named Condition.
   IsDev: !Not [!Condition IsProdLike]
+  # HasDbSg gates which form the app SG's Postgres egress rule takes. On the
+  # first deploy the app stack does not exist yet, so DbSecurityGroupId is
+  # empty and the rule is written against the VPC CIDR - functional, and no
+  # worse than having no rule. On the second pass the real SG id is supplied
+  # and the rule tightens to that security group alone. Both branches are
+  # declared IN this template, which is what keeps detect-stack-drift IN_SYNC:
+  # whichever branch is live is also the branch CloudFormation knows about.
+  HasDbSg: !Not [!Equals [!Ref DbSecurityGroupId, ""]]
 
 Resources:
   Vpc:
@@ -335,16 +355,36 @@ Resources:
   #
   # Egress is enumerated, which REPLACES the default allow-all. Two rules:
   #   443 to the internet - ECR image pulls, STS AssumeRole, Secrets Manager.
-  #   5432 to the VPC CIDR - Postgres, the RDS instance in the private subnets.
+  #   5432 to the RDS security group by id, once that id is known.
   #
-  # The 5432 rule is CIDR-scoped rather than SG-to-SG on purpose. Pointing it
-  # at the app stack's DbSecurityGroup would be a cross-stack cycle: this stack
-  # would import from the app stack, which already imports AppSgId from here.
-  # Adding it from the app stack instead (an AWS::EC2::SecurityGroupEgress
-  # attached to the imported SG) breaks the cycle but leaves THIS stack
-  # permanently DRIFTED - a rule exists on the SG that this template does not
-  # describe, so Task 4's detect-stack-drift would never read IN_SYNC again.
-  # The tight direction is enforced where it can be, on the DB side: the app
+  # THE CYCLE, AND HOW IT IS BROKEN WITHOUT COSTING DRIFT.
+  # The obvious spelling of "egress 5432 to the RDS SG" is
+  # `DestinationSecurityGroupId: !ImportValue taxcalc-app-dev-DbSgId`. That is
+  # a cross-stack CYCLE - the app stack already imports AppSgId from here, so
+  # each stack would wait on the other and neither would ever deploy.
+  #
+  # The usual escape is to declare a standalone AWS::EC2::SecurityGroupEgress
+  # in the app stack, attached to the imported SG. It breaks the cycle and it
+  # is wrong here: the rule would exist on a security group whose owning
+  # template does not describe it, so THIS stack reads DRIFTED forever and
+  # Task 4's detect-stack-drift could never return IN_SYNC. Worse, AWS
+  # documents that mixing inline SecurityGroupEgress with standalone egress
+  # resources on one group produces conflicting rule sets.
+  #
+  # So the id arrives as a PARAMETER instead of an import, and the rule stays
+  # declared in this template either way. Deploy is two passes:
+  #
+  #   pass 1  DbSecurityGroupId=""            -> 5432 egress to the VPC CIDR
+  #   (deploy the app stack, which exports taxcalc-app-dev-DbSgId)
+  #   pass 2  DbSecurityGroupId=sg-0abc...    -> 5432 egress to that SG only
+  #
+  # Both branches are in the template, so live state and declared state agree
+  # at every point and drift stays clean. A Parameter is weaker than an import
+  # in one specific way - it does not earn the "Export ... is in use by"
+  # deletion refusal on the DB SG - which is why the app stack still imports
+  # AppSgId properly and only this one back-reference is parameterised.
+  #
+  # The tight direction is ALSO enforced on the DB side regardless: the app
   # stack's DbSecurityGroup takes ingress 5432 from this SG by ID, so nothing
   # else in the VPC can actually open a Postgres connection.
   TaxcalcAppSecurityGroup:
@@ -385,11 +425,23 @@ Resources:
           ToPort: 443
           CidrIp: 0.0.0.0/0
           Description: HTTPS egress (ECR, STS, Secrets Manager).
-        - IpProtocol: tcp
-          FromPort: 5432
-          ToPort: 5432
-          CidrIp: !Ref VpcCidr
-          Description: Postgres to the RDS instance in the private subnets.
+        # Postgres egress, in whichever form is currently possible. Pass 2
+        # (DbSecurityGroupId supplied) pins it to the RDS security group by id,
+        # which is the tight form the deliverable asks for. Pass 1 falls back
+        # to the VPC CIDR so the app can reach its database from the moment
+        # both stacks exist, rather than waiting for a third deploy.
+        - !If
+          - HasDbSg
+          - IpProtocol: tcp
+            FromPort: 5432
+            ToPort: 5432
+            DestinationSecurityGroupId: !Ref DbSecurityGroupId
+            Description: Postgres to the RDS security group only.
+          - IpProtocol: tcp
+            FromPort: 5432
+            ToPort: 5432
+            CidrIp: !Ref VpcCidr
+            Description: Postgres, VPC-scoped until the DB SG id is supplied.
       Tags:
         - {Key: Name, Value: !Sub "taxcalc-${EnvName}-app-sg"}
         - {Key: Env, Value: !Ref EnvName}

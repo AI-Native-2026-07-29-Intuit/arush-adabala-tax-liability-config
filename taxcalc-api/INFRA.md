@@ -85,9 +85,18 @@ taxcalc-app-dev          RDS Postgres + DB subnet group + DB SG + the
 1. taxcalc-bootstrap-dev    creates role/taxcalc-api-cfn-deploy, which every
                             later CI-driven deploy assumes
 2. taxcalc-artifacts-dev    independent; before the app stack writes to it
-3. taxcalc-network-dev      exports the ids stack 4 imports
-4. taxcalc-app-dev          fails at CREATE if 3 has not exported yet
+3. taxcalc-network-dev      pass 1, DbSecurityGroupId="" - exports the ids
+                            stack 4 imports
+4. taxcalc-app-dev          fails at CREATE if 3 has not exported yet;
+                            exports taxcalc-app-dev-DbSgId
+5. taxcalc-network-dev      pass 2, UPDATE with DbSecurityGroupId=<that id> -
+                            tightens the app SG's 5432 egress from the VPC
+                            CIDR to the RDS security group. See decision 4.
 ```
+
+Step 5 is an UPDATE of step 3's stack, not a fifth stack. It exists because
+the network→app dependency is a cycle in one direction only, and the cycle is
+broken with a Parameter rather than by giving up the SG-to-SG rule.
 
 Only one edge is enforced by CloudFormation itself: step 4's `!ImportValue`
 calls fail outright if step 3's exports do not exist, with
@@ -343,6 +352,28 @@ the app stack was verified with a local-only probe that substitutes a literal
 list for that one property; it is not committed and exists only in the
 scratchpad.
 
+**2b. `Fn::If` is not resolved inside security-group rules either.** The same
+class as the `Fn::Split` gap, found when the pass-2 egress rule landed. floci
+passes the raw `Fn::If` structure through to the EC2 API, which rejects it:
+
+```
+A security group rule must specify exactly one of CidrIp, CidrIpv6,
+a prefix list, or a security group.
+```
+
+Isolated with a two-resource probe — one SG with a literal rule, one with the
+identical rule wrapped in `!If` on a **false** condition. The literal one
+created; the `!If` one failed. Retried with the `!If` hoisted to the property
+level (returning the whole list rather than one element): same failure. Both
+spellings are `cfn-lint`-clean, and `Fn::If` in a resource property is
+ordinary CloudFormation, so **the committed template is unchanged** — the
+network stack is executed on floci through a probe that inlines the false
+branch, which is byte-identical to what pass 1 produces anyway.
+
+Note that `create-change-set` succeeds on the real template in both cases; it
+is only `execute-change-set` that fails. So the ChangeSet diffs in the PR come
+from the committed templates, not from the probes.
+
 **3. `detect-stack-drift` is not implemented at all.**
 
 ```
@@ -536,25 +567,72 @@ given a public address to anything a later stack launched there. **Removed,
 not suppressed**: a suppression would have kept the exposure and hidden the
 warning.
 
-### 4. Egress 5432 is CIDR-scoped, not SG-to-SG — a cycle that has no clean fix
+### 4. Egress 5432 reaches the RDS SG through a two-pass deploy, not an import
 
-The task text asks the app SG for "egress 5432 to the RDS SG". Taken
-literally that is a **cross-stack cycle**: the network stack would import from
-the app stack, which already imports `AppSgId` from the network stack.
+The task text asks the app SG for "egress 5432 to the RDS SG". The obvious
+spelling — `DestinationSecurityGroupId: !ImportValue taxcalc-app-dev-DbSgId` —
+is a **cross-stack cycle**: the app stack already imports `AppSgId` from the
+network stack, so each would wait on the other and neither would deploy.
 
-The usual escape — declare an `AWS::EC2::SecurityGroupEgress` in the app stack
-and attach it to the imported SG — breaks the cycle but has a cost nobody
-mentions: it leaves the *network* stack permanently `DRIFTED`, because a rule
-exists on that SG which the network template does not describe. Task 4's whole
-point is a `detect-stack-drift` that can read `IN_SYNC`, and this would make
-that impossible forever.
+The usual escape is a standalone `AWS::EC2::SecurityGroupEgress` in the app
+stack, attached to the imported SG. It breaks the cycle and it is wrong here,
+for a reason worth stating: the rule would live on a security group whose
+owning template does not describe it, so the **network** stack reads `DRIFTED`
+forever and Task 4's `detect-stack-drift` could never return `IN_SYNC`. AWS
+also documents that mixing inline `SecurityGroupEgress` with standalone egress
+resources on one group produces conflicting rule sets.
 
-So the app SG egresses to `5432` on the **VPC CIDR**, and the tight direction
-is enforced where it costs nothing: the DB SG's *ingress* is
-`SourceSecurityGroupId: !ImportValue ...-AppSgId`. Membership of the app SG is
-the credential. A box merely sitting in the same subnet range still cannot
-open a Postgres connection — which is the property the SG-to-SG pairing was
-wanted for in the first place.
+**So the id arrives as a Parameter rather than an import**, gated by a
+`HasDbSg` condition, with *both* branches declared in this template:
+
+```yaml
+DbSecurityGroupId: {Type: String, Default: ""}
+HasDbSg: !Not [!Equals [!Ref DbSecurityGroupId, ""]]
+...
+- !If
+  - HasDbSg
+  - {IpProtocol: tcp, FromPort: 5432, ToPort: 5432,
+     DestinationSecurityGroupId: !Ref DbSecurityGroupId}
+  - {IpProtocol: tcp, FromPort: 5432, ToPort: 5432, CidrIp: !Ref VpcCidr}
+```
+
+Deploy is two passes:
+
+```
+pass 1   DbSecurityGroupId=""          -> 5432 egress to the VPC CIDR
+         (deploy the app stack; it exports taxcalc-app-dev-DbSgId)
+pass 2   DbSecurityGroupId=sg-0abc...  -> 5432 egress to that SG alone
+```
+
+```bash
+DBSG=$(aws cloudformation list-exports \
+  --query "Exports[?Name=='taxcalc-app-dev-DbSgId'].Value" --output text)
+aws cloudformation create-change-set --stack-name taxcalc-network-dev \
+  --change-set-name pass2 --change-set-type UPDATE \
+  --template-body file://cfn/taxcalc-network-dev.yaml \
+  --parameters ParameterKey=EnvName,ParameterValue=dev \
+               ParameterKey=DbSecurityGroupId,ParameterValue="$DBSG"
+```
+
+**Why this keeps drift clean:** whichever branch is live is also the branch
+CloudFormation knows about, because both are in the template. Nothing is ever
+added to that security group from outside the stack that owns it. The pass-2
+ChangeSet is a modify in place:
+
+```json
+{"Action": "Modify", "LogicalResourceId": "TaxcalcAppSecurityGroup",
+ "ResourceType": "AWS::EC2::SecurityGroup", "Replacement": "False"}
+```
+
+A Parameter is weaker than an `!ImportValue` in exactly one way — it does not
+earn the "Export ... is in use by" deletion refusal on the DB SG. That is why
+only this one back-reference is parameterised; the app stack still imports
+`AppSgId`, `VpcId` and `PrivateSubnets` properly.
+
+And the tight direction holds in **both** passes regardless, on the DB side:
+the app stack's `DbSecurityGroup` takes ingress `SourceSecurityGroupId:
+!ImportValue ...-AppSgId`. Verified live — `UserIdGroupPairs GroupId` matching
+the network's exported `AppSgId`, with `IpRanges: []` and no CIDR fallback.
 
 ### 5. `EngineVersion` is a Parameter, not a literal
 
