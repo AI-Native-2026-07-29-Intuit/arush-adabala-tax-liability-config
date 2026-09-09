@@ -106,15 +106,41 @@ Resources:
   # stack. !Split + !ImportValue is the cross-stack pattern for a set: CFN
   # exports cannot hold a List, so the network stack joins the three ids and
   # this stack splits them back apart.
+  #
+  # Each element is !Select over that !Split rather than handing the bare
+  # !Split to SubnetIds. Both spellings are valid CloudFormation and both
+  # resolve to the same three ids; this one is written as a real YAML list of
+  # three scalars, which is the form floci's engine can actually resolve into
+  # a list-typed property (it drops a whole-list function used as the property
+  # value - see INFRA.md). Nothing is hardcoded either way: the ids still come
+  # only from the network stack's PrivateSubnets export.
+  #
+  # The cost is that the count is pinned at three. That matches the network
+  # stack, which builds exactly one private subnet per AZ across three AZs;
+  # if that ever becomes variable, this is the line that has to change.
   DbSubnetGroup:
     Type: AWS::RDS::DBSubnetGroup
     Properties:
       DBSubnetGroupDescription: !Sub "taxcalc ${EnvName} private subnets"
       SubnetIds:
-        !Split
-          - ","
-          - !ImportValue
-              "Fn::Sub": "${NetworkStackName}-PrivateSubnets"
+        - !Select
+            - 0
+            - !Split
+                - ","
+                - !ImportValue
+                    "Fn::Sub": "${NetworkStackName}-PrivateSubnets"
+        - !Select
+            - 1
+            - !Split
+                - ","
+                - !ImportValue
+                    "Fn::Sub": "${NetworkStackName}-PrivateSubnets"
+        - !Select
+            - 2
+            - !Split
+                - ","
+                - !ImportValue
+                    "Fn::Sub": "${NetworkStackName}-PrivateSubnets"
       Tags:
         - {Key: Env, Value: !Ref EnvName}
         - {Key: Project, Value: taxcalc}

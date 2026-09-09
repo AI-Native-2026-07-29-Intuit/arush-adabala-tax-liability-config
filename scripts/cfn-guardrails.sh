@@ -239,6 +239,105 @@ if [ "${1:-}" = "reap-orphans" ]; then
   reap_orphans "${2:-}"; exit 0
 fi
 
+# ---------------------------------------------------------------------------
+# reconcile-s3 - apply the S3 hardening that this endpoint's CloudFormation
+# accepted and then dropped.
+#
+# floci's CFN provider for AWS::S3::Bucket and AWS::S3::BucketPolicy is a
+# no-op for three properties: PublicAccessBlockConfiguration, BucketEncryption
+# and the bucket policy. All three report CREATE_COMPLETE - the policy even
+# gets a fabricated physical id like bucket-policy-80a48155 - and none of them
+# reaches S3. That is the worst failure mode in this whole exercise: the stack
+# is green, describe-stacks agrees, and the deny-non-TLS rule S3 is supposed to
+# be enforcing does not exist.
+#
+# floci's S3 accepts all three over the S3 API (measured), so this reads them
+# out of the template and PUTs them, then reads them back to prove it.
+#
+# It REFUSES to run against real AWS. There, CloudFormation applies these
+# itself, and reaching around it with put-bucket-policy would create exactly
+# the drift that Task 4's detect-stack-drift is meant to catch. This is an
+# emulator-parity shim, and it is scoped to emulators on purpose.
+reconcile_s3() {
+  if ! is_emulator; then
+    printf 'refusing: reconcile-s3 is an emulator-parity shim.\n' >&2
+    printf 'Against real AWS, CloudFormation applies these properties itself;\n' >&2
+    printf 'applying them out of band here would register as stack drift.\n' >&2
+    return 2
+  fi
+  command -v ruby >/dev/null 2>&1 || { printf 'refusing: ruby not found.\n' >&2; return 2; }
+
+  local here stacks stack tpl bucket extracted rc=0
+  here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  stacks="${1:-taxcalc-artifacts-dev taxcalc-bootstrap-dev}"
+
+  for stack in $stacks; do
+    head_ "reconcile-s3: $stack"
+    tpl="$here/../cfn/$stack.yaml"
+    if [ ! -f "$tpl" ]; then note "no template at cfn/$stack.yaml; skipped"; continue; fi
+
+    bucket=$(aws_ cloudformation describe-stack-resources --stack-name "$stack" \
+      --query "StackResources[?ResourceType=='AWS::S3::Bucket'].PhysicalResourceId" \
+      --output text 2>/dev/null)
+    if [ -z "$bucket" ] || [ "$bucket" = "None" ]; then
+      note "$stack is not deployed, or declares no bucket; skipped"; continue
+    fi
+    note "bucket: $bucket"
+
+    extracted=$(ruby "$here/cfn-extract-s3.rb" "$tpl" "$bucket" 2>/dev/null) || {
+      bad "could not read S3 settings out of $(basename "$tpl")"; rc=1; continue; }
+
+    # --- public access block
+    if echo "$extracted" | jq -e '.pab != null' >/dev/null; then
+      aws_ s3api put-public-access-block --bucket "$bucket" \
+        --public-access-block-configuration "$(echo "$extracted" | jq -c .pab)" >/dev/null 2>&1
+      if [ "$(aws_ s3api get-public-access-block --bucket "$bucket" \
+              --query "PublicAccessBlockConfiguration.[BlockPublicAcls,BlockPublicPolicy,IgnorePublicAcls,RestrictPublicBuckets]" \
+              --output text 2>/dev/null)" = "True	True	True	True" ]; then
+        ok "public access block - all four toggles true"
+      else
+        bad "public access block did not stick"; rc=1
+      fi
+    fi
+
+    # --- default encryption
+    if echo "$extracted" | jq -e '.sse != null' >/dev/null; then
+      aws_ s3api put-bucket-encryption --bucket "$bucket" \
+        --server-side-encryption-configuration "$(echo "$extracted" | jq -c .sse)" >/dev/null 2>&1
+      local alg
+      alg=$(aws_ s3api get-bucket-encryption --bucket "$bucket" \
+        --query "ServerSideEncryptionConfiguration.Rules[0].ApplyServerSideEncryptionByDefault.SSEAlgorithm" \
+        --output text 2>/dev/null)
+      if [ "$alg" = "aws:kms" ]; then ok "default encryption - aws:kms"
+      else bad "default encryption is ${alg:-unset}, expected aws:kms"; rc=1; fi
+    fi
+
+    # --- bucket policy
+    if echo "$extracted" | jq -e '.policy != null' >/dev/null; then
+      aws_ s3api put-bucket-policy --bucket "$bucket" \
+        --policy "$(echo "$extracted" | jq -c .policy)" >/dev/null 2>&1
+      if aws_ s3api get-bucket-policy --bucket "$bucket" --query Policy --output text 2>/dev/null |
+           jq -e '[.Statement[] | select(.Effect=="Deny" and .Condition.Bool."aws:SecureTransport"=="false")] | length > 0' >/dev/null 2>&1; then
+        ok "bucket policy - aws:SecureTransport false => Deny"
+      else
+        bad "deny-non-TLS statement is not present after put"; rc=1
+      fi
+    fi
+  done
+
+  echo
+  if [ "$rc" -eq 0 ]; then
+    printf 'Reconciled. These settings now live in S3, applied from the template\n'
+    printf 'by this script - NOT by CloudFormation, which dropped them. Any\n'
+    printf 'evidence taken from them must say so.\n'
+  fi
+  return $rc
+}
+
+if [ "${1:-}" = "reconcile-s3" ]; then
+  reconcile_s3 "${2:-}"; exit $?
+fi
+
 # --static runs only the checks derived from the templates themselves - no AWS
 # call, no endpoint, no credentials. That is checks 1-3 and the 0.0.0.0/0
 # assertion, which between them catch the mistake most likely to be made in
@@ -454,7 +553,7 @@ head_ '7. Phantom resources - CREATE_COMPLETE in CFN, absent from the data plane
 #
 # Generalised: for every AWS::S3::BucketPolicy the stacks claim to have
 # created, go and ask S3 whether it is actually there.
-PHANTOM=0; CHECKED=0
+PHANTOM=0; CHECKED=0; RECONCILED=0
 for stk in taxcalc-bootstrap-dev taxcalc-artifacts-dev; do
   aws_ cloudformation describe-stack-resources --stack-name "$stk" \
     --query "StackResources[?ResourceType=='AWS::S3::BucketPolicy'].LogicalResourceId" \
@@ -474,6 +573,7 @@ for pair in "taxcalc-bootstrap-dev:$BKT_BOOT" "taxcalc-artifacts-dev:$BUCKET"; d
   if aws_ s3api get-bucket-policy --bucket "$bkt" --query Policy --output text >/tmp/cfn-guard-pol 2>/dev/null; then
     if grep -q 'SecureTransport' /tmp/cfn-guard-pol; then
       ok "$stk bucket policy is live and denies non-TLS"
+      RECONCILED=$((RECONCILED+1))
     else
       bad "$stk bucket policy exists but has no aws:SecureTransport condition"
     fi
@@ -492,6 +592,15 @@ if [ "$PHANTOM" -gt 0 ]; then
   note "$PHANTOM phantom resource(s). On this endpoint a green stack does NOT"
   note "mean the hardening is applied - re-assert bucket policies out of band,"
   note "or verify them on real AWS before believing them."
+fi
+# A PASS here says the policy is in S3. It does NOT say CloudFormation put it
+# there. On an emulator whose CFN provider is a known no-op for this resource,
+# the likeliest reason the policy is live is that `reconcile-s3` applied it -
+# so this check cannot be cited as evidence that the CFN path works.
+if [ "$RECONCILED" -gt 0 ] && is_emulator; then
+  note "NOTE: on this endpoint a live policy is most likely the work of"
+  note "'cfn-guardrails.sh reconcile-s3', not of CloudFormation. This check"
+  note "proves the data plane holds the rule, not that CFN applied it."
 fi
 
 head_ '8. Does this endpoint HONOUR Replacement: False?'

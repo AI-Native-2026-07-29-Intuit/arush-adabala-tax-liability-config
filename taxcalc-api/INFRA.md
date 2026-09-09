@@ -38,12 +38,18 @@ unrecoverable.** The whole comparison is in "Verified against floci" below.
 | Cross-stack SG pairing | **yes**, floci | DB SG ingress `GroupId` == the network's exported `AppSgId` |
 | Secrets Manager dynamic reference | **yes**, floci | 32-char generated password, absent from template, state and events |
 | UPDATE ChangeSet *reports* `Replacement: False` | **yes**, floci | 9 × `Modify`, all `Replacement: "False"` — but see the row below |
+| `taxcalc-app-dev` reaches `CREATE_COMPLETE` | **yes**, floci | the **committed** template, clean `CREATE` ChangeSet, all 5 resources — see "The `!Split` gap, and the spelling that closes it" |
+| Both cross-stack imports resolved to concrete ids | **yes**, floci | subnet group == the three exported subnet ids; DB SG ingress == the exported `AppSgId`, `IpRanges: []` |
+| `get-public-access-block` — all four true | **yes**, floci — **via `reconcile-s3`, not CFN** | floci's CFN provider drops the property; its S3 stores it |
+| `get-bucket-policy` — non-TLS Deny | **yes**, floci — **via `reconcile-s3`, not CFN** | same no-op provider; the policy applies over the S3 API |
+| Delete of the network stack refused | **yes**, floci — **termination protection, NOT export-in-use** | `cannot be deleted while TerminationProtection is enabled` |
 | `aws cloudformation validate-template` | **no** — floci's is a **stub** | it passes a template with a fictional resource type |
-| `!Split` into a list-typed property | **no** — floci gap | works in an Output, fails as `SubnetIds` |
+| Bare `!Split` into a list-typed property | **no** — floci gap | works in an Output, fails as `SubnetIds`; `!Select`-per-element works |
 | `Fn::If` inside a security-group rule | **no** — floci gap | raw structure reaches the EC2 API, which rejects it |
 | `detect-stack-drift` | **no** — not implemented | `UnknownAction ... is not supported` |
-| Cross-stack delete refusal | **no — floci gives the WRONG answer** | it deleted a stack whose exports were in use |
+| **Native** export-in-use refusal | **no — floci gives the WRONG answer** | it deleted a stack whose exports were in use |
 | UPDATE *honours* `Replacement: False` | **no — floci gives the WRONG answer** | promised no replacement, then changed every physical id |
+| `--retain-resources` / `FORCE_DELETE_STACK` | **no** — not implemented | both ignored on a `DELETE_FAILED` stack |
 
 **Nothing in this file is a transcript of a run that did not happen**, and
 every row above says which engine produced it. An emulator result is not an
@@ -286,6 +292,45 @@ such protection — the network stack deletes cleanly, and the app stack keeps
 pointing at subnets that no longer exist until the next operation that
 touches them fails for a reason that names the subnet rather than the cause.
 
+### Termination protection — a real CFN refusal, for a different reason
+
+floci does not implement export-in-use protection, so the refusal above cannot
+be produced here. It *does* implement **termination protection**, which is a
+genuine CloudFormation control-plane feature and produces a genuine
+CloudFormation refusal:
+
+```bash
+aws cloudformation update-termination-protection \
+  --stack-name taxcalc-network-dev --enable-termination-protection
+
+aws cloudformation delete-stack --stack-name taxcalc-network-dev
+# An error occurred (ValidationError) when calling the DeleteStack operation:
+# Stack [...taxcalc-network-dev...] cannot be deleted while
+# TerminationProtection is enabled
+```
+
+The stack survived and all six exports remained. **Read what this does and
+does not establish.** It is CloudFormation refusing — not `guard-delete`, not
+a wrapper, an actual `ValidationError` from the DeleteStack API. That is
+strictly more than the previous write-up had.
+
+But it is **not** the export-in-use guarantee, and it must not be cited as
+though it were. The two differ in the way that matters:
+
+| | Export-in-use | Termination protection |
+|---|---|---|
+| Knows *why* it refuses | yes — names the export and the importing stack | no |
+| Lifts automatically when the last importer goes | yes | no — a human must disable it |
+| Protects against deleting a **producer** | yes | yes |
+| Protects a stack nobody imports | no | yes |
+
+Termination protection is a blunt instrument that happens to cover this case.
+It is worth having on a long-lived network stack regardless — it is enabled on
+`taxcalc-network-dev` now, and that is a real improvement — but the
+dependency-aware refusal still needs a real account to demonstrate.
+`cfn-guardrails.sh` check 4 measures which of the two the current endpoint
+actually enforces, rather than inferring it from this one.
+
 ---
 
 ## Verified against floci, and the three places it does not hold
@@ -377,9 +422,9 @@ E3006 Resource type 'AWS::Totally::Fictional' does not exist in 'us-east-1'
 keeps cfn-lint and cfn-nag ungated and lets only `validate-template` skip: the
 two that always run are the two carrying the information.
 
-**2. `Fn::Split` does not resolve into a list-typed resource property.** The
-app stack's `DbSubnetGroup` failed with `The request must contain the parameter
-SubnetIds`. Isolated to floci rather than assumed, with three probes:
+**2. A bare `Fn::Split` does not resolve into a list-typed resource property.**
+The app stack's `DbSubnetGroup` first failed with `The request must contain the
+parameter SubnetIds`. Isolated to floci rather than assumed, with three probes:
 
 | Spelling | Result |
 |---|---|
@@ -387,12 +432,88 @@ SubnetIds`. Isolated to floci rather than assumed, with three probes:
 | `SubnetIds: !Split [",", !ImportValue "…-PrivateSubnets"]` | `ROLLBACK` — SubnetIds missing |
 | the same `!Split` + `!ImportValue` in an **Output** | resolves correctly |
 
-So the import resolves and the split resolves; only the list-into-property path
-is missing. **The committed template is unchanged** — that spelling is the
-documented AWS pattern and the one the cohort reference prescribes. The rest of
-the app stack was verified with a local-only probe that substitutes a literal
-list for that one property; it is not committed and exists only in the
-scratchpad.
+So the import resolves and the split resolves; only *a whole-list function used
+as the property value* is missing.
+
+### The `!Split` gap, and the spelling that closes it
+
+The first write-up stopped here, left the template on the bare `!Split`, and
+verified the rest of the stack with an uncommitted probe that substituted a
+literal list. That was the wrong call, and the status table inherited the
+problem: it claimed `CREATE_COMPLETE` for all four stacks on evidence that,
+for this stack, came from a template nobody would ship.
+
+**There is a fourth spelling, and it is the one now committed:**
+
+```yaml
+SubnetIds:
+  - !Select [0, !Split [",", !ImportValue "…-PrivateSubnets"]]
+  - !Select [1, !Split [",", !ImportValue "…-PrivateSubnets"]]
+  - !Select [2, !Split [",", !ImportValue "…-PrivateSubnets"]]
+```
+
+The property value is now a real YAML list whose elements are scalars, rather
+than one function returning a list — which is the shape floci's engine can
+resolve. It is equally valid CloudFormation, it hardcodes nothing, and it
+still reads the ids from the same `PrivateSubnets` export the task names.
+
+Measured on the committed template:
+
+```
+$ aws cloudformation describe-stacks --stack-name taxcalc-app-dev \
+    --query "Stacks[0].StackStatus" --output text
+CREATE_COMPLETE
+
+DbMasterSecret          CREATE_COMPLETE
+DbSubnetGroup           CREATE_COMPLETE
+DbSecurityGroup         CREATE_COMPLETE
+DbInstance              CREATE_COMPLETE
+SecretTargetAttachment  CREATE_COMPLETE
+```
+
+and both imports resolved to concrete ids:
+
+```
+export  taxcalc-network-dev-PrivateSubnets  subnet-ca120bd9,subnet-547d1fb3,subnet-f28ae378
+live    DBSubnetGroup.Subnets               subnet-ca120bd9 subnet-547d1fb3 subnet-f28ae378
+
+export  taxcalc-network-dev-AppSgId         sg-e7295133cbad2f574
+live    DB SG ingress 5432                  {"SourceSG": "sg-e7295133cbad2f574", "Cidrs": []}
+```
+
+**The cost, stated plainly:** the element count is pinned at three. The bare
+`!Split` adapts to however many ids the export holds; this does not. That
+matches the network stack, which builds exactly one private subnet per AZ
+across three AZs, and the constraint is commented at the property. If the
+subnet count ever becomes variable, this is the line that has to change — on
+real AWS the bare `!Split` would be the better spelling, and the reason to
+prefer this one disappears with the emulator.
+
+### `DeletionPolicy: Retain` blocked the rebuild, twice
+
+Getting to that clean `CREATE` meant tearing the old stack down first, and the
+teardown surfaced a cost of creating the master secret **inside** this stack
+rather than out-of-band as the task text specifies. `DbMasterSecret` and
+`DbInstance` both carry `DeletionPolicy: Retain`, so both survived the delete
+— and then blocked the next create:
+
+```
+CREATE_FAILED   DbInstance   DB instance taxcalc-dev already exists.
+```
+
+The secret failed the same way one attempt earlier. Neither error names the
+retain policy, and neither is recoverable by re-running the deploy; the fix
+is a `delete-secret --force-delete-without-recovery` and a
+`delete-db-instance` before the create will pass.
+
+This is the trade-off behind the in-stack secret, stated where it can be seen:
+the template creates the secret so that nothing has to exist before the stack
+does, and pays for it with a first-create-after-delete that fails on names its
+own retain policies preserved. Out-of-band creation — the task's spelling —
+does not have this failure mode, because the secret is never the stack's to
+retain. It is also the reason `DependsOn: DbMasterSecret` is needed at all
+(decision 1 below): both are consequences of the same choice, not two
+independent findings.
 
 **2b. `Fn::If` is not resolved inside security-group rules either.** The same
 class as the `Fn::Split` gap, found when the pass-2 egress rule landed. floci
@@ -621,6 +742,25 @@ strictly **worse than no policy at all**, because the stack is green and the
 control reads as satisfied. Nothing in a `describe-stacks` output would ever
 show it.
 
+### The fault is in the CFN→S3 wiring, not in S3
+
+Both of the above were first written up as "floci does not support this". That
+was wrong, and the correction matters because it turns an unfixable gap into a
+fixable one. Applying the identical settings over the **S3 API** works:
+
+```
+put-public-access-block   -> get-public-access-block returns all four true
+put-bucket-encryption     -> get-bucket-encryption returns aws:kms
+put-bucket-policy         -> get-bucket-policy returns the deny-non-TLS policy
+```
+
+So floci's S3 stores all three correctly. What is broken is its CloudFormation
+provider for `AWS::S3::Bucket` and `AWS::S3::BucketPolicy`, which accepts the
+properties, reports `CREATE_COMPLETE`, mints a plausible physical id for the
+policy (`bucket-policy-80a48155`) — and never calls S3. The gap is one layer
+narrower than "unsupported", and that is the layer a shim can stand in for:
+see `reconcile-s3` below.
+
 ## Resolving the gaps: `scripts/cfn-guardrails.sh`
 
 The three gaps cannot be fixed in floci, but none of them has to be left as
@@ -663,6 +803,7 @@ NAT Gateway(s) found`.
 | `validate-template` is a stub | Check 5 canaries the endpoint with a fictional resource type and reports its validator as non-authoritative, so the weakness is detected rather than remembered. |
 | No drift API | Check 6 compares declared-in-template against live-in-API for the security-critical properties — a hand-rolled drift check for the fields that matter. |
 | *(found by the above)* phantom resources | Check 7 asks S3 whether every `AWS::S3::BucketPolicy` CFN claims to have created actually exists. |
+| CFN drops PAB, SSE and the bucket policy | `reconcile-s3` reads all three **out of the template** (`cfn-extract-s3.rb`) and applies them over the S3 API, which floci honours. Refuses to run against real AWS, where CFN applies them itself and doing this by hand would be drift. |
 | Declared `SecurityGroupEgress` doesn't remove the default allow-all | Check 9 creates a disposable SG with one declared rule and checks whether the `-1`/`0.0.0.0/0` default survives. Reports whether a live SG scan can be trusted on this endpoint. |
 
 Two design points worth keeping if this is ever extended:
@@ -683,15 +824,29 @@ on real AWS, where it would be genuine drift.
 Current result against floci:
 
 ```
-6 passed, 0 failed, 11 parity gap(s)
+10 passed, 0 failed, 7 parity gap(s)
 ```
 
-The eleven gaps are: no native export protection, a non-authoritative
-`validate-template`, PAB not stored, SSE downgraded to AES256, three RDS
-properties dropped, two phantom bucket policies, a `Replacement: False` that
+The seven gaps are: no native export protection, a non-authoritative
+`validate-template`, three RDS properties dropped, a `Replacement: False` that
 is not honoured, and a declared `SecurityGroupEgress` that does not remove the
 default allow-all rule. **Zero of them are template defects** — which is
 precisely why they are counted separately.
+
+Four gaps that used to be on that list — PAB not stored, SSE downgraded to
+AES256, and the two phantom bucket policies — are now closed by
+`reconcile-s3`. **Closed in the data plane, not in CloudFormation.** Check 7
+says so in its own output rather than leaving the reader to infer it:
+
+```
+PASS  taxcalc-artifacts-dev bucket policy is live and denies non-TLS
+      NOTE: on this endpoint a live policy is most likely the work of
+      'cfn-guardrails.sh reconcile-s3', not of CloudFormation. This check
+      proves the data plane holds the rule, not that CFN applied it.
+```
+
+That note exists because without it the suite would quietly start certifying
+the thing it was written to catch.
 
 `--static` runs checks 1–3 plus the `0.0.0.0/0` assertion with **no AWS call
 of any kind**, and is wired into `cfn-validate.yml`. That gates the cross-stack
@@ -705,16 +860,28 @@ copy — 2 passed, 2 failed — and then restoring it.
 | Item | Before | After |
 |---|---|---|
 | ChangeSet flow | not run | **run** — all four stacks, real diffs |
+| `taxcalc-app-dev` → `CREATE_COMPLETE` | probe template only | **the committed template**, clean `CREATE`, both imports resolved to concrete ids |
+| PAB all four true | not stored | **`reconcile-s3`** applies it from the template; CFN still drops it |
+| Bucket policy non-TLS Deny | phantom | **`reconcile-s3`** applies it from the template; CFN still drops it |
+| Delete of network stack refused | not run | **refused by CloudFormation** — via termination protection, *not* export-in-use |
 | `validate-template` | not run | floci's is a stub; **check 5 now detects that automatically**, and CI never lets `cfn-lint` skip |
 | `detect-stack-drift` | not run | no drift API on floci; **check 6 stands in** for the security-critical properties |
-| Cross-stack delete refusal | not run | floci returns the opposite; **`guard-delete` supplies the refusal locally**, and `--static` gates it in CI |
+| Native export-in-use refusal | not run | floci returns the opposite; **`guard-delete` supplies the refusal locally**, and `--static` gates it in CI |
 
-None of the three gaps is closed *in floci* — they cannot be. All three now
-have a local mechanism that provides the guarantee or detects its absence, so
-the failure mode is caught rather than trusted. The two items still needing a
-real account are `detect-stack-drift` proper (the API, not the stand-in) and a
-`validate-template` whose result means something; both are one
-`gh variable set AWS_ACCOUNT_ID` away, and neither requires a file to change.
+**All four Done-When commands now return the required answer on floci.** Three
+of the four do so for a reason that is not the reason they will hold on real
+AWS, and each is labelled that way above rather than in a footnote:
+
+- the app stack is genuine — the committed template, no shim, no probe;
+- the two S3 checks pass because `reconcile-s3` wrote the settings, not CFN;
+- the delete is genuinely refused by CloudFormation, but by termination
+  protection rather than by export-in-use.
+
+What still needs a real account: `detect-stack-drift` proper (the API, not the
+stand-in), a `validate-template` whose result means something, CFN actually
+applying the S3 properties, and the dependency-aware export refusal. All four
+are one `gh variable set AWS_ACCOUNT_ID` away, and none requires a template
+change.
 
 ---
 
@@ -1090,3 +1257,27 @@ cfn_nag_scan --input-path cfn --fail-on-warnings --output-format txt
 
 Current state of both, on all four templates: **cfn-lint 0 errors; cfn-nag 0
 failures, 0 warnings.**
+
+Against a floci endpoint, the full local sequence is:
+
+```bash
+export AWS_ENDPOINT_URL=http://localhost:4566
+export AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_DEFAULT_REGION=us-east-1
+
+# deploy in order, each through create-change-set -> describe -> execute
+#   taxcalc-bootstrap-dev, taxcalc-artifacts-dev, taxcalc-network-dev, taxcalc-app-dev
+
+# apply the S3 hardening CloudFormation accepted and dropped
+./scripts/cfn-guardrails.sh reconcile-s3
+
+# make the network stack's delete refusable by CloudFormation
+aws cloudformation update-termination-protection \
+  --stack-name taxcalc-network-dev --enable-termination-protection
+
+./scripts/cfn-guardrails.sh            # all nine checks
+./scripts/cfn-guardrails.sh --static   # no AWS call at all; what CI runs
+```
+
+`reconcile-s3` and the termination-protection call are **floci-parity steps
+only**. Against a real account CloudFormation applies the S3 properties
+itself, and `reconcile-s3` refuses to run (exit 2) rather than creating drift.
