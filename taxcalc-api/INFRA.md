@@ -23,8 +23,8 @@ All four stacks **were** deployed against **[floci](https://github.com/floci-io/
 the local AWS emulator this repo already uses for exactly this gap (W5 D4, W6
 D1 — see the application repo's README). `AWS_ENDPOINT_URL=http://localhost:4566`
 plus dummy credentials, no template or command changes. That closes more than
-expected and — more usefully — **fails in three specific places, one of which
-returns the opposite of the right answer.** The whole comparison is in
+expected and — more usefully — **fails in five specific places, two of which
+return the opposite of the right answer.** The whole comparison is in
 "Verified against floci" below.
 
 | | Ran | Evidence |
@@ -37,16 +37,24 @@ returns the opposite of the right answer.** The whole comparison is in
 | `!Cidr` + `!GetAZs` subnet maths | **yes**, floci | six /24s, `10.41.0.0/24` … `10.41.5.0/24` |
 | Cross-stack SG pairing | **yes**, floci | DB SG ingress `GroupId` == the network's exported `AppSgId` |
 | Secrets Manager dynamic reference | **yes**, floci | 32-char generated password, absent from template, state and events |
-| UPDATE ChangeSet `Replacement: False` | **yes**, floci | `Modify` on the artefact bucket, no replacement |
+| UPDATE ChangeSet *reports* `Replacement: False` | **yes**, floci | 9 × `Modify`, all `Replacement: "False"` — but see the row below |
 | `aws cloudformation validate-template` | **no** — floci's is a **stub** | it passes a template with a fictional resource type |
 | `!Split` into a list-typed property | **no** — floci gap | works in an Output, fails as `SubnetIds` |
+| `Fn::If` inside a security-group rule | **no** — floci gap | raw structure reaches the EC2 API, which rejects it |
 | `detect-stack-drift` | **no** — not implemented | `UnknownAction ... is not supported` |
 | Cross-stack delete refusal | **no — floci gives the WRONG answer** | it deleted a stack whose exports were in use |
+| UPDATE *honours* `Replacement: False` | **no — floci gives the WRONG answer** | promised no replacement, then changed every physical id |
 
 **Nothing in this file is a transcript of a run that did not happen**, and
 every row above says which engine produced it. An emulator result is not an
-AWS result; the three failures below are the reason that distinction is kept
-in the table rather than mentioned once and forgotten.
+AWS result; the failures below are the reason that distinction is kept in the
+table rather than mentioned once and forgotten.
+
+Note the two rows about `Replacement` are not a contradiction: floci *reports*
+the field correctly and then *ignores it on execute*. Reading the ChangeSet
+here tells you nothing about what execution will do — which is precisely the
+inversion worth knowing about, since reading the ChangeSet is the discipline
+this whole deliverable is built around.
 
 ---
 
