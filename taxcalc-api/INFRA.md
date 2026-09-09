@@ -384,9 +384,44 @@ Action DetectStackDrift is not supported.
 Same for `DescribeStackDriftDetectionStatus` and `DescribeStackResourceDrifts`.
 There is no local path to the drift Done-When; it needs an account.
 
-**4. The one that matters most: floci deleted a stack whose exports were in
-use.** With `taxcalc-app-dev` importing `VpcId`, `PrivateSubnets` and
-`AppSgId`:
+**3b. `Replacement: False` is not honoured — the ChangeSet lies.** This is the
+one that undermines the deliverable's central discipline, because
+`Replacement` is the single field a reviewer is told to read before approving.
+
+The Task 4 UPDATE (rename the `Project` tag on the network stack) produced
+nine `Modify` entries, **every one `Replacement: "False"`**. After
+`execute-change-set`, every physical id had changed:
+
+```
+                          before                 after
+Vpc                       vpc-ea579a03           vpc-dd646d09
+TaxcalcAppSecurityGroup   sg-624e656c612250d41   sg-6548a5703671159a2
+PrivateSubnetA            subnet-c5189fab        subnet-0d313d24
+```
+
+The tag was not applied either (`Tags[?Key=='Project']` → `[]`). Isolated to a
+two-line template — one SNS topic, one tag changed — with the same outcome:
+`Modify` / `Replacement: False`, then a new physical id.
+
+The consequence is the good demonstration. The network stack's exports now
+carry the *new* security-group id, while the app stack's `DbSecurityGroup`
+still holds ingress from the **old, deleted** one:
+
+```
+export taxcalc-network-dev-AppSgId  ->  sg-6548a5703671159a2   (new)
+DB SG ingress UserIdGroupPairs      ->  sg-624e656c612250d41   (gone)
+both stacks                         ->  CREATE_COMPLETE / UPDATE_COMPLETE
+```
+
+The application cannot reach its database, nothing is red, and the ChangeSet
+that caused it said no resource would be replaced. On real CloudFormation a
+tag change on a VPC is a metadata update and replaces nothing. **Never accept
+a no-replacement claim from this endpoint** — `scripts/cfn-guardrails.sh`
+check 8 now measures it on every run, and the only trustworthy verification is
+comparing physical resource ids before and after.
+
+**4. floci deleted a stack whose exports were in use.** With
+`taxcalc-app-dev` importing `VpcId`, `PrivateSubnets` and `AppSgId`:
 
 ```
 $ aws cloudformation delete-stack --stack-name taxcalc-network-dev
@@ -464,6 +499,7 @@ refuse anything is decoration.
 | Gap | Resolution |
 |---|---|
 | No export-in-use refusal | `guard-delete` refuses a producer whose exports are imported, from an import graph derived from `cfn/*.yaml`. Use it instead of raw `delete-stack` on any endpoint check 4 reports as unenforced. |
+| `Replacement: False` not honoured | Check 8 creates a disposable stack, changes one tag, confirms the ChangeSet promises no replacement, executes, and compares physical ids. Reports whether the promise held. |
 | `validate-template` is a stub | Check 5 canaries the endpoint with a fictional resource type and reports its validator as non-authoritative, so the weakness is detected rather than remembered. |
 | No drift API | Check 6 compares declared-in-template against live-in-API for the security-critical properties — a hand-rolled drift check for the fields that matter. |
 | *(found by the above)* phantom resources | Check 7 asks S3 whether every `AWS::S3::BucketPolicy` CFN claims to have created actually exists. |
@@ -486,12 +522,13 @@ on real AWS, where it would be genuine drift.
 Current result against floci:
 
 ```
-6 passed, 0 failed, 9 parity gap(s)
+6 passed, 0 failed, 10 parity gap(s)
 ```
 
-The nine gaps are: no native export protection, a non-authoritative
+The ten gaps are: no native export protection, a non-authoritative
 `validate-template`, PAB not stored, SSE downgraded to AES256, three RDS
-properties dropped, and two phantom bucket policies. **Zero of them are
+properties dropped, two phantom bucket policies, and a `Replacement: False`
+that is not honoured. **Zero of them are
 template defects** — which is precisely why they are counted separately.
 
 `--static` runs checks 1–3 plus the `0.0.0.0/0` assertion with **no AWS call

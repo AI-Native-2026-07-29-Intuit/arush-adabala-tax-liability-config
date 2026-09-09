@@ -394,6 +394,69 @@ if [ "$PHANTOM" -gt 0 ]; then
   note "or verify them on real AWS before believing them."
 fi
 
+head_ '8. Does this endpoint HONOUR Replacement: False?'
+# The most dangerous gap found on floci, because it contradicts the exact
+# field the whole ChangeSet review discipline rests on. describe-change-set
+# reported Action: Modify / Replacement: False on a pure tag change - and
+# execute-change-set then replaced the resource anyway, changing its physical
+# id (and not applying the tag). A reviewer who reads "Replacement: False" on
+# an RDS instance and approves would lose the database.
+#
+# Measured on a disposable stack: create, change one tag, confirm the
+# ChangeSet promises no replacement, execute, compare physical ids.
+UPD=cfn-guard-replace-probe
+TMPU=$(mktemp -d)
+cat > "$TMPU/v1.yaml" <<'YAML'
+AWSTemplateFormatVersion: "2010-09-09"
+Description: disposable probe - Replacement:False honoured?
+Resources:
+  Topic:
+    Type: AWS::SNS::Topic
+    Properties:
+      Tags: [{Key: Probe, Value: before}]
+YAML
+sed 's/Value: before/Value: after/' "$TMPU/v1.yaml" > "$TMPU/v2.yaml"
+upd_cleanup() {
+  aws_ cloudformation delete-stack --stack-name "$UPD" >/dev/null 2>&1
+  aws_ cloudformation wait stack-delete-complete --stack-name "$UPD" >/dev/null 2>&1
+  rm -rf "$TMPU"
+}
+trap upd_cleanup EXIT
+if aws_ cloudformation create-stack --stack-name "$UPD" \
+      --template-body "file://$TMPU/v1.yaml" >/dev/null 2>&1 &&
+   aws_ cloudformation wait stack-create-complete --stack-name "$UPD" >/dev/null 2>&1; then
+  BEFORE=$(aws_ cloudformation describe-stack-resources --stack-name "$UPD" \
+    --query 'StackResources[0].PhysicalResourceId' --output text 2>/dev/null)
+  aws_ cloudformation create-change-set --stack-name "$UPD" --change-set-name t \
+    --change-set-type UPDATE --template-body "file://$TMPU/v2.yaml" >/dev/null 2>&1
+  aws_ cloudformation wait change-set-create-complete --stack-name "$UPD" --change-set-name t >/dev/null 2>&1
+  PROMISE=$(aws_ cloudformation describe-change-set --stack-name "$UPD" --change-set-name t \
+    --query 'Changes[0].ResourceChange.Replacement' --output text 2>/dev/null)
+  aws_ cloudformation execute-change-set --stack-name "$UPD" --change-set-name t >/dev/null 2>&1
+  aws_ cloudformation wait stack-update-complete --stack-name "$UPD" >/dev/null 2>&1
+  AFTER=$(aws_ cloudformation describe-stack-resources --stack-name "$UPD" \
+    --query 'StackResources[0].PhysicalResourceId' --output text 2>/dev/null)
+  if [ "$PROMISE" = "False" ] && [ "$BEFORE" = "$AFTER" ]; then
+    ok "promised Replacement: False and kept it (physical id unchanged)"
+  elif [ "$PROMISE" = "False" ]; then
+    if is_emulator; then
+      gap "promised Replacement: False then REPLACED the resource"
+      note "before: $BEFORE"
+      note "after:  $AFTER"
+      note "Replacement: False cannot be trusted on this endpoint. Any"
+      note "no-replacement claim has to be re-checked by comparing physical"
+      note "ids before and after, not by reading the ChangeSet."
+    else
+      bad "real AWS promised Replacement: False then replaced the resource"
+    fi
+  else
+    note "ChangeSet reported Replacement=$PROMISE; not a no-replacement case."
+  fi
+else
+  gap "replacement probe stack could not be created; not measured"
+fi
+trap - EXIT; upd_cleanup
+
 head_ 'Result'
 printf '%d passed, %d failed, %d parity gap(s)\n' "$PASS" "$FAIL" "$GAP"
 if [ "$GAP" -gt 0 ]; then
