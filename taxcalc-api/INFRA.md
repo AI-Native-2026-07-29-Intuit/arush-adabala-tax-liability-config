@@ -1415,3 +1415,97 @@ aws cloudformation update-termination-protection \
 `reconcile-s3` and the termination-protection call are **floci-parity steps
 only**. Against a real account CloudFormation applies the S3 properties
 itself, and `reconcile-s3` refuses to run (exit 2) rather than creating drift.
+
+---
+
+# W6 D4 — the cost stack
+
+`cfn/taxcalc-cost-dev.yaml` layers cost governance over the D3 substrate: a tag-scoped
+`AWS::Budgets::Budget`, an account-wide CloudWatch billing alarm, and the SNS topic both publish
+to. The full runbook — thresholds, tag taxonomy, LLM-plane accounting, per-alarm runbooks — lives
+in the application repo's [`COST.md`](https://github.com/AI-Native-2026-07-29-Intuit/arush-adabala-tax-liability/blob/main/COST.md).
+This section records only what the infrastructure side verified and what it could not.
+
+## Status table
+
+| Done-When | Engine | Result |
+|---|---|---|
+| `taxcalc-cost-dev` reaches `CREATE_COMPLETE` | floci 2.0.1 | **PASS** — real ChangeSet flow |
+| billing alarm on `AWS/Billing EstimatedCharges` | floci 2.0.1 | **PASS** — `describe-alarms` returns it |
+| Budget with two notifications → SNS | floci 2.0.1 | **NOT VERIFIABLE** — see gap 1 |
+| NAT + RDS carry all four tags | templates + `--static` | **PASS (static)** — see gap 4 |
+| Cost Explorer view grouped by `service` | — | **NO LOCAL PATH** — see gap 4 |
+| `grep -RIn "notBreaching" cfn/` → zero | static | **PASS** — guardrails check 6 |
+
+## Four gaps, measured
+
+**1. `AWS::Budgets::Budget` reports `CREATE_COMPLETE` against a service that is not running.**
+floci exposes no `budgets` service at all — it is absent from the 100 in `/_localstack/health` —
+yet its CloudFormation provider accepts the resource and mints `MonthlyCostBudget-7636191f`, while
+`aws budgets describe-budget` returns `UnknownOperationException:
+AWSBudgetServiceGateway.DescribeBudget`. Identical in shape to D3's phantom `bucket-policy-…`, and
+worse in consequence: it lands on the deliverable's headline resource. `CREATE_COMPLETE` here means
+the template parsed, not that a budget exists.
+
+**2. The SNS `TopicPolicy`, `KmsMasterKeyId` and tags are silently dropped.** All three report
+`CREATE_COMPLETE`; none reaches the SNS API. The live topic still carries `__default_policy_ID`
+with `Principal {"AWS":"*"}` — **wider** than the committed template, not narrower. An engineer
+verifying a least-privilege topic policy on this endpoint would have verified nothing. Note the
+direction: unlike a resource that fails to deploy, this one fails *open*.
+
+**3. `TreatMissingData` is dropped from the alarm.** Namespace, metric, threshold and alarm action
+all survive; `describe-alarms` reports `TreatMissingData: None`. The one property that decides
+whether the alarm behaves correctly on a metric with routine gaps is the one that did not make it.
+
+**4. Cost Explorer is not emulable, as distinct from unimplemented.** floci *does* run `ce`, and
+answers correctly — `get-cost-and-usage` grouped by `SERVICE` returns 36 groups with every amount
+`0.0000000000`, and `get-tags` returns `{"Tags": [], "TotalSize": 0}`. An emulator does not bill
+anybody, so there is no spend to report and no activated cost-allocation tag to group by. Unlike
+gaps 1–3, which are provider bugs a later version could fix, this one is structural. Consequently
+`aws resourcegroupstaggingapi get-resources --tag-filters Key=service,Values=taxcalc` returns an
+empty list here too, and the tag-coverage claim rests on the static check rather than on the API.
+
+## What floci did settle
+
+The stack creates through the real `create-change-set → describe-change-set → execute-change-set`
+flow, the alarm is real and readable, and the `IsUsEast1` condition was verified **from both
+sides**: the same template yields 4 resources in `us-east-1` and 3 in `eu-west-1`, the alarm being
+exactly the difference. That is the class of claim an emulator can settle, because it concerns
+template evaluation rather than a service.
+
+## A pre-existing D3 issue, not a D4 regression
+
+`taxcalc-network-dev` does not currently deploy on this floci: it rolls back with `A security group
+rule must specify exactly one of CidrIp, CidrIpv6, a prefix list, or a security group` on
+`TaxcalcAppSecurityGroup`. **The W6 D4 diff to that template is tag lines only**, and an A/B
+confirms it — the template as it stood before this deliverable fails identically on the same
+endpoint. Recorded here rather than fixed, because chasing a D3 stack regression inside a D4
+deliverable would bury both.
+
+## CI
+
+`cfn-validate.yml` needed **no new validation step**. Every tool in it is already
+directory-scoped (`cfn/*.yaml`, `--input-path cfn`) and `validate-template` already loops the same
+glob, so the new template was linted, scanned and API-validated the moment it was committed;
+adding a cost-specific step would have meant the next template needed a third. What the generic
+tools have no opinion about went into `scripts/cfn-guardrails.sh` as two static checks — tag
+coverage on billable resources, and `TreatMissingData: notBreaching` anywhere in `cfn/` — **both
+proved to fire by breaking a template on purpose**, since a check that has never failed is
+indistinguishable from one that is not wired.
+
+Both checks needed correcting after their first spelling, and both failures are instructive:
+
+- Check 5's `Type:` match was unanchored, so `TargetType: AWS::RDS::DBInstance` on the
+  `SecretTargetAttachment` matched, and the check demanded cost-allocation tags on a resource that
+  cannot carry them. A red check nobody can make green gets the check deleted, not the template
+  fixed.
+- Check 6 was first written as the task's literal `grep -RIn "notBreaching" cfn/`, which failed on
+  the paragraph in `taxcalc-cost-dev.yaml` explaining why `notBreaching` is wrong. A negative grep
+  that its own documentation trips is worse than no check: it is red for a reason only fixable by
+  deleting the explanation.
+
+Gate on all five templates: `cfn-lint` 1.56.2 + `cfn-lint-serverless` → **0 findings**;
+`cfn_nag_scan --fail-on-warnings` → **0 failures, 0 warnings**; `cfn-guardrails.sh --static` →
+**6 passed, 0 failed**. The one `W28` (explicit `AlarmName`) is suppressed at the resource with its
+reasoning attached, house style — the name is the handle `describe-alarms`, the COST.md runbook and
+a 2am console search all use.
