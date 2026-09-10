@@ -1,0 +1,154 @@
+# .github/workflows/cfn-validate.yml - cfn-lint + cfn-nag + validate-template.
+#
+# TASK 4 CI gate: every PR that touches cfn/ is linted for syntax (cfn-lint),
+# scanned for security posture (cfn-nag), and - when AWS is wired - checked
+# against the real CloudFormation service (validate-template). Failures block
+# merge; this is the required status check on main.
+#
+# The three tools do not overlap:
+#   cfn-lint          template grammar, intrinsic-function arity, resource
+#                     property names and types, invalid !Ref targets. Catches
+#                     "this will not parse" and "no such property".
+#   cfn-nag           security posture. Catches "this parses and deploys and
+#                     is wrong" - a wildcard IAM action, a bucket without
+#                     public-access blocks, a security group with implicit
+#                     allow-all egress.
+#   validate-template the CloudFormation service's own parser. Catches the
+#                     small set of things only the service knows, e.g. a
+#                     template over the size limit.
+#
+# Running the same checks locally before pushing:
+#   pip install cfn-lint==1.56.1 cfn-lint-serverless==0.3.5
+#   cfn-lint cfn/*.yaml -a cfn_lint_serverless.rules
+#   gem install cfn-nag -v 0.8.10 && cfn_nag_scan --input-path cfn --fail-on-warnings
+name: cfn-validate
+
+on:
+  pull_request:
+    paths:
+      - "cfn/**"
+      - "scripts/cfn-guardrails.sh"
+      - ".github/workflows/cfn-validate.yml"
+
+permissions:
+  contents: read # checkout
+  id-token: write # OIDC for the aws cli
+
+concurrency:
+  group: cfn-validate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: cfn-lint + cfn-nag + aws validate-template
+    # Blacksmith, not ubuntu-24.04: GitHub-hosted runners do not start in this
+    # org since the W5 D2 Actions billing block. A job pinned to a
+    # GitHub-hosted label fails in ~3s with "recent account payments have
+    # failed" - a runner that never booted, not a lint failure.
+    runs-on: blacksmith-2vcpu-ubuntu-2204
+    timeout-minutes: 10
+    steps:
+      - name: Check out config repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python (for cfn-lint)
+        uses: actions/setup-python@39cd14951b08e74b54015e9e001cdefcf80e669f # v5.1.1
+        with:
+          python-version: "3.12"
+
+      # cfn-lint-serverless requires cfn-lint>=1.44.0, which is why the pin
+      # moved off 1.22.3. Both are pinned exactly: an unpinned rule pack can
+      # start failing a green PR on a day nobody touched the templates.
+      - name: Install cfn-lint + the serverless rule pack
+        run: pip install cfn-lint==1.56.1 cfn-lint-serverless==0.3.5
+
+      - name: Set up Ruby (for cfn-nag)
+        uses: ruby/setup-ruby@a4effe49ee8ee5b8b5091268c473a4628afb5651 # v1.211.0
+        with:
+          # 3.3 specifically. cfn-nag 0.8.10 pulls kwalify 0.7.2, which calls
+          # StringScanner#peep - removed in Ruby 4.0, so the scan dies in the
+          # require chain with a NoMethodError before it reads a template.
+          # Verified locally: identical templates, 0 findings on 3.3 and a
+          # stack trace on 4.0.
+          ruby-version: "3.3"
+
+      - name: Install cfn-nag
+        run: gem install cfn-nag -v 0.8.10 --no-document
+
+      # -a appends the serverless rule pack (ES*/WS* rules: Lambda tracing and
+      # memory/timeout defaults, API Gateway logging and throttling, SQS/SNS
+      # redrive policies, EventBridge DLQs).
+      #
+      # It finds nothing today, and that is the correct result rather than a
+      # wasted step: cfn/ currently holds a VPC, an RDS instance, two S3
+      # buckets and an IAM role, and no Transform. Verified the pack is
+      # genuinely wired rather than silently inert - a scratch SQS queue with
+      # no RedrivePolicy trips ES6000 through this exact invocation. It starts
+      # earning its place when W6 D4's LLM cost-monitoring Lambda stack lands
+      # in cfn/, which is the point of wiring it before then rather than after.
+      - name: cfn-lint (with cfn-lint-serverless rules)
+        run: cfn-lint cfn/*.yaml -a cfn_lint_serverless.rules
+
+      # --fail-on-warnings, so a WARN is a red check rather than a line of log
+      # nobody reads. Anything deliberately accepted is suppressed at the
+      # resource with a Metadata.cfn_nag.rules_to_suppress reason, which puts
+      # the justification in the diff where a reviewer argues with it.
+      - name: cfn-nag
+        run: cfn_nag_scan --input-path cfn --fail-on-warnings --output-format txt
+
+      # Static half of scripts/cfn-guardrails.sh - no AWS call, no credentials,
+      # so it gates every PR regardless of whether an account exists.
+      #
+      # It asserts the cross-stack contract from the templates themselves:
+      # taxcalc-app-dev must still consume taxcalc-network-dev by !ImportValue.
+      # That catches the mistake most likely to be made in good faith - swapping
+      # an import for a hardcoded subnet id because the import was awkward -
+      # which neither cfn-lint nor cfn-nag has an opinion about, and which
+      # silently removes the protection that stops a network rebuild from
+      # orphaning the app stack.
+      - name: cross-stack guardrails (static)
+        run: ./scripts/cfn-guardrails.sh --static
+
+      # The AWS half is guarded on vars.AWS_ACCOUNT_ID rather than assumed.
+      # configure-aws-credentials cannot do anything with an empty
+      # role-to-assume, so an unguarded step would put a permanent red X on
+      # main for every repo that has not been pointed at an account yet - and
+      # a required check that is always red gets bypassed, which is worse than
+      # not having it. cfn-lint and cfn-nag above are the part that always
+      # runs, and they are the part that catches almost everything.
+      - name: AWS not wired - validate-template will be skipped
+        if: vars.AWS_ACCOUNT_ID == ''
+        run: |
+          echo "::warning::vars.AWS_ACCOUNT_ID is unset, so the CFN deploy role" \
+               "cannot be assumed and 'aws cloudformation validate-template' is" \
+               "skipped. cfn-lint and cfn-nag still ran and still gate this PR." \
+               "To enable: deploy cfn/taxcalc-bootstrap-dev.yaml (it creates" \
+               "role/taxcalc-api-cfn-deploy), then" \
+               "'gh variable set AWS_ACCOUNT_ID --body <account-id>'. No" \
+               "workflow change needed."
+
+      - name: Configure AWS credentials (OIDC, read-only)
+        if: vars.AWS_ACCOUNT_ID != ''
+        uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
+        with:
+          # Created by cfn/taxcalc-bootstrap-dev.yaml. Its policy allows
+          # cloudformation:ValidateTemplate but no Create/Execute path that
+          # this workflow could reach - the ChangeSet actions in it are for
+          # the deploy path, and this job never calls them.
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/taxcalc-api-cfn-deploy
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+          role-session-name: gh-cfn-validate-${{ github.run_id }}
+
+      # Looped rather than one step per template: adding cfn/taxcalc-lambda-dev.yaml
+      # in W6 D4 should not also require editing this workflow to validate it.
+      - name: aws cloudformation validate-template
+        if: vars.AWS_ACCOUNT_ID != ''
+        run: |
+          set -euo pipefail
+          for tpl in cfn/*.yaml; do
+            echo "::group::validate-template ${tpl}"
+            aws cloudformation validate-template \
+              --template-body "file://${tpl}" \
+              --region "${{ vars.AWS_REGION || 'us-east-1' }}"
+            echo "::endgroup::"
+          done

@@ -1,0 +1,482 @@
+# cfn/taxcalc-network-dev.yaml
+#
+# TASK 2 network stack: a 3-AZ VPC, an IGW, three public and three private
+# subnets (one of each per AZ), a per-environment NAT Gateway count gated by
+# Conditions, and the application security group.
+#
+# Everything the application stack (Task 3) needs from the network is EXPORTED
+# here and consumed there via !ImportValue. Subnet IDs are never copied into
+# another template by hand: a rebuilt network changes every ID, and hardcoded
+# copies then point at subnets that no longer exist while still looking valid
+# in Git.
+#
+# Cost/HA trade-off, made explicit by IsProdLike:
+#   dev            1 NAT Gateway  (~$32/mo)  - all three private subnets route
+#                                              through AZ A; losing AZ A costs
+#                                              dev its egress, which is fine.
+#   staging/prod   3 NAT Gateways (~$97/mo)  - one per AZ, so an AZ failure
+#                                              takes out only its own subnet.
+#
+# Deploy with the ChangeSet flow; --change-set-type CREATE the first time.
+AWSTemplateFormatVersion: "2010-09-09"
+Description: taxcalc 3-AZ VPC + app SG - parameterised by env.
+
+Parameters:
+  EnvName:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: >-
+      Deployment environment. Gates the NAT-Gateway count via the IsProdLike
+      condition and suffixes every resource name.
+
+  VpcCidr:
+    Type: String
+    Default: 10.41.0.0/16
+    Description: >-
+      VPC CIDR. Must not overlap any peered network or the cluster CIDR the
+      W5 D3 workloads run in. The AllowedPattern rejects a malformed or
+      wrong-sized block at ChangeSet-creation time rather than at resource
+      creation, where the failure arrives ten minutes into a rollback.
+    AllowedPattern: "^10\\.\\d{1,3}\\.0\\.0/16$"
+    ConstraintDescription: Must be a 10.x.0.0/16 block, e.g. 10.41.0.0/16.
+
+  DbSecurityGroupId:
+    Type: String
+    Default: ""
+    Description: >-
+      The application stack's DB security group id, so the app SG's Postgres
+      egress can be pinned to that SG rather than to a CIDR. Empty on the
+      first deploy and supplied on a later UPDATE - see "Two-pass deploy" in
+      taxcalc-api/INFRA.md. A Parameter and NOT an !ImportValue on purpose:
+      importing here would be a cross-stack CYCLE, because the app stack
+      already imports AppSgId from this stack. Leaving it empty is safe - the
+      egress rule falls back to the VPC CIDR, which is functional but looser.
+
+Mappings:
+  # Per-env scale hints, consumed by the application stack via !FindInMap when
+  # it imports this network's VpcCidr. Kept here so one file owns the
+  # "how big is this environment" answer.
+  EnvToReplicas:
+    dev:     {AppMin: "1", AppDesired: "1", AppMax: "2"}
+    staging: {AppMin: "2", AppDesired: "2", AppMax: "4"}
+    prod:    {AppMin: "3", AppDesired: "3", AppMax: "6"}
+
+Conditions:
+  # IsProdLike gates the HA NAT pattern: staging and prod each get one NAT
+  # Gateway per AZ, so a single-AZ failure cannot remove egress for the other
+  # two. Dev deliberately does not - a second and third NAT would double the
+  # environment's standing cost to protect a workload nobody is paged for.
+  IsProdLike: !Or [!Equals [!Ref EnvName, staging], !Equals [!Ref EnvName, prod]]
+  # IsDev is the exact inverse of IsProdLike. It exists because the dev-only
+  # route-table associations (private B and C pointing at AZ A's NAT) have no
+  # prod-like counterpart, and CFN has no "else" - each branch needs its own
+  # named Condition.
+  IsDev: !Not [!Condition IsProdLike]
+  # HasDbSg gates which form the app SG's Postgres egress rule takes. On the
+  # first deploy the app stack does not exist yet, so DbSecurityGroupId is
+  # empty and the rule is written against the VPC CIDR - functional, and no
+  # worse than having no rule. On the second pass the real SG id is supplied
+  # and the rule tightens to that security group alone. Both branches are
+  # declared IN this template, which is what keeps detect-stack-drift IN_SYNC:
+  # whichever branch is live is also the branch CloudFormation knows about.
+  HasDbSg: !Not [!Equals [!Ref DbSecurityGroupId, ""]]
+
+Resources:
+  Vpc:
+    Type: AWS::EC2::VPC
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W60
+            reason: >-
+              No VPC flow log is attached from this stack, and that is a known
+              gap rather than an oversight - see "What this substrate does not
+              do yet" in taxcalc-api/INFRA.md. Flow logs are only useful when
+              they land somewhere durable and queryable; wiring a per-VPC log
+              group here would create a second, divergent destination next to
+              the observability stack W6 D5 sets up. The delivery target is
+              picked there, and this resource gains its AWS::EC2::FlowLog then.
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - {Key: Name, Value: !Sub "taxcalc-${EnvName}-vpc"}
+        - {Key: Env, Value: !Ref EnvName}
+        - {Key: Project, Value: taxcalc}
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - {Key: Name, Value: !Sub "taxcalc-${EnvName}-igw"}
+        - {Key: Env, Value: !Ref EnvName}
+        - {Key: Project, Value: taxcalc}
+
+  IgwAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  # --- Public subnets (3): IGW-routed, host the NAT Gateway(s).
+  # AvailabilityZone comes from !GetAZs rather than a literal like us-east-1a:
+  # AZ names are per-account aliases over different physical zones, so a
+  # literal is both non-portable across accounts and silently wrong.
+  # CIDRs come from !Cidr so the template survives a VpcCidr change - six /24s
+  # carved out of the /16, indices 0-2 public and 3-5 private.
+  #
+  # MapPublicIpOnLaunch is deliberately left at its default of false. "Public"
+  # here means IGW-routed, not auto-addressed: the only things this stack puts
+  # in these subnets are NAT Gateways, which carry their own Elastic IPs and
+  # ignore the setting entirely. Turning it on would silently give a public
+  # address to anything a later stack launches here, which is how a debug EC2
+  # box ends up reachable from the internet. (cfn-nag W33 flags it for the
+  # same reason; this is a removal, not a suppression.)
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: !Select [0, !Cidr [!Ref VpcCidr, 6, 8]]
+      Tags:
+        - {Key: Name, Value: !Sub "taxcalc-${EnvName}-public-a"}
+        - {Key: Env, Value: !Ref EnvName}
+        - {Key: Project, Value: taxcalc}
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      CidrBlock: !Select [1, !Cidr [!Ref VpcCidr, 6, 8]]
+      Tags:
+        - {Key: Name, Value: !Sub "taxcalc-${EnvName}-public-b"}
+        - {Key: Env, Value: !Ref EnvName}
+        - {Key: Project, Value: taxcalc}
+
+  PublicSubnetC:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [2, !GetAZs ""]
+      CidrBlock: !Select [2, !Cidr [!Ref VpcCidr, 6, 8]]
+      Tags:
+        - {Key: Name, Value: !Sub "taxcalc-${EnvName}-public-c"}
+        - {Key: Env, Value: !Ref EnvName}
+        - {Key: Project, Value: taxcalc}
+
+  # --- Private subnets (3): NAT-routed, host the workloads and the RDS
+  # instance the application stack creates. No MapPublicIpOnLaunch.
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: !Select [3, !Cidr [!Ref VpcCidr, 6, 8]]
+      Tags:
+        - {Key: Name, Value: !Sub "taxcalc-${EnvName}-private-a"}
+        - {Key: Env, Value: !Ref EnvName}
+        - {Key: Project, Value: taxcalc}
+
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      CidrBlock: !Select [4, !Cidr [!Ref VpcCidr, 6, 8]]
+      Tags:
+        - {Key: Name, Value: !Sub "taxcalc-${EnvName}-private-b"}
+        - {Key: Env, Value: !Ref EnvName}
+        - {Key: Project, Value: taxcalc}
+
+  PrivateSubnetC:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [2, !GetAZs ""]
+      CidrBlock: !Select [5, !Cidr [!Ref VpcCidr, 6, 8]]
+      Tags:
+        - {Key: Name, Value: !Sub "taxcalc-${EnvName}-private-c"}
+        - {Key: Env, Value: !Ref EnvName}
+        - {Key: Project, Value: taxcalc}
+
+  # --- NAT Gateways: always at least one (A); B and C only when IsProdLike.
+  # DependsOn IgwAttachment on every EIP - an Elastic IP allocated before the
+  # IGW is attached to the VPC can fail to associate, and the resulting error
+  # names the EIP rather than the missing attachment.
+  NatEipA:
+    Type: AWS::EC2::EIP
+    DependsOn: IgwAttachment
+    Properties:
+      Domain: vpc
+      Tags: [{Key: Name, Value: !Sub "taxcalc-${EnvName}-nat-eip-a"}]
+
+  NatGatewayA:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEipA.AllocationId
+      SubnetId: !Ref PublicSubnetA
+      Tags: [{Key: Name, Value: !Sub "taxcalc-${EnvName}-nat-a"}]
+
+  NatEipB:
+    Type: AWS::EC2::EIP
+    Condition: IsProdLike
+    DependsOn: IgwAttachment
+    Properties:
+      Domain: vpc
+      Tags: [{Key: Name, Value: !Sub "taxcalc-${EnvName}-nat-eip-b"}]
+
+  NatGatewayBPerAz:
+    Type: AWS::EC2::NatGateway
+    Condition: IsProdLike
+    Properties:
+      AllocationId: !GetAtt NatEipB.AllocationId
+      SubnetId: !Ref PublicSubnetB
+      Tags: [{Key: Name, Value: !Sub "taxcalc-${EnvName}-nat-b"}]
+
+  NatEipC:
+    Type: AWS::EC2::EIP
+    Condition: IsProdLike
+    DependsOn: IgwAttachment
+    Properties:
+      Domain: vpc
+      Tags: [{Key: Name, Value: !Sub "taxcalc-${EnvName}-nat-eip-c"}]
+
+  NatGatewayCPerAz:
+    Type: AWS::EC2::NatGateway
+    Condition: IsProdLike
+    Properties:
+      AllocationId: !GetAtt NatEipC.AllocationId
+      SubnetId: !Ref PublicSubnetC
+      Tags: [{Key: Name, Value: !Sub "taxcalc-${EnvName}-nat-c"}]
+
+  # --- Public route table: 0.0.0.0/0 -> IGW. Shared across all 3 AZs, because
+  # every public subnet wants the identical route.
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{Key: Name, Value: !Sub "taxcalc-${EnvName}-public-rt"}]
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IgwAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicAssocA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PublicSubnetA, RouteTableId: !Ref PublicRouteTable}
+  PublicAssocB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PublicSubnetB, RouteTableId: !Ref PublicRouteTable}
+  PublicAssocC:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PublicSubnetC, RouteTableId: !Ref PublicRouteTable}
+
+  # --- Private route tables: one per AZ when IsProdLike (each routing via its
+  # own NAT GW); a single shared table in dev (all 3 AZs route via NAT A).
+  # Private subnets must NOT share one table in the HA case - that would send
+  # all three AZs through one NAT and throw away the redundancy just paid for.
+  PrivateRouteTableA:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{Key: Name, Value: !Sub "taxcalc-${EnvName}-private-rt-a"}]
+
+  PrivateDefaultRouteA:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableA
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGatewayA
+
+  PrivateAssocA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PrivateSubnetA, RouteTableId: !Ref PrivateRouteTableA}
+
+  PrivateRouteTableB:
+    Type: AWS::EC2::RouteTable
+    Condition: IsProdLike
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{Key: Name, Value: !Sub "taxcalc-${EnvName}-private-rt-b"}]
+
+  PrivateDefaultRouteB:
+    Type: AWS::EC2::Route
+    Condition: IsProdLike
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableB
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGatewayBPerAz
+
+  PrivateAssocBHA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: IsProdLike
+    Properties: {SubnetId: !Ref PrivateSubnetB, RouteTableId: !Ref PrivateRouteTableB}
+
+  # In dev: route B through the single NAT (A).
+  PrivateAssocBDev:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: IsDev
+    Properties: {SubnetId: !Ref PrivateSubnetB, RouteTableId: !Ref PrivateRouteTableA}
+
+  PrivateRouteTableC:
+    Type: AWS::EC2::RouteTable
+    Condition: IsProdLike
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{Key: Name, Value: !Sub "taxcalc-${EnvName}-private-rt-c"}]
+
+  PrivateDefaultRouteC:
+    Type: AWS::EC2::Route
+    Condition: IsProdLike
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableC
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGatewayCPerAz
+
+  PrivateAssocCHA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: IsProdLike
+    Properties: {SubnetId: !Ref PrivateSubnetC, RouteTableId: !Ref PrivateRouteTableC}
+
+  # In dev: route C through the single NAT (A).
+  PrivateAssocCDev:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: IsDev
+    Properties: {SubnetId: !Ref PrivateSubnetC, RouteTableId: !Ref PrivateRouteTableA}
+
+  # --- Application security group: only the app port, only from inside the VPC.
+  #
+  # Egress is enumerated, which REPLACES the default allow-all. Two rules:
+  #   443 to the internet - ECR image pulls, STS AssumeRole, Secrets Manager.
+  #   5432 to the RDS security group by id, once that id is known.
+  #
+  # THE CYCLE, AND HOW IT IS BROKEN WITHOUT COSTING DRIFT.
+  # The obvious spelling of "egress 5432 to the RDS SG" is
+  # `DestinationSecurityGroupId: !ImportValue taxcalc-app-dev-DbSgId`. That is
+  # a cross-stack CYCLE - the app stack already imports AppSgId from here, so
+  # each stack would wait on the other and neither would ever deploy.
+  #
+  # The usual escape is to declare a standalone AWS::EC2::SecurityGroupEgress
+  # in the app stack, attached to the imported SG. It breaks the cycle and it
+  # is wrong here: the rule would exist on a security group whose owning
+  # template does not describe it, so THIS stack reads DRIFTED forever and
+  # Task 4's detect-stack-drift could never return IN_SYNC. Worse, AWS
+  # documents that mixing inline SecurityGroupEgress with standalone egress
+  # resources on one group produces conflicting rule sets.
+  #
+  # So the id arrives as a PARAMETER instead of an import, and the rule stays
+  # declared in this template either way. Deploy is two passes:
+  #
+  #   pass 1  DbSecurityGroupId=""            -> 5432 egress to the VPC CIDR
+  #   (deploy the app stack, which exports taxcalc-app-dev-DbSgId)
+  #   pass 2  DbSecurityGroupId=sg-0abc...    -> 5432 egress to that SG only
+  #
+  # Both branches are in the template, so live state and declared state agree
+  # at every point and drift stays clean. A Parameter is weaker than an import
+  # in one specific way - it does not earn the "Export ... is in use by"
+  # deletion refusal on the DB SG - which is why the app stack still imports
+  # AppSgId properly and only this one back-reference is parameterised.
+  #
+  # The tight direction is ALSO enforced on the DB side regardless: the app
+  # stack's DbSecurityGroup takes ingress 5432 from this SG by ID, so nothing
+  # else in the VPC can actually open a Postgres connection.
+  TaxcalcAppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W5
+            reason: >-
+              443 egress to 0.0.0.0/0 is required and cannot be narrowed by
+              CIDR: ECR, STS and Secrets Manager are reached over public
+              service endpoints whose IP ranges are not stable. Removing this
+              breaks image pulls and IRSA. The narrower fix is VPC endpoints,
+              which is W6 D4 scope (see taxcalc-api/INFRA.md).
+          - id: W9
+            reason: >-
+              Ingress is intentionally the whole VPC CIDR rather than a /32.
+              The callers are pods behind a Service with no stable address; a
+              /32 here would have to be re-written on every reschedule.
+              Crucially this is NOT 0.0.0.0/0 - nothing outside the VPC can
+              reach 8080.
+    Properties:
+      # No GroupName: consumers import the SG *id* (AppSgId), never the name,
+      # so a generated name costs nothing and keeps this SG replaceable in
+      # place. An explicit name would make any replacing update fail on a
+      # name collision with the SG still being deleted (cfn-nag W28).
+      GroupDescription: App SG; ingress 8080 from VPC only; egress 443 + 5432 only.
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          CidrIp: !Ref VpcCidr
+          Description: App port, in-VPC only.
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS egress (ECR, STS, Secrets Manager).
+        # Postgres egress, in whichever form is currently possible. Pass 2
+        # (DbSecurityGroupId supplied) pins it to the RDS security group by id,
+        # which is the tight form the deliverable asks for. Pass 1 falls back
+        # to the VPC CIDR so the app can reach its database from the moment
+        # both stacks exist, rather than waiting for a third deploy.
+        - !If
+          - HasDbSg
+          - IpProtocol: tcp
+            FromPort: 5432
+            ToPort: 5432
+            DestinationSecurityGroupId: !Ref DbSecurityGroupId
+            Description: Postgres to the RDS security group only.
+          - IpProtocol: tcp
+            FromPort: 5432
+            ToPort: 5432
+            CidrIp: !Ref VpcCidr
+            Description: Postgres, VPC-scoped until the DB SG id is supplied.
+      Tags:
+        - {Key: Name, Value: !Sub "taxcalc-${EnvName}-app-sg"}
+        - {Key: Env, Value: !Ref EnvName}
+        - {Key: Project, Value: taxcalc}
+
+Outputs:
+  VpcId:
+    Description: VPC id, imported by the application stack's security groups.
+    Value: !Ref Vpc
+    Export: {Name: !Sub "${AWS::StackName}-VpcId"}
+
+  VpcCidr:
+    Description: VPC CIDR, echoed so consumers need not re-derive it.
+    Value: !Ref VpcCidr
+    Export: {Name: !Sub "${AWS::StackName}-VpcCidr"}
+
+  PrivateSubnets:
+    # Comma-joined; consumers split with !Split. CFN exports cannot hold a
+    # List type, so a joined string is the only way to export a subnet set
+    # under one name instead of three.
+    Description: The three private subnet ids, comma-joined.
+    Value: !Join [",", [!Ref PrivateSubnetA, !Ref PrivateSubnetB, !Ref PrivateSubnetC]]
+    Export: {Name: !Sub "${AWS::StackName}-PrivateSubnets"}
+
+  PublicSubnets:
+    Description: The three public subnet ids, comma-joined.
+    Value: !Join [",", [!Ref PublicSubnetA, !Ref PublicSubnetB, !Ref PublicSubnetC]]
+    Export: {Name: !Sub "${AWS::StackName}-PublicSubnets"}
+
+  AppSecurityGroupId:
+    Description: Application SG id; the app stack's DB SG takes ingress from it.
+    Value: !Ref TaxcalcAppSecurityGroup
+    Export: {Name: !Sub "${AWS::StackName}-AppSgId"}
+
+  AppDesiredCount:
+    Description: Per-env desired replica count, from the EnvToReplicas mapping.
+    Value: !FindInMap [EnvToReplicas, !Ref EnvName, AppDesired]
+    Export: {Name: !Sub "${AWS::StackName}-AppDesiredCount"}
