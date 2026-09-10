@@ -1,0 +1,285 @@
+# cfn/taxcalc-cost-dev.yaml
+#
+# TASK 1: the cost-GOVERNANCE stack, layered over the W6 D3 substrate. An AWS
+# Budget (tag-scoped) + a CloudWatch billing alarm + the SNS topic both of them
+# publish to.
+#
+# This stack governs AWS-RESIDENT spend only - the NAT Gateway, the RDS
+# instance, the S3 buckets - because that is the spend AWS billing can see.
+# Anthropic (LLM) spend is NOT AWS spend: it bills to the Anthropic workspace,
+# never appears in Cost Explorer, and no AWS Budget can be made to see it. It
+# is governed on its own plane (an Anthropic Console workspace spend limit) and
+# attributed in-app (the per-request cost log + the X-Cost-Usd header added in
+# taxcalc-api on W6 D4 Task 2). taxcalc-api/COST.md tabulates the split.
+#
+# Two guardrails, deliberately not redundant:
+#
+#   MonthlyCostBudget      Tag-scoped. Sees ONLY resources carrying
+#                          service=taxcalc AND env=<EnvName>, so it attributes
+#                          spend to this project inside a shared account.
+#                          Fires FORECASTED>80% (early warning, before the money
+#                          is spent) and ACTUAL>100% (it happened).
+#
+#   EstimatedChargesAlarm  Account-wide. AWS/Billing EstimatedCharges CANNOT be
+#                          filtered by tag - it is one number for the whole
+#                          account - so it catches the spend the Budget is blind
+#                          to by construction: an untagged resource, or a
+#                          resource somebody else created. The Budget is the
+#                          attribution; this is the backstop.
+#
+# Deploy with the same ChangeSet flow as the other three stacks:
+#   aws cloudformation create-change-set --stack-name taxcalc-cost-dev \
+#     --change-set-name initial --change-set-type CREATE \
+#     --template-body file://cfn/taxcalc-cost-dev.yaml \
+#     --parameters ParameterKey=EnvName,ParameterValue=dev --region us-east-1
+#
+# REGION IS LOAD-BEARING, not a default: see IsUsEast1 below.
+AWSTemplateFormatVersion: "2010-09-09"
+Description: taxcalc cost-governance stack - AWS Budget + billing alarm + SNS.
+
+Parameters:
+  EnvName:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: >-
+      Deployment environment. Suffixes every resource name and forms half of
+      the Budget's CostFilters (user:env$<EnvName>), so a dev budget never
+      counts staging's spend.
+
+  MonthlyBudgetUsd:
+    Type: Number
+    Default: 100
+    MinValue: 20
+    MaxValue: 100000
+    Description: >-
+      Monthly cost cap for the tagged stack. Derived from the W6 D3 figures
+      rather than picked: one dev NAT Gateway is ~$32/mo before data-processing
+      charges, RDS db.t4g.micro + 20GB gp3 is ~$15/mo, and S3 is cents. $100
+      leaves genuine headroom over ~$50 of steady state, so FORECASTED>80%
+      ($80) means something has actually changed rather than that the month
+      has a 31st day in it.
+
+  BillingAlarmUsd:
+    Type: Number
+    Default: 120
+    MinValue: 1
+    Description: >-
+      Account-wide EstimatedCharges threshold. Set ABOVE MonthlyBudgetUsd on
+      purpose: the tag-scoped Budget should be the thing that speaks first, and
+      this should only fire when total account spend has passed the point where
+      the tagged view is no longer the whole story.
+
+Conditions:
+  # AWS/Billing EstimatedCharges is published ONLY to us-east-1, for every
+  # region's spend. An alarm on that metric in any other region watches a
+  # metric that will never receive a datapoint - and with TreatMissingData:
+  # ignore (which is correct here, see the alarm) it would sit in
+  # INSUFFICIENT_DATA forever, looking deployed and never firing.
+  #
+  # Gating on the region converts that silent failure into a visible absence:
+  # deploy this stack outside us-east-1 and the alarm is not created at all,
+  # and the BillingAlarmName output says so in words instead of naming an alarm
+  # that cannot work. An alarm that exists and cannot fire is strictly worse
+  # than no alarm, because it is the one a reviewer ticks off.
+  IsUsEast1: !Equals [!Ref "AWS::Region", us-east-1]
+
+Resources:
+  # --- The notification sink. Both the Budget and the alarm publish here.
+  CostAlarmsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "taxcalc-cost-alarms-${EnvName}"
+      DisplayName: !Sub "taxcalc cost alarms (${EnvName})"
+      # SSE at rest with the AWS-managed SNS key. alias/aws/sns rather than a
+      # CMK: the payload is a threshold-breach notification, not the spend data
+      # itself, and a CMK would add key policy management plus ~$1/mo to a
+      # stack whose entire purpose is watching a ~$50/mo bill.
+      KmsMasterKeyId: alias/aws/sns
+      # The four-key taxonomy, applied to this stack's own resources too. A
+      # cost stack that is itself untagged is the first thing a tag-coverage
+      # audit finds.
+      Tags:
+        - {Key: service, Value: taxcalc}
+        - {Key: env, Value: !Ref EnvName}
+        - {Key: tenant, Value: shared}
+        - {Key: feature, Value: cost-governance}
+
+  # --- WITHOUT this policy, Budgets and CloudWatch silently fail to publish
+  # and the notification never arrives. The Budget still shows as configured
+  # in the console and the alarm still transitions to ALARM - the delivery is
+  # what is missing, which is the "green but dead" shape this whole stack
+  # exists to avoid, reproduced inside the stack itself.
+  CostAlarmsTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: [!Ref CostAlarmsTopic]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowBudgetsPublish
+            Effect: Allow
+            Principal: {Service: budgets.amazonaws.com}
+            Action: sns:Publish
+            Resource: !Ref CostAlarmsTopic
+            # Both service principals are confused-deputy candidates: any
+            # account's budget could otherwise ask the Budgets service to
+            # publish to this topic. SourceAccount pins it to ours. This is
+            # not in the reference snippet and is the one substantive
+            # hardening added to it.
+            Condition:
+              StringEquals:
+                AWS:SourceAccount: !Ref "AWS::AccountId"
+          - Sid: AllowCloudWatchPublish
+            Effect: Allow
+            Principal: {Service: cloudwatch.amazonaws.com}
+            Action: sns:Publish
+            Resource: !Ref CostAlarmsTopic
+            Condition:
+              StringEquals:
+                AWS:SourceAccount: !Ref "AWS::AccountId"
+
+  # --- Tag-scoped COST budget: sees ONLY resources tagged service=taxcalc AND
+  # env=<EnvName> - the NAT Gateway and the RDS instance tagged in the D3
+  # templates by this deliverable. This is the ENFORCED guardrail on
+  # AWS-resident spend.
+  #
+  # CostFilters are AND-ed across keys and OR-ed within one key, so this reads
+  # "service is taxcalc AND env is dev". A resource missing EITHER key is
+  # invisible to this budget - which is why an untagged resource is a
+  # governance hole rather than a cosmetic one, and why COST.md makes tag
+  # coverage a reviewable property instead of a convention.
+  #
+  # NOTE on activation: cost-allocation tag keys must be activated by hand in
+  # the Billing console before they can be used as a filter, and activation
+  # does NOT backfill - spend incurred before activation is never attributed,
+  # no matter what the resource was tagged with at the time. See COST.md.
+  MonthlyCostBudget:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetName: !Sub "taxcalc-monthly-cost-${EnvName}"
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit: {Amount: !Ref MonthlyBudgetUsd, Unit: USD}
+        CostFilters:
+          TagKeyValue:
+            # The `user:` prefix marks a cost-allocation TAG key (as opposed to
+            # an AWS-generated one), and `$` separates key from value. The two
+            # entries are spelled differently for a reason cfn-lint enforces:
+            # the first has no substitution in it, so a !Sub there is dead
+            # weight (W1020); the second does, and needs `$$` to emit the
+            # literal separator `$` before `${EnvName}` interpolates - a single
+            # `$` there would make CloudFormation look for a variable named
+            # `{EnvName}` inside `env${EnvName}` and produce `user:env` with the
+            # env silently dropped, which is a filter that matches every
+            # environment at once.
+            - "user:service$taxcalc"
+            - !Sub "user:env$${EnvName}"
+      NotificationsWithSubscribers:
+        # FORECASTED first: it is the only one of the two that can still change
+        # the outcome. ACTUAL>100% is a post-mortem trigger.
+        - Notification:
+            NotificationType: FORECASTED
+            ComparisonOperator: GREATER_THAN
+            Threshold: 80
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - {SubscriptionType: SNS, Address: !Ref CostAlarmsTopic}
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 100
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - {SubscriptionType: SNS, Address: !Ref CostAlarmsTopic}
+
+  # --- Account-wide backstop. See IsUsEast1 above for why this is conditional.
+  EstimatedChargesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsUsEast1
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: >-
+              The explicit AlarmName is kept deliberately. It is the handle
+              every operational path uses - `describe-alarms --alarm-names`,
+              the runbook entry in taxcalc-api/COST.md, and the console search
+              an on-caller does at 2am - and a CFN-generated name would change
+              all three on any replacing update. W28's underlying concern
+              (a rename forces replacement) is close to free on a CloudWatch
+              alarm: it holds no data and has no dependants, so replacing it
+              costs one evaluation period of history, unlike the RDS instance
+              where the same suppression is a real trade.
+    Properties:
+      AlarmName: !Sub "taxcalc/estimated-charges-${EnvName}"
+      AlarmDescription: !Sub >-
+        Account-wide AWS EstimatedCharges above ${BillingAlarmUsd} USD. This is
+        NOT tag-scoped - EstimatedCharges cannot be filtered by tag - so it
+        covers untagged spend the taxcalc-monthly-cost-${EnvName} budget is
+        blind to. It does not see Anthropic spend either; nothing in AWS does.
+      Namespace: AWS/Billing
+      MetricName: EstimatedCharges
+      Dimensions:
+        - {Name: Currency, Value: USD}
+      Statistic: Maximum
+      # 6h, matching the metric. AWS refreshes EstimatedCharges roughly every
+      # six hours, so a shorter period buys nothing and only widens the window
+      # in which the alarm has no datapoint to evaluate.
+      Period: 21600
+      EvaluationPeriods: 1
+      Threshold: !Ref BillingAlarmUsd
+      ComparisonOperator: GreaterThanThreshold
+      # `ignore`, and NOT `notBreaching`, and the distinction is the whole
+      # point of the setting on THIS metric:
+      #
+      #   ignore         a missing datapoint leaves the alarm in whatever state
+      #                  it was already in. Billing updates every ~6h, so gaps
+      #                  are normal and expected here.
+      #   notBreaching   a missing datapoint counts as OK. On a metric with
+      #                  routine gaps that actively erases a real breach - the
+      #                  alarm goes ALARM, the next evaluation window has no
+      #                  data, and it resets itself to OK having notified once
+      #                  or not at all.
+      #
+      # The opposite reasoning applies to a metric-pipeline alarm (an app
+      # error rate, say), where silence means the pipeline is broken and
+      # `breaching` is the safe reading. Same setting, inverted answer,
+      # because the two metrics fail in opposite directions.
+      TreatMissingData: ignore
+      ActionsEnabled: true
+      AlarmActions: [!Ref CostAlarmsTopic]
+      # OKActions too, so the recovery is as visible as the breach. Without
+      # it, an alarm that clears goes quiet and the only signal anyone ever
+      # sees is the bad one.
+      OKActions: [!Ref CostAlarmsTopic]
+
+Outputs:
+  CostAlarmsTopicArn:
+    Description: >-
+      SNS topic the Budget and the billing alarm publish to. Exported so a
+      later stack can subscribe an endpoint (email, chatbot, Lambda) without
+      this stack owning the subscriber list - subscriptions confirmed by a
+      human do not belong in a template that gets torn down.
+    Value: !Ref CostAlarmsTopic
+    Export: {Name: !Sub "${AWS::StackName}-CostAlarmsTopicArn"}
+
+  BudgetName:
+    Description: Budget name, for `aws budgets describe-budget --budget-name`.
+    Value: !Sub "taxcalc-monthly-cost-${EnvName}"
+
+  BillingAlarmName:
+    Description: >-
+      Billing alarm name, or an explicit statement that no alarm exists in
+      this region. Deliberately not an empty string: an operator reading the
+      outputs of a stack deployed to eu-west-1 should be told why the alarm is
+      missing, not left to infer it from a blank.
+    Value: !If
+      - IsUsEast1
+      - !Sub "taxcalc/estimated-charges-${EnvName}"
+      - !Sub >-
+          NONE - AWS/Billing EstimatedCharges is published only to us-east-1,
+          and this stack is deployed to ${AWS::Region}. The tag-scoped budget
+          is active; the account-wide billing alarm is not. Redeploy in
+          us-east-1 to get it.

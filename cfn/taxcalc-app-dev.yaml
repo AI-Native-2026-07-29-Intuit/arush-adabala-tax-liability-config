@@ -240,9 +240,30 @@ Resources:
         "Fn::Sub": "{{resolve:secretsmanager:taxcalc/${EnvName}/db-master:SecretString:username}}"
       MasterUserPassword:
         "Fn::Sub": "{{resolve:secretsmanager:taxcalc/${EnvName}/db-master:SecretString:password}}"
+      # W6 D4 Task 1: the four-key cost-allocation taxonomy, added alongside
+      # the existing Env/Project tags rather than replacing them. AWS
+      # cost-allocation tag keys are case-sensitive, so `Env` and `env` are two
+      # distinct keys, each activated separately in the Billing console; a
+      # rename would have been the tidier diff and would have silently orphaned
+      # every historical `Env`-keyed report.
+      #
+      # RDS is the second-largest line item after the NAT Gateway, and unlike
+      # the NAT Gateway its charge does not fall when traffic does - a
+      # db.t4g.micro bills the same over a weekend nobody used it. Untagged it
+      # is invisible to the taxcalc-monthly-cost-<env> Budget, which would
+      # leave that Budget watching almost nothing while still looking correct.
       Tags:
         - {Key: Env, Value: !Ref EnvName}
         - {Key: Project, Value: taxcalc}
+        - {Key: service, Value: taxcalc}
+        - {Key: env, Value: !Ref EnvName}
+        # tenant=shared: this instance holds every tenant's rows behind the
+        # application's own tenant_id scoping, so there is no per-tenant split
+        # of the instance charge to record. A tenant on a dedicated instance
+        # would carry its own tenant value here and become separable in Cost
+        # Explorer with no further change.
+        - {Key: tenant, Value: shared}
+        - {Key: feature, Value: persistence}
 
   # --- Secret-to-DB attachment: rotation can target the live DB ARN.
   # It also backfills the connection details (host, port, engine) into the

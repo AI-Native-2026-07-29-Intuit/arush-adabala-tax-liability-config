@@ -506,6 +506,74 @@ if [ "$STATIC" = "true" ]; then
   else
     ok "app SG template has no 0.0.0.0/0 ingress"
   fi
+  # ---------------------------------------------------------------------
+  # W6 D4 Task 1. Both checks below are template-derived, so they gate every
+  # PR whether or not an AWS account is wired - which matters more here than
+  # elsewhere, because both failures are INVISIBLE at deploy time. An
+  # untagged NAT Gateway and an alarm set to notBreaching both reach
+  # CREATE_COMPLETE and both look correct in the console.
+  head_ '5. Cost-allocation tag coverage on billable resources (static)'
+  # A tag-scoped Budget filters on service AND env; a resource missing either
+  # key contributes spend the Budget cannot see. That is not a cosmetic gap -
+  # it silently shrinks what the guardrail guards, while the guardrail keeps
+  # reporting green. So the four keys are asserted here rather than left to
+  # a convention nobody re-checks.
+  #
+  # Scoped to the resource types that actually carry a recurring charge; a
+  # route table has no line item and demanding tags on it would train people
+  # to ignore this check.
+  BILLABLE_TYPES='AWS::EC2::NatGateway|AWS::EC2::EIP|AWS::RDS::DBInstance'
+  TAG_MISSING=0
+  while IFS= read -r block; do
+    tpl=${block%%$'\t'*}; rest=${block#*$'\t'}
+    lid=${rest%%$'\t'*}; body=${rest#*$'\t'}
+    for k in service env tenant feature; do
+      case "$body" in
+        *"Key: $k,"*|*"Key: $k}"*|*"Key: $k "*) ;;
+        *) bad "$tpl: $lid is billable but has no '$k' cost-allocation tag"
+           TAG_MISSING=$((TAG_MISSING+1)) ;;
+      esac
+    done
+  done <<EOF
+$(awk -v types="$BILLABLE_TYPES" '
+    FILENAME != prevfile { prevfile = FILENAME; lid = ""; body = ""; billable = 0 }
+    # A top-level resource starts at exactly two spaces of indent.
+    /^  [A-Za-z0-9]+:[ \t]*$/ {
+      if (lid != "" && billable) printf "%s\t%s\t%s\n", FILENAME, lid, body
+      lid = $1; sub(/:$/, "", lid); body = ""; billable = 0; next
+    }
+    # ANCHORED to a four-space "    Type:" and not a bare "Type:" substring.
+    # Unanchored, `TargetType: AWS::RDS::DBInstance` on the
+    # SecretTargetAttachment matched, and the check demanded cost-allocation
+    # tags on a resource that has no charge and cannot carry tags at all - a
+    # red check nobody can make green, which gets the check deleted rather
+    # than the template fixed.
+    { body = body " " $0; if ($0 ~ ("^    Type: (" types ")[ \t]*$")) billable = 1 }
+    END { if (lid != "" && billable) printf "%s\t%s\t%s\n", FILENAME, lid, body }
+  ' "$CFN_DIR"/*.yaml)
+EOF
+  [ "$TAG_MISSING" -eq 0 ] && ok "every billable resource in $CFN_DIR/ carries all four cost-allocation tags"
+
+  head_ '6. Billing alarm does not use TreatMissingData: notBreaching (static)'
+  # On AWS/Billing EstimatedCharges - a metric that publishes roughly every 6h
+  # - notBreaching reads every routine gap as "fine" and resets a real breach
+  # to OK. `ignore` holds the last state instead. The two spellings are one
+  # word apart and the wrong one produces an alarm that never usefully fires.
+  # Matches the PROPERTY ASSIGNMENT, not the bare word. The first spelling of
+  # this check was `grep -RIn 'notBreaching' cfn/` - exactly what the task
+  # text asks for - and it failed on the paragraph in taxcalc-cost-dev.yaml
+  # that explains why notBreaching is wrong. A negative grep that its own
+  # documentation trips is worse than no check: it is red for a reason that
+  # can only be fixed by deleting the explanation, so the next person deletes
+  # the check instead and the real setting goes ungated.
+  NB_RE='^[[:space:]]*TreatMissingData:[[:space:]]*notBreaching'
+  if grep -RInE "$NB_RE" "$CFN_DIR"/ >/dev/null 2>&1; then
+    bad "TreatMissingData: notBreaching found in $CFN_DIR/ - see cfn/taxcalc-cost-dev.yaml for why it is wrong on a billing metric"
+    grep -RInE "$NB_RE" "$CFN_DIR"/ | while read -r l; do note "$l"; done
+  else
+    ok "no 'TreatMissingData: notBreaching' in $CFN_DIR/ (billing alarm uses ignore)"
+  fi
+
   head_ 'Result (static mode - no AWS calls made)'
   printf '%d passed, %d failed\n' "$PASS" "$FAIL"
   [ "$FAIL" -eq 0 ] || exit 1
