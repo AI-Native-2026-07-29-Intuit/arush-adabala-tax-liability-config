@@ -1428,16 +1428,24 @@ This section records only what the infrastructure side verified and what it coul
 
 ## Status table
 
+All four commands now answer. `scripts/cost-done-when.sh` runs them and prints `PASS`/`SHIM`/`GAP`
+per check rather than an exit status — reading raw exit codes here would report **one false pass
+and one false failure**, which is worse than reporting nothing.
+
 | Done-When | Engine | Result |
 |---|---|---|
-| `taxcalc-cost-dev` reaches `CREATE_COMPLETE` | floci 2.0.1 | **PASS** — real ChangeSet flow |
+| `taxcalc-cost-dev` reaches `CREATE_COMPLETE` | floci 2.0.1 | **PASS** (qualified) — real ChangeSet flow |
 | billing alarm on `AWS/Billing EstimatedCharges` | floci 2.0.1 | **PASS** — `describe-alarms` returns it |
-| Budget with two notifications → SNS | floci 2.0.1 | **NOT VERIFIABLE** — see gap 1 |
-| NAT + RDS carry all four tags | templates + `--static` | **PASS (static)** — see gap 4 |
-| Cost Explorer view grouped by `service` | — | **NO LOCAL PATH** — see gap 4 |
+| Budget with two notifications → SNS | `floci-cost-apis-shim.py` | **SHIM** — see gap 1; not evidence a budget exists |
+| NAT + RDS carry all four tags | `cfn-guardrails.sh reconcile-tags` + shim | **SHIM** — real tags, stood-in index; see gap 2 |
+| Cost Explorer view grouped by `service` | — | **NO LOCAL PATH, structural** — see "Still unresolvable" |
 | `grep -RIn "notBreaching" cfn/` → zero | static | **PASS** — guardrails check 6 |
 
-## Four gaps, measured
+`taxcalc-network-dev` also now deploys, via `cfn-resolve-if.rb` — see below. Its previous rollback
+was diagnosed as a floci bug, not a template defect, and is fixed on the deploy path without
+touching the committed YAML.
+
+## Four gaps, measured — and what closes each one
 
 **1. `AWS::Budgets::Budget` reports `CREATE_COMPLETE` against a service that is not running.**
 floci exposes no `budgets` service at all — it is absent from the 100 in `/_localstack/health` —
@@ -1447,25 +1455,85 @@ AWSBudgetServiceGateway.DescribeBudget`. Identical in shape to D3's phantom `buc
 worse in consequence: it lands on the deliverable's headline resource. `CREATE_COMPLETE` here means
 the template parsed, not that a budget exists.
 
+**Closed as a `SHIM`, not a `PASS`.** `floci-cost-apis-shim.py` serves `DescribeBudget` and
+`DescribeNotificationsForBudget` by reading `cfn-extract-cost.rb`'s output — the Budget resource's
+properties, taken straight from the deployed template with its `!Ref`/`!Sub` intrinsics resolved
+against the live stack's parameters and physical ids. Through the shim:
+
+```
+BudgetLimit 100 USD, COST/MONTHLY, 2 notification(s): FORECASTED 80  ACTUAL 100
+CostFilters: user:service$taxcalc, user:env$dev
+```
+
+That is real information about the committed template — the limit, the filters, the notification
+shape all match what was reviewed. **It is not a live budget.** There is nothing on this endpoint
+to read; the response is a projection, labelled as one in an `x-floci-shim` response header (the
+`ShimProvenance` body key does not survive botocore's response validation, which drops any member
+its service model does not declare — a caveat that cannot be delivered any other way to an
+`aws` CLI caller). Change the template and redeploy, and the shim's answer changes with it; that is
+the whole of its fidelity. It refuses to start without `AWS_ENDPOINT_URL` set, so it cannot run
+against a real account and mask a real answer.
+
 **2. The SNS `TopicPolicy`, `KmsMasterKeyId` and tags are silently dropped.** All three report
 `CREATE_COMPLETE`; none reaches the SNS API. The live topic still carries `__default_policy_ID`
 with `Principal {"AWS":"*"}` — **wider** than the committed template, not narrower. An engineer
 verifying a least-privilege topic policy on this endpoint would have verified nothing. Note the
-direction: unlike a resource that fails to deploy, this one fails *open*.
+direction: unlike a resource that fails to deploy, this one fails *open*. **Not closed** — no
+per-service SNS API exists to set a policy CloudFormation was supposed to set, so there is nothing
+to reconcile onto. The tags on this same topic *are* closed, by the mechanism in gap 4 below.
 
 **3. `TreatMissingData` is dropped from the alarm.** Namespace, metric, threshold and alarm action
 all survive; `describe-alarms` reports `TreatMissingData: None`. The one property that decides
 whether the alarm behaves correctly on a metric with routine gaps is the one that did not make it.
 
+**Read closed, behaviour not — and the two must not be conflated.** `cfn-guardrails.sh
+reconcile-cloudwatch` re-`PUT`s the alarm from the template and then *measures*, with a disposable
+probe alarm, whether this CloudWatch can store the property at all. It cannot: a direct
+`put-metric-alarm --treat-missing-data ignore` on a throwaway alarm also reads back `None`, so the
+property is absent from the stored record rather than defaulted. The script reports this as
+**`GAP`, not `FAIL`** — the template is correct and the engine cannot represent it; calling it a
+template failure would be the opposite error. `floci-cost-apis-shim.py`'s `DescribeAlarms` then
+overlays *only* the properties floci accepted and discarded, so a caller reading through the shim
+sees `TreatMissingData: ignore` with `OverlaidFromTemplate: ["TreatMissingData"]` naming the
+substitution — a value floci actually stored is never overwritten, which is what stops this from
+hiding real drift. **What this does not buy:** floci's alarm still evaluates a gappy metric as
+`missing` regardless of what `describe-alarms` reports, so the alarm's firing *behaviour* cannot be
+tested on this engine by any means.
+
 **4. Cost Explorer is not emulable, as distinct from unimplemented.** floci *does* run `ce`, and
 answers correctly — `get-cost-and-usage` grouped by `SERVICE` returns 36 groups with every amount
 `0.0000000000`, and `get-tags` returns `{"Tags": [], "TotalSize": 0}`. An emulator does not bill
-anybody, so there is no spend to report and no activated cost-allocation tag to group by. Unlike
-gaps 1–3, which are provider bugs a later version could fix, this one is structural. Consequently
-`aws resourcegroupstaggingapi get-resources --tag-filters Key=service,Values=taxcalc` returns an
-empty list here too, and the tag-coverage claim rests on the static check rather than on the API.
+anybody, so there is no spend to report and no activated cost-allocation tag to group by. This one
+is **not closed** — it is structural, not a provider bug, and no local shim can invent spend that
+never happened.
 
-## What floci did settle
+What *is* closed is the resource-tagging half that fed into this gap.
+`resourcegroupstaggingapi get-resources` returned an empty list for two compounding reasons: the
+network stack didn't deploy (see below), and even for the cost stack's own SNS topic — which does
+exist — floci's tagging index returns nothing for anything, ever. `cfn-guardrails.sh reconcile-tags`
+applies each resource's declared `Tags`, read from its template, over the per-service APIs that do
+work (`ec2 create-tags`, `rds add-tags-to-resource`, `sns tag-resource`), then **verifies by reading
+back** rather than trusting the write's exit status — floci's `sns tag-resource` stores tags
+correctly and returns a response botocore cannot parse, so the CLI reports failure on a write that
+succeeded. `floci-cost-apis-shim.py`'s `GetResources` then serves a reimplemented index over those
+same live per-service reads:
+
+```
+$ resourcegroupstaggingapi get-resources --tag-filters Key=service,Values=taxcalc (via the shim)
+arn:aws:ec2:us-east-1:000000000000:elastic-ip/54.68.243.147
+arn:aws:ec2:us-east-1:000000000000:natgateway/nat-203670a3ea6ed03ba
+arn:aws:rds:us-east-1:000000000000:db:taxcalc-dev
+arn:aws:sns:us-east-1:000000000000:taxcalc-cost-alarms-dev
+```
+
+This is a genuine **`SHIM`, not a `PASS`, and the two halves are not equally trustworthy.** The
+*tags* are real, live, and change if the underlying resource is retagged or deleted — only the
+*index* over them is stood in for. The Budget projection above is a different kind of thing
+entirely: there the underlying resource does not exist at all. Cost attribution itself — an
+activated tag key feeding a Cost Explorer report — remains unreachable regardless, for the
+structural reason stated above.
+
+## What floci did settle without any workaround
 
 The stack creates through the real `create-change-set → describe-change-set → execute-change-set`
 flow, the alarm is real and readable, and the `IsUsEast1` condition was verified **from both
@@ -1473,14 +1541,69 @@ sides**: the same template yields 4 resources in `us-east-1` and 3 in `eu-west-1
 exactly the difference. That is the class of claim an emulator can settle, because it concerns
 template evaluation rather than a service.
 
-## A pre-existing D3 issue, not a D4 regression
+## The network-stack rollback: root-caused and worked around, not a D3 regression
 
-`taxcalc-network-dev` does not currently deploy on this floci: it rolls back with `A security group
-rule must specify exactly one of CidrIp, CidrIpv6, a prefix list, or a security group` on
-`TaxcalcAppSecurityGroup`. **The W6 D4 diff to that template is tag lines only**, and an A/B
-confirms it — the template as it stood before this deliverable fails identically on the same
-endpoint. Recorded here rather than fixed, because chasing a D3 stack regression inside a D4
-deliverable would bury both.
+`taxcalc-network-dev` previously rolled back on this floci with `A security group rule must specify
+exactly one of CidrIp, CidrIpv6, a prefix list, or a security group` on `TaxcalcAppSecurityGroup`.
+**The W6 D4 diff to that template was tag lines only**, and an A/B confirmed the template as it
+stood before this deliverable failed identically — so this was never a D4 regression.
+
+**The actual cause: floci does not evaluate `Fn::If` when it is an element of a list**, as opposed
+to the value of a property. Isolated with a two-resource probe stack — one security group with a
+plain list of egress rules (`CREATE_COMPLETE`), one identical except for one `!If`-conditioned rule
+appended to the same list (`CREATE_FAILED`, with neither a CIDR nor a group id, because the rejected
+rule is *still* the literal mapping `{"Fn::If": [...]}` — the intrinsic was never evaluated). Real
+CloudFormation evaluates it, which is why `cfn-lint` is clean and the committed template is correct
+exactly as it stands.
+
+`cfn-resolve-if.rb` collapses **only** list-positioned `Fn::If` nodes, evaluated from the template's
+own `Conditions` block against its actual parameter values — never guessed, and refusing outright
+if a condition depends on a parameter with no override and no `Default`. Every other intrinsic
+(`Ref`, `Fn::Sub`, `Fn::GetAtt`, resource-level `Condition:` keys, property-positioned `Fn::If`)
+passes through untouched, because floci handles those correctly and pre-resolving them here would
+hide it if that ever stopped being true. Its output is a throwaway JSON body for one emulator
+deploy — never a second source of truth for the template — and it says so in its own banner.
+`taxcalc-network-dev` now reaches `CREATE_COMPLETE` through it for the first time on this endpoint;
+`taxcalc-app-dev` has no list-positioned `Fn::If` at all (the script exits 3 and says to deploy the
+committed file directly).
+
+## A second floci bug, found while exercising the update path
+
+Task 1 also calls for redeploying with an UPDATE ChangeSet. Doing that properly — baseline the
+pre-tag template, then ChangeSet to the committed one — surfaced a second, unrelated floci defect:
+**the plan is right and the execution is wrong.** `describe-change-set` correctly reports
+`Modify DbInstance … Replacement: False`, one resource, tags only. `execute-change-set` then failed
+on `DbMasterSecret`, a resource the ChangeSet never listed, with `A secret with the name
+taxcalc/dev/db-master already exists.`
+
+A four-resource probe stack isolated it further: floci's update path **iterates every resource in
+the template rather than the change set's change list**, and implements several update handlers as
+create. It aborted on the first non-idempotent one (`CreateSecret` throws on a name collision;
+`CreateTopic`/`CreateBucket` on an existing name are idempotent and silently succeed) — so the
+*planned* change was never reached at all. A template of purely idempotent resource types would
+"update" green while silently re-creating everything in it.
+
+`cfn-guardrails.sh guard-update <stack>` always produces the plan (failing outright on any
+`Replacement: True`), then **probes** — with a disposable stack, not an assumption — whether this
+endpoint's execution honours it. Not honoured → refuses to execute (leaving the stack healthy
+rather than in `UPDATE_ROLLBACK_COMPLETE`) and names the deliberate follow-up instead
+(`reconcile-tags`, for a tag-only change). Honoured → executes normally, so the identical command is
+correct against real AWS. It also treats a no-op change set as a `PASS` rather than a `FAIL` — real
+CloudFormation rejects a no-op outright, floci instead returns `CREATE_COMPLETE` with an empty
+`Changes` list, which would otherwise read as "nothing replaced" and say nothing about what actually
+happened.
+
+## Four things still only a real account can establish
+
+Every workaround above changes what can be **read** through the emulator; none changes what its
+infrastructure **does**. Nothing here shims around this list, and nothing should:
+
+| still unverifiable on floci | why no local workaround reaches it |
+|---|---|
+| the Budget exists and would notify | there is no budget to read; the shim projects the template, not a resource |
+| the SNS `TopicPolicy` takes effect | floci drops it entirely and leaves the topic **wider** than committed |
+| the alarm's firing behaviour on a gappy metric | floci evaluates a gap as `missing` regardless of what `describe-alarms` reports |
+| tag-scoped cost attribution in Cost Explorer | an emulator bills nobody, so no tag key is ever activated |
 
 ## CI
 
