@@ -12,14 +12,26 @@ base/                              W5 D3 manifests, copied verbatim, identical i
   05-dev-dependencies.yaml         postgres / redis / mongo Deployments + Services
   10-taxcalc-api.deployment.yaml
   20-taxcalc-api.service.yaml
+  06-kafka.yaml                    W6 D5 - a REAL KRaft broker; W5 D3 shipped a DNS placeholder
+  10-taxcalc-api.deployment.yaml
+  12-taxcalc-worker.deployment.yaml      W6 D5 - the KEDA scale target (same image, worker profile)
+  13-taxcalc-worker-scaledobject.yaml    W6 D5 - KEDA on taxpayers.events consumer-group lag
   30-taxcalc-api.configmap.yaml
-  50-taxcalc-api.hpa.yaml
+  50-taxcalc-api.hpa.yaml          W6 D5 - now on taxcalc_inflight_requests, no longer on CPU
+  55-taxcalc-api.pdb.yaml          W6 D5 - minAvailable 2, paired with the HPA floor
   60-taxcalc-api.ingress.yaml
   70-taxcalc-api.servicemonitor.yaml
+  prometheus-adapter-values.yaml   W6 D5 - Helm VALUES, not a manifest; the rule the HPA reads
 overlays/
   dev/kustomization.yaml           namespace + replicas + image tag + Spring profile + log level + host
+  loadtest/kustomization.yaml      W6 D5 - applied by hand for a k6 run; NOT in the ApplicationSet
   staging/kustomization.yaml
   prod/kustomization.yaml
+aws-authored/                      W6 D5 - AUTHOR-AND-DEFEND. Never applied to k3d; each file
+  karpenter-nodepool.yaml          says why it cannot run here.
+  adot-collector.yaml
+  taxcalc-worker-scaledobject.sqs.yaml
+  cfn/taxcalc-observability-dev.yaml
 argocd/
   projects/taxcalc.yaml            AppProject: the four allow-lists, syncWindows, two RBAC roles
   applications/taxcalc-api-dev.yaml        the dev anchor Application (documentation once the
@@ -40,6 +52,41 @@ cfn/                               W6 D3 - the AWS substrate everything above ru
 taxcalc-api/
   INFRA.md                         the substrate write-up - stacks, ordering, ChangeSets, drift
 ```
+
+## W6 D5 — two autoscalers, and the one that is only as big as the quota
+
+`base/` gains a real Kafka broker, a worker Deployment, a KEDA `ScaledObject` on consumer-group
+lag, a `PodDisruptionBudget`, and an HPA that no longer scales on CPU. Measured on k3d: KEDA drove
+the worker `0 → 7 → 0` on 60,000 synthetic records, and the HPA logged
+`SuccessfulRescale … New size: 10`.
+
+**The api Deployment stops consuming `taxcalc-read-model-builder`, and that one env var is the
+load-bearing change here.** Lag is a property of a consumer group, not of a Deployment. The api
+runs the same image as the worker, so once a real broker existed the api pods drained the very lag
+KEDA scales the worker on — and two or three of them keep a dev-rate topic at zero however much is
+produced. The ScaledObject stays `READY=True`, the trigger is valid, the read model *is* updated by
+the wrong pods, and the worker simply never leaves `minReplicaCount: 0`.
+
+**The HPA scaled to 10 and got 2, and the reason is in `platform/00-namespaces.yaml`.** The
+ReplicaSet was refused with `exceeded quota: requested: limits.cpu=500m, used: limits.cpu=8`. No
+container in `base/` declares `limits.cpu` — W5 D3 omitted it on purpose to avoid CFS throttling —
+so that 500m is the LimitRange's `default` applied at admission. Every pod spends 500m of an 8-CPU
+quota, the namespace tops out near sixteen pods across all workloads, and `maxReplicas: 20` is
+unreachable by a factor of five. The HPA reports success, the Deployment reports `2/10` forever,
+and the only trace is a ReplicaSet event. An autoscaler's maximum is a request; the quota is the
+answer.
+
+`prometheus-adapter-values.yaml` is a Helm values file and is deliberately **not** in
+`base/kustomization.yaml`'s `resources` — the adapter is cluster infrastructure, but the *rule* is
+application-specific, and separating the rule from the HPA that reads it is how the two drift into
+naming different metrics.
+
+`overlays/loadtest/` is applied by hand for the duration of a k6 run and is deliberately not wired
+into the ApplicationSet: an environment Argo CD reconciles is one that can be left switched on by
+accident.
+
+`aws-authored/` is written and reviewed, never deployed. The full defence is in the application
+repo's [`SRE-CAPSTONE.md`](https://github.com/AI-Native-2026-07-29-Intuit/arush-adabala-tax-liability/blob/main/SRE-CAPSTONE.md).
 
 ## The reconcile loop
 
