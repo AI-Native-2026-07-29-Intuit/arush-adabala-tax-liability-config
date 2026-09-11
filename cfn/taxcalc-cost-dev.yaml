@@ -309,10 +309,19 @@ Resources:
   CostUsageReport:
     Type: AWS::CUR::ReportDefinition
     Condition: IsUsEast1
-    DeletionPolicy: Retain
     # Retain, because deleting the definition orphans the delivered objects in
     # S3 while removing the only record of what produced them. The bucket's own
     # lifecycle rule is what ages them out.
+    #
+    # UpdateReplacePolicy is set alongside DeletionPolicy, and the pair is the
+    # point: DeletionPolicy alone covers stack DELETE but not the replacement
+    # half of an UPDATE, so a property change that forces a new resource would
+    # still discard the old definition and its delivery history - the exact
+    # loss Retain was chosen to prevent, on the path nobody tests. cfn-lint
+    # W3011 flags the mismatch, and this is one of the three quirks the
+    # cost-author skill names in its own non-negotiables.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       ReportName: !Sub "taxcalc-cost-${EnvName}"
       TimeUnit: DAILY
