@@ -1,4 +1,4 @@
-# manifests/60-taxcalc-api.ingress.yaml - external reach.
+# k8s/taxcalc-api/taxcalc-api.ingress.yaml - external reach.
 # ingress-nginx is the cluster's Ingress controller (manifests/05-dev-
 # dependencies.yaml's header note doesn't cover it - it's deployed
 # separately, see the README's Week 5 Day 3 section for how). The k3d

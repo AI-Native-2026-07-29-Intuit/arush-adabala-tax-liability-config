@@ -1,4 +1,4 @@
-# manifests/10-taxcalc-api.deployment.yaml - the workload.
+# k8s/taxcalc-api/taxcalc-api.deployment.yaml - the workload.
 # Pin the image by tag (NOT a moving label); set zero-downtime rollout
 # defaults; use the three-probe pattern from Topic 7; surface the
 # non-root UID from the W5 D1 distroless image; wire envFrom both the
@@ -68,7 +68,7 @@ spec:
             # clean.
             #
             # Until W6 D5 this was harmless because W5 D3 deployed no broker at
-            # all. base/06-kafka.yaml changes that, which is what makes this
+            # all. k8s/taxcalc-api/kafka.yaml changes that, which is what makes this
             # line load-bearing from today.
             - name:  TAXCALC_READ_MODEL_LISTENER_ENABLED
               value: "false"

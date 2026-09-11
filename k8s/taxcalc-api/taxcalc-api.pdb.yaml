@@ -1,4 +1,4 @@
-# base/55-taxcalc-api.pdb.yaml - the availability floor (W6 D5 Task 2, RUNNABLE).
+# k8s/taxcalc-api/taxcalc-api.pdb.yaml - the availability floor (W6 D5 Task 2, RUNNABLE).
 #
 # A PodDisruptionBudget constrains VOLUNTARY disruptions only. That distinction is the whole
 # point of the object and is the thing most often misread:
@@ -18,7 +18,7 @@
 #
 # minAvailable: 2, PAIRED WITH THE HPA's minReplicas
 #
-# The two numbers in 50-taxcalc-api.hpa.yaml and this file move together, and both directions of
+# The two numbers in taxcalc-api.hpa.yaml and this file move together, and both directions of
 # mismatch are bugs:
 #
 #   PDB floor ABOVE the HPA floor - unsatisfiable at rest. Once the HPA scales to its minimum,

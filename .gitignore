@@ -3,6 +3,6 @@
 /rendered/
 *.rendered.yaml
 
-# A locally-materialised Secret must never reach Git. base/40-taxcalc-api.secret.yaml
+# A locally-materialised Secret must never reach Git. k8s/taxcalc-api/taxcalc-api.secret.yaml
 # carries a placeholder; real values come from a secrets manager (W6 D3: ESO).
 *.secret.local.yaml

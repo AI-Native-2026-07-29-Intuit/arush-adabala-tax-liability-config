@@ -28,7 +28,7 @@
 # same document. Interruption costs latency, not correctness.
 #
 # The api is the workload that makes On-Demand necessary. A Spot reclaim is an INVOLUNTARY
-# disruption, and the PodDisruptionBudget in base/55-taxcalc-api.pdb.yaml does not apply to it -
+# disruption, and the PodDisruptionBudget in k8s/taxcalc-api/taxcalc-api.pdb.yaml does not apply to it -
 # AWS sends a two-minute notice and takes the instance regardless of what any budget says. A
 # service whose floor is "two serving pods" cannot have that floor guaranteed by Spot alone.
 #
@@ -74,12 +74,12 @@ spec:
     # half-empty ones.
     #
     # Repacking is a VOLUNTARY disruption, so it goes through the Eviction API and the api's PDB
-    # is consulted. That is exactly the interaction base/55-taxcalc-api.pdb.yaml exists for: this
+    # is consulted. That is exactly the interaction k8s/taxcalc-api/taxcalc-api.pdb.yaml exists for: this
     # policy is the routine, automated, every-few-minutes source of drains in a production
     # cluster, and without the PDB it would happily take the api to one replica mid-repack.
     consolidationPolicy: WhenEmptyOrUnderutilized
     # 600s, in lockstep with the HPA's scaleDown.stabilizationWindowSeconds in
-    # base/50-taxcalc-api.hpa.yaml.
+    # k8s/taxcalc-api/taxcalc-api.hpa.yaml.
     #
     # These two numbers are a pair and the failure when they disagree is expensive in both
     # directions. Shorter here than the HPA window: Karpenter removes a node during the HPA's

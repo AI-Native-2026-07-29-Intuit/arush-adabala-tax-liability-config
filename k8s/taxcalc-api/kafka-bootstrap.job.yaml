@@ -1,4 +1,4 @@
-# base/07-kafka-bootstrap.job.yaml - make a FRESH deploy's at-rest state the
+# k8s/taxcalc-api/kafka-bootstrap.job.yaml - make a FRESH deploy's at-rest state the
 # at-rest state the deliverable describes (W6 D5 Task 1).
 #
 # THE PROBLEM THIS SOLVES
@@ -100,7 +100,7 @@ spec:
         - name: bootstrap
           # The same image as the broker, for the CLI tools rather than the
           # server. Pinned identically: these are JVM tools, so the arm64 SIGILL
-          # documented in 06-kafka.yaml applies to them exactly as it does to
+          # documented in kafka.yaml applies to them exactly as it does to
           # the broker, and KAFKA_OPTS below is load-bearing on this VM.
           image: apache/kafka:3.9.1
           imagePullPolicy: IfNotPresent

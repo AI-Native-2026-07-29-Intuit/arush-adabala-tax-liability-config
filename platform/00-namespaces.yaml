@@ -1,7 +1,7 @@
 # platform/00-namespaces.yaml - the three destination namespaces, plus the
 # quota knobs that bound them.
 #
-# NOT part of base/ and NOT synced by Argo CD, deliberately. The AppProject
+# NOT part of k8s/taxcalc-api/ and NOT synced by Argo CD, deliberately. The AppProject
 # (argocd/projects/taxcalc.yaml) denies all three kinds to the taxcalc team:
 #
 #   Namespace      cluster-scoped, and `clusterResourceWhitelist: []` is a

@@ -56,7 +56,7 @@ spec:
   # whitelist is a full deny, and it is what stops a compromised config repo
   # from smuggling in a privileged DaemonSet or a cluster-admin binding.
   #
-  # This is also why base/ carries no Namespace object: Namespace is
+  # This is also why k8s/taxcalc-api/ carries no Namespace object: Namespace is
   # cluster-scoped, so it is governed by THIS list and not by the
   # namespaceResourceWhitelist below.
   #
@@ -81,7 +81,7 @@ spec:
   # use. Anything else is denied.
   #
   # Ingress is on this list and is NOT in the reference layout's: the W5 D3
-  # manifest set contains one (manifests/60-taxcalc-api.ingress.yaml), so
+  # manifest set contains one (k8s/taxcalc-api/taxcalc-api.ingress.yaml), so
   # omitting it would deny a resource this project's own base ships. An
   # allow-list has to match the manifests it governs or the first sync fails.
   #

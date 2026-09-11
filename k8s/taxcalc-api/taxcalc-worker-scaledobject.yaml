@@ -1,4 +1,4 @@
-# base/13-taxcalc-worker-scaledobject.yaml - KEDA on Kafka lag (W6 D5 Task 1, RUNNABLE on k3d).
+# k8s/taxcalc-api/taxcalc-worker-scaledobject.yaml - KEDA on Kafka lag (W6 D5 Task 1, RUNNABLE on k3d).
 #
 # KEDA scales taxcalc-api-worker on the consumer-group lag of
 # taxcalc-read-model-builder against taxpayers.events - the W3 D3 group and the
@@ -44,7 +44,7 @@
 #
 #   maxReplicaCount: 20   The blast-radius cap. Note the REAL ceiling is lower:
 #                         a consumer group cannot have more useful members than
-#                         the topic has partitions, and base/06-kafka.yaml sets
+#                         the topic has partitions, and k8s/taxcalc-api/kafka.yaml sets
 #                         12. KEDA will not exceed the partition count no
 #                         matter what this says, so an observed peak of ~12-15
 #                         is the system working, not the limit being missed.

@@ -1,4 +1,4 @@
-# base/12-taxcalc-worker.deployment.yaml - the KEDA scale target (W6 D5 Task 1).
+# k8s/taxcalc-api/taxcalc-worker.deployment.yaml - the KEDA scale target (W6 D5 Task 1).
 #
 # The SAME image as taxcalc-api, run with SPRING_PROFILES_ACTIVE=k8s,worker:
 # no HTTP server, consumes taxpayers.events on consumer group

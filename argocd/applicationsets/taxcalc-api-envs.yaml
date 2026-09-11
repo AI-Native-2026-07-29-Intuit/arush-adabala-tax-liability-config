@@ -107,7 +107,7 @@ spec:
       # list takes its whole workload with it.
       annotations:
         # Sync-wave on the generated APPLICATION - a different axis from the
-        # sync-waves inside base/kustomization.yaml. This one orders the three
+        # sync-waves inside k8s/taxcalc-api/kustomization.yaml. This one orders the three
         # Applications against each other so a single sync of the whole set
         # lands dev before staging before prod. The waves inside the manifest
         # set order resources within ONE Application (ConfigMap and the data
@@ -163,7 +163,7 @@ spec:
       # selfHeal and the HPA overwrite each other forever.
       #
       # The worker entry is separate because the ignore is scoped by name: the
-      # api entry does NOT cover taxcalc-api-worker, and base/12 declaring
+      # api entry does NOT cover taxcalc-api-worker, and taxcalc-worker.deployment.yaml declaring
       # `replicas: 0` would fight KEDA's generated HPA without this.
       ignoreDifferences:
         - group: apps

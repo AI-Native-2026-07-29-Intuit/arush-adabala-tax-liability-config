@@ -9,7 +9,7 @@ apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
 resources:
-  - ../../base
+  - ../../k8s/taxcalc-api
 
 namespace: taxcalc-staging
 
@@ -37,7 +37,7 @@ patches:
 
   # HPA floor, patched per env to MATCH the replica count above.
   #
-  # base/50-taxcalc-api.hpa.yaml sets minReplicas: 2 for every environment,
+  # k8s/taxcalc-api/taxcalc-api.hpa.yaml sets minReplicas: 2 for every environment,
   # which silently overrides `replicas:` here: the HPA scales the Deployment
   # back up to its own floor within a reconcile, and because
   # Deployment.spec.replicas is in ignoreDifferences, Argo CD reports Synced

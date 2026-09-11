@@ -7,14 +7,14 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
-# The unchanged W5 D3 manifests, copied verbatim into base/. Identical across
+# The unchanged W5 D3 manifests, copied verbatim into k8s/taxcalc-api/. Identical across
 # every environment - if a change belongs in all three, it belongs there.
 resources:
-  - ../../base
+  - ../../k8s/taxcalc-api
 
 # Per-env namespace. Kustomize rewrites every resource's metadata.namespace at
 # build time, so the base files' own `namespace: taxcalc-dev` lines are
-# overwritten rather than respected - which is why base/ can stay a verbatim
+# overwritten rather than respected - which is why k8s/taxcalc-api/ can stay a verbatim
 # copy of the W5 D3 originals instead of being stripped of them.
 namespace: taxcalc-dev
 
@@ -72,7 +72,7 @@ images:
 
 # Per-env replica count. dev runs hot at one replica.
 #
-# The HPA in base/ has minReplicas: 2, so it will scale this back up to 2
+# The HPA in k8s/taxcalc-api/ has minReplicas: 2, so it will scale this back up to 2
 # within a reconcile - and because the Application sets selfHeal: true, Argo
 # CD would then fight the HPA over the same field forever. `Deployment.spec
 # .replicas` is therefore in ignoreDifferences on every generated Application
@@ -111,7 +111,7 @@ patches:
   # the k3d cluster, so the host header is the only thing separating them.
   # HPA floor, patched per env to MATCH the replica count above.
   #
-  # base/50-taxcalc-api.hpa.yaml sets minReplicas: 2 for every environment,
+  # k8s/taxcalc-api/taxcalc-api.hpa.yaml sets minReplicas: 2 for every environment,
   # which silently overrides `replicas:` here: the HPA scales the Deployment
   # back up to its own floor within a reconcile, and because
   # Deployment.spec.replicas is in ignoreDifferences, Argo CD reports Synced
@@ -124,8 +124,8 @@ patches:
   # W6 D5 Task 2: the floor moves BACK UP to 2, and the `replicas: 1` above with it.
   #
   # The note above describes aligning the HPA floor with dev's single replica so Git and the HPA
-  # agreed at rest. That reasoning was right and its conclusion is now wrong, because 55-taxcalc
-  # -api.pdb.yaml introduces a third party: a PodDisruptionBudget with minAvailable: 2.
+  # agreed at rest. That reasoning was right and its conclusion is now wrong, because
+  # taxcalc-api.pdb.yaml introduces a third party: a PodDisruptionBudget with minAvailable: 2.
   #
   # A PDB floor above the HPA floor is unsatisfiable at rest. At one replica, allowed disruptions
   # pins at 0 and `kubectl drain` on the node holding that pod hangs indefinitely - not with an
@@ -134,7 +134,7 @@ patches:
   # exactly that path, so this is not hypothetical.
   #
   # So dev runs two replicas now. That is the cost of having a disruption budget that means
-  # something, and it is the same number base/ and the PDB already agree on.
+  # something, and it is the same number k8s/taxcalc-api/ and the PDB already agree on.
   - target: { kind: HorizontalPodAutoscaler, name: taxcalc-api }
     patch: |
       - op: replace

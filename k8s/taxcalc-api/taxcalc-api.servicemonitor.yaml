@@ -1,4 +1,7 @@
-# manifests/observability/taxcalc-api-servicemonitor.yaml
+# k8s/taxcalc-api/taxcalc-api.servicemonitor.yaml
+#
+# Authored on W5 D5 as manifests/observability/taxcalc-api-servicemonitor.yaml in the application
+# repo, which is still where that copy lives; this is the one Argo CD syncs.
 #
 # A ServiceMonitor is the Prometheus Operator's way of saying "scrape every Pod behind this
 # Service, at this path, this often". The Operator watches these objects and rewrites the
@@ -20,7 +23,7 @@ metadata:
 spec:
   selector:
     matchLabels:
-      # Matches the Service authored on W5 D3 (manifests/20-taxcalc-api.service.yaml).
+      # Matches the Service authored on W5 D3 (k8s/taxcalc-api/taxcalc-api.service.yaml).
       app.kubernetes.io/name: taxcalc-api
   namespaceSelector:
     matchNames: [taxcalc-dev]

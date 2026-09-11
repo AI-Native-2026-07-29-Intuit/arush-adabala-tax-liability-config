@@ -1,4 +1,4 @@
-# base/50-taxcalc-api.hpa.yaml - SLO-derived HPA on a custom metric (W6 D5 Task 2, RUNNABLE).
+# k8s/taxcalc-api/taxcalc-api.hpa.yaml - SLO-derived HPA on a custom metric (W6 D5 Task 2, RUNNABLE).
 #
 # WHAT CHANGED TODAY, AND WHY THE OLD VERSION WAS WORSE THAN IT LOOKED
 #
@@ -67,7 +67,7 @@ spec:
     kind:       Deployment
     name:       taxcalc-api
   # Paired with the PodDisruptionBudget's minAvailable in
-  # 55-taxcalc-api.pdb.yaml. The two numbers move together: a PDB floor ABOVE
+  # taxcalc-api.pdb.yaml. The two numbers move together: a PDB floor ABOVE
   # the HPA floor can never be satisfied once the HPA scales to its minimum
   # (allowed disruptions pins at 0 and node drains hang forever), and a PDB
   # floor BELOW it does not protect the availability the HPA floor exists for.

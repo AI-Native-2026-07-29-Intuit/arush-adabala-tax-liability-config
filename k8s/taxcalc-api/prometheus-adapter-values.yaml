@@ -1,12 +1,12 @@
-# base/prometheus-adapter-values.yaml - Helm values for prometheus-adapter (W6 D5 Task 2).
+# k8s/taxcalc-api/prometheus-adapter-values.yaml - Helm values for prometheus-adapter (W6 D5 Task 2).
 #
-# NOT a Kubernetes manifest and deliberately NOT in base/kustomization.yaml's `resources`. This
+# NOT a Kubernetes manifest and deliberately NOT in k8s/taxcalc-api/kustomization.yaml's `resources`. This
 # is a Helm values file for a CLUSTER-INFRASTRUCTURE component, installed once per cluster
 # alongside kube-prometheus-stack:
 #
 #   helm upgrade --install prom-adapter prometheus-community/prometheus-adapter \
 #     --version 5.3.0 --namespace monitoring \
-#     -f base/prometheus-adapter-values.yaml
+#     -f k8s/taxcalc-api/prometheus-adapter-values.yaml
 #
 # It lives in this repo, next to the HPA that depends on it, because the RULE below is
 # application-specific even though the component is not: nothing else in the cluster knows or

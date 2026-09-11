@@ -1,8 +1,8 @@
-# base/06-kafka.yaml - a REAL single-node Kafka broker (W6 D5 Task 1).
+# k8s/taxcalc-api/kafka.yaml - a REAL single-node Kafka broker (W6 D5 Task 1).
 #
 # WHY THIS FILE DID NOT EXIST UNTIL TODAY, AND WHY IT HAS TO NOW
 #
-# W5 D3 deliberately shipped no broker. 05-dev-dependencies.yaml carried a bare
+# W5 D3 deliberately shipped no broker. dev-dependencies.yaml carried a bare
 # `kafka` Service with a selector matching nothing, because the only thing the
 # application needed from Kafka at boot was for the bootstrap hostname to
 # RESOLVE - KafkaConsumer's constructor does a synchronous DNS lookup and kills

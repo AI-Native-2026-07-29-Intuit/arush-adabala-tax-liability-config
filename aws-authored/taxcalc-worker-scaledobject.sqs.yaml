@@ -2,7 +2,7 @@
 #
 # AUTHOR-AND-DEFEND. NEVER `kubectl apply` THIS TO k3d.
 #
-# This is the production form of base/13-taxcalc-worker-scaledobject.yaml's trigger. On a managed
+# This is the production form of k8s/taxcalc-api/taxcalc-worker-scaledobject.yaml's trigger. On a managed
 # cluster the worker scales on SQS queue depth instead of Kafka consumer-group lag, and the
 # interesting part is not the scaler swap - it is WHERE THE CREDENTIAL LIVES.
 #
@@ -39,7 +39,7 @@
 # queueLength IS THE SAME CEIL MATH AS lagThreshold
 # ---------------------------------------------------------------------------------------------
 # queueLength: "10" means 10 messages per pod, so 73 messages scales to ceil(73/10) = 8 pods -
-# identical arithmetic to base/13's lagThreshold: "10". The two files are worth reading side by
+# identical arithmetic to taxcalc-worker-scaledobject.yaml's lagThreshold: "10". The two files are worth reading side by
 # side precisely because only the SIGNAL changes; the scaling behaviour does not.
 #
 # One real difference: SQS's ApproximateNumberOfMessages does NOT include in-flight messages
