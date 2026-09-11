@@ -48,6 +48,7 @@ kind: Kustomization
 resources:
   - 05-dev-dependencies.yaml
   - 06-kafka.yaml                          # W6 D5 Task 1: a real broker, at last
+  - 07-kafka-bootstrap.job.yaml            # W6 D5 Task 1: seeds the group offset so a FRESH deploy rests at 0/0
   - 10-taxcalc-api.deployment.yaml
   - 12-taxcalc-worker.deployment.yaml      # W6 D5 Task 1: the KEDA scale target
   - 13-taxcalc-worker-scaledobject.yaml    # W6 D5 Task 1: KEDA on Kafka lag

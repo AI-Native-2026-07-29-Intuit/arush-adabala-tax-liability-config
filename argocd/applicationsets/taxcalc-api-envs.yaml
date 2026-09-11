@@ -161,9 +161,18 @@ spec:
       # overlay sets the replica count the Deployment is created with, the
       # HorizontalPodAutoscaler owns it afterwards, and without this ignore
       # selfHeal and the HPA overwrite each other forever.
+      #
+      # The worker entry is separate because the ignore is scoped by name: the
+      # api entry does NOT cover taxcalc-api-worker, and base/12 declaring
+      # `replicas: 0` would fight KEDA's generated HPA without this.
       ignoreDifferences:
         - group: apps
           kind:  Deployment
           name:  taxcalc-api
+          jsonPointers:
+            - /spec/replicas
+        - group: apps
+          kind:  Deployment
+          name:  taxcalc-api-worker
           jsonPointers:
             - /spec/replicas

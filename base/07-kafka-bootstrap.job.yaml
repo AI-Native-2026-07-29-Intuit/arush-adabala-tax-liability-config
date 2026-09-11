@@ -1,0 +1,160 @@
+# base/07-kafka-bootstrap.job.yaml - make a FRESH deploy's at-rest state the
+# at-rest state the deliverable describes (W6 D5 Task 1).
+#
+# THE PROBLEM THIS SOLVES
+#
+# Task 1's Done-When asks for `READY True, ACTIVE False` and a worker at `0/0`
+# at rest. On a cluster that has already run a spike, that is exactly what you
+# get. On a FRESHLY deployed one it is not, and the reason is not a mistake in
+# either the ScaledObject or the worker:
+#
+# A consumer group that has never committed has no offset to subtract from, so
+# the kafka scaler cannot compute lag at all. It does not report zero - it
+# reports an INVALID offset, and its default `scaleToZeroOnInvalidOffset:
+# false` then deliberately holds the Deployment at ONE replica rather than
+# zero. The reasoning is sound: scaling to zero on an invalid offset would mean
+# nothing ever joins the group, nothing ever commits, and the offset stays
+# invalid forever - the autoscaler would have wedged itself shut.
+#
+# So a brand-new deployment sits at 1 replica with ACTIVE=True against a
+# completely empty topic, which reads exactly like "KEDA thinks there is work
+# when there is none". Producing once fixes it permanently, because the group
+# commits and the offsets become valid from then on.
+#
+# WHY SEED THE OFFSET RATHER THAN FLIP THE FLAG
+#
+# The one-line alternative is `scaleToZeroOnInvalidOffset: "true"` on the
+# trigger. It makes the symptom disappear and replaces it with a worse bug:
+# with an invalid offset AND permission to scale to zero, the Deployment goes
+# to zero, no member ever joins, no offset is ever committed, and the offset is
+# invalid forever. The worker never starts, whatever is produced. The scaler's
+# default is protecting against precisely the thing that flag would cause, and
+# a manifest that overrides a safety default to make a status column look right
+# is the kind of fix that is discovered during an incident.
+#
+# Seeding attacks the actual cause. `--reset-offsets --to-latest` on a group
+# with no members writes a committed offset equal to the log-end offset, which
+# is byte-for-byte the position the application's own
+# `auto-offset-reset: latest` would have chosen on first poll. Nothing is
+# skipped that would otherwise have been read, and nothing is replayed. The
+# only difference is that the position is now WRITTEN DOWN, so the scaler can
+# subtract it and gets 0 - a real zero lag, from real offsets.
+#
+# IDEMPOTENT, AND THE GUARD IS NOT DECORATION
+#
+# As a `Sync` hook with `BeforeHookCreation`, this runs on EVERY Argo CD sync,
+# including every image bump for the rest of the service's life. An
+# unconditional reset would therefore be catastrophic twice over: it would
+# rewind or skip a live group's position on every deploy, and
+# `--reset-offsets --execute` REFUSES outright on a group with active members,
+# so it would fail the hook and fail the sync whenever the worker happened to
+# be scaled up. The `--list` guard means this does real work exactly once per
+# cluster and is a sub-second no-op forever after.
+#
+# `--list` is the right probe because a group appears in it as soon as it has
+# committed offsets or active members, and not before - which is the same
+# condition the scaler cares about.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kafka-bootstrap
+  namespace: taxcalc-dev
+  labels:
+    app.kubernetes.io/name:      kafka-bootstrap
+    app.kubernetes.io/component: bootstrap
+    app.kubernetes.io/part-of:   taxcalc
+  annotations:
+    # Wave 0: after the broker (wave -1, with the other backing stores) and
+    # before the ScaledObject (wave 1). The ordering is the whole point - the
+    # committed offset has to exist before KEDA's first poll, or the fresh
+    # deployment passes through the 1-replica invalid-offset state this file
+    # exists to prevent.
+    argocd.argoproj.io/sync-wave: "0"
+    # A plain resource would be immutable on the second apply: a Job's
+    # spec.template cannot be changed in place, so editing the script below
+    # would make every later sync fail with "field is immutable". A Sync hook
+    # with BeforeHookCreation is deleted and recreated each time instead, and
+    # Argo CD still waits for it to succeed before advancing the wave.
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  # The guard makes a retry safe, and one retry covers the realistic failure:
+  # the broker accepting TCP on 9092 a moment before its metadata is queryable.
+  backoffLimit: 3
+  # Keep the pod around long enough to read its logs after a sync, then let it
+  # go. Without this, completed bootstrap Jobs accumulate one per deploy.
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name:      kafka-bootstrap
+        app.kubernetes.io/component: bootstrap
+        app.kubernetes.io/part-of:   taxcalc
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser:    1000
+        runAsGroup:   1000
+      containers:
+        - name: bootstrap
+          # The same image as the broker, for the CLI tools rather than the
+          # server. Pinned identically: these are JVM tools, so the arm64 SIGILL
+          # documented in 06-kafka.yaml applies to them exactly as it does to
+          # the broker, and KAFKA_OPTS below is load-bearing on this VM.
+          image: apache/kafka:3.9.1
+          imagePullPolicy: IfNotPresent
+          env:
+            - { name: KAFKA_OPTS, value: "-XX:UseSVE=0" }
+            - { name: BROKER,     value: "kafka.taxcalc-dev.svc.cluster.local:9092" }
+            - { name: TOPIC,      value: "taxpayers.events" }
+            - { name: GROUP,      value: "taxcalc-read-model-builder" }
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              BIN=/opt/kafka/bin
+
+              # Wave -1 waits for the broker Deployment to be HEALTHY, which
+              # means its tcpSocket readiness probe passed - the port is open.
+              # That is a weaker statement than "metadata requests succeed", so
+              # this waits for the stronger one rather than assuming it.
+              echo "waiting for ${BROKER} to answer metadata requests"
+              for _ in $(seq 1 60); do
+                if "${BIN}"/kafka-broker-api-versions.sh \
+                     --bootstrap-server "${BROKER}" >/dev/null 2>&1; then
+                  break
+                fi
+                sleep 2
+              done
+
+              # Explicit creation rather than relying on
+              # KAFKA_AUTO_CREATE_TOPICS_ENABLE. Auto-creation happens on first
+              # PRODUCE, which is after KEDA's first poll - and a scaler asked
+              # about a topic that does not exist yet is another way to reach an
+              # invalid offset. Creating it here means the topic and its 12
+              # partitions exist before anything reads or writes them.
+              "${BIN}"/kafka-topics.sh --bootstrap-server "${BROKER}" \
+                --create --if-not-exists \
+                --topic "${TOPIC}" --partitions 12 --replication-factor 1
+
+              if "${BIN}"/kafka-consumer-groups.sh --bootstrap-server "${BROKER}" \
+                   --list 2>/dev/null | grep -qx "${GROUP}"; then
+                echo "group ${GROUP} already has committed offsets or live members; nothing to seed"
+                exit 0
+              fi
+
+              echo "seeding ${GROUP} at the log-end offset of ${TOPIC}"
+              "${BIN}"/kafka-consumer-groups.sh --bootstrap-server "${BROKER}" \
+                --group "${GROUP}" --topic "${TOPIC}" \
+                --reset-offsets --to-latest --execute
+
+              # Print what the scaler will now read. On a fresh cluster every
+              # partition shows CURRENT-OFFSET 0, LOG-END-OFFSET 0, LAG 0 -
+              # valid offsets and genuinely zero lag, which is the
+              # READY=True/ACTIVE=False/0-0 at-rest state Task 1 asks for.
+              "${BIN}"/kafka-consumer-groups.sh --bootstrap-server "${BROKER}" \
+                --describe --group "${GROUP}"
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits:   {            memory: 512Mi }

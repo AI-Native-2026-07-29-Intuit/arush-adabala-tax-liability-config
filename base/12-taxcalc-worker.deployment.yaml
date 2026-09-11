@@ -6,20 +6,41 @@
 # two run modes, so the worker is provably the same bytes as the api rather
 # than a second build that drifts from it.
 #
-# `replicas` IS ABSENT FROM THIS FILE, AND THAT IS THE POINT
+# `replicas: 0` IS STATED, AND THE IGNORE THAT MAKES IT SAFE IS NAMED BELOW
 #
 # KEDA owns the replica count from the moment the ScaledObject is created. It
 # does not set the count itself - it creates a HorizontalPodAutoscaler behind
-# the scenes and that HPA drives spec.replicas. Declaring `replicas: 0` here
-# alongside it is the classic sync war: Argo CD reconciles the field back to
-# the manifest value, the HPA writes it again from lag, and the two fight on
-# every reconcile interval. Omitting the field entirely means Kubernetes
-# defaults it once at creation and never asserts it again.
+# the scenes and that HPA drives spec.replicas. So the danger of declaring the
+# field is the classic sync war: Argo CD's selfHeal reconciles it back to the
+# manifest value, the HPA writes it again from lag, and the two fight on every
+# reconcile interval.
 #
-# The corollary for GitOps: Deployment.spec.replicas is already in
-# ignoreDifferences on every generated Application (see
-# argocd/applicationsets/taxcalc-api-envs.yaml) for exactly this reason on the
-# api side. The same exclusion covers this Deployment.
+# This file previously omitted `replicas` for that reason, and justified it by
+# saying Deployment.spec.replicas was already in ignoreDifferences "on every
+# generated Application". That was not true: both
+# argocd/applications/taxcalc-api-dev.yaml and
+# argocd/applicationsets/taxcalc-api-envs.yaml scope the ignore to
+# `name: taxcalc-api` - deliberately, so a blanket ignore could not hide a real
+# edit to some other Deployment's spec. taxcalc-api-worker was not covered by
+# it, so the omission was load-bearing rather than belt-and-braces, and the
+# comment asserting otherwise was the dangerous part: the next person to add
+# `replicas` on the strength of it would have got the sync war.
+#
+# Both Applications now carry a second, equally narrow ignoreDifferences entry
+# for `name: taxcalc-api-worker` on /spec/replicas. With the ignore actually in
+# place, stating `replicas: 0` is strictly better than omitting it:
+#
+#   - It is what the deliverable asks for, and it says out loud that this
+#     Deployment starts at zero rather than leaving a reader to know that
+#     Kubernetes defaults an absent replicas to 1. An omitted field here reads
+#     as "starts at one" to anyone who has not memorised that default, which is
+#     the opposite of the intent.
+#   - Scale-to-zero is the point of the ScaledObject, so zero is the honest
+#     declared starting state - and Argo CD's diff view showing `0` against a
+#     live `7` under load is informative, not drift.
+#
+# Git owns the value this Deployment is CREATED with. KEDA's HPA owns it from
+# then on, and the ignore is what lets both statements be true at once.
 #
 # NO PROBES, DELIBERATELY
 #
@@ -41,6 +62,10 @@ metadata:
     app.kubernetes.io/part-of:    taxcalc
     app.kubernetes.io/managed-by: argocd
 spec:
+  # Zero, and KEDA owns it from here. Safe to declare only because
+  # /spec/replicas on this exact name is in ignoreDifferences on both
+  # Applications - see the header.
+  replicas: 0
   selector:
     matchLabels:
       app.kubernetes.io/name: taxcalc-api-worker
