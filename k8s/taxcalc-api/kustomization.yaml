@@ -54,7 +54,7 @@
 #                     continuous reconciliation: the first sync wrote the
 #                     placeholder over the real password and every api pod
 #                     started failing Postgres auth. See
-#                     platform/40-taxcalc-api.secret.yaml for the full
+#                     platform/secret/40-taxcalc-api.secret.yaml for the full
 #                     write-up and the out-of-band procedure.
 #
 # All four live under platform/ and are applied out-of-band. See those files'
