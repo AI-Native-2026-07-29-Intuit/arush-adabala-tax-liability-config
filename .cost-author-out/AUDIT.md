@@ -102,8 +102,11 @@ billing one.
 
 ### 3. An AWS Budget created to cap Anthropic spend
 
-No counterpart exists in the tracked gate, so the detector lives in
-`audit.sh` — see the acceptance below, which is about exactly that gap.
+No counterpart existed in the tracked gate when this ran, so the detector lived
+in `audit.sh` — see the acceptance below, which is about exactly that gap. It
+has since been adopted as `cfn-guardrails.sh` **check 7**, so re-running
+`audit.sh` today shows the gate rejecting this one too (16 findings on the
+candidate rather than 15), with `audit.sh`'s own copy kept as a cross-check.
 
 ```
 -- rejection 3, an AWS Budget aimed at non-AWS spend --

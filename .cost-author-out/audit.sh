@@ -17,14 +17,19 @@
 #   2. TreatMissingData: notBreaching on the AWS/Billing alarm
 #   3. an AWS::Budgets::Budget created to cap Anthropic/LLM spend
 #
-# Checks 1 and 2 are delegated to the repo's own tracked gate,
-# scripts/cfn-guardrails.sh --static checks 5 and 6, pointed at the candidate
-# via CFN_DIR. Reusing the real gate rather than reimplementing it is the
-# point: it proves the SHIPPING check catches these, not that this script can.
+# All three are delegated to the repo's own tracked gate,
+# scripts/cfn-guardrails.sh --static checks 5, 6 and 7, pointed at the
+# candidate via CFN_DIR. Reusing the real gate rather than reimplementing it is
+# the point: it proves the SHIPPING check catches these, not that this script
+# can.
 #
-# Check 3 has no counterpart in the tracked gate, because no static rule in
-# this repo has ever needed one. It is implemented here and the audit records
-# that asymmetry rather than papering over it.
+# Check 3 had no counterpart in the tracked gate when this first ran - no
+# static rule in the repo had ever needed one - so it was implemented here and
+# the asymmetry recorded rather than papered over. THAT ASYMMETRY WAS THE
+# PASS'S ONE ACCEPTED FINDING: it is now cfn-guardrails.sh check 7, adopted on
+# w6d4-implementation. The tracked gate rejects all three defects as of that
+# commit, and the local detector below is kept as an independent cross-check -
+# if the two ever disagree, one of them has drifted.
 #
 # The script then re-runs all three against the real cfn/ and requires them to
 # pass, so a green result cannot come from a broken detector.
@@ -45,7 +50,8 @@ green() { printf '\033[32m%s\033[0m\n' "$1"; }
 head_() { printf '\n\033[1m== %s\033[0m\n' "$1"; }
 
 # ---------------------------------------------------------------------------
-# Rejection 3's detector. Not in cfn-guardrails.sh - see the header.
+# Rejection 3's detector, kept as an independent cross-check of check 7 rather
+# than as the only implementation - see the header.
 #
 # BEDROCK IS DELIBERATELY NOT MATCHED. Amazon Bedrock is a hosted model AND
 # AWS-resident spend, so a Bedrock-scoped Budget is legitimate and a detector
@@ -85,7 +91,7 @@ llm_budget_scan() { # dir -> prints offending "file:resource"; returns count
 head_ "Phase 1 - the candidate MUST be rejected on all three"
 # ---------------------------------------------------------------------------
 
-printf '\n-- rejections 1 and 2, via the tracked gate --\n'
+printf '\n-- rejections 1, 2 and 3, via the tracked gate (checks 5, 6, 7) --\n'
 CFN_DIR="$CAND" ./scripts/cfn-guardrails.sh --static
 GATE_RC=$?
 if [ "$GATE_RC" -eq 0 ]; then
@@ -95,7 +101,7 @@ else
   green "OK: the tracked gate rejected the candidate (exit $GATE_RC)"
 fi
 
-printf '\n-- rejection 3, an AWS Budget aimed at non-AWS spend --\n'
+printf '\n-- rejection 3, cross-checked by this script'"'"'s own detector --\n'
 llm_budget_scan "$CAND"
 if [ "$?" -gt 0 ]; then
   green "OK: rejected - AWS Budgets cannot see spend AWS does not bill"
@@ -110,7 +116,7 @@ head_ "Phase 2 - the real cfn/ MUST pass all three"
 # Without this half, a detector that matched everything would look like a
 # working audit.
 
-printf '\n-- rejections 1 and 2, via the tracked gate --\n'
+printf '\n-- rejections 1, 2 and 3, via the tracked gate (checks 5, 6, 7) --\n'
 CFN_DIR="$REAL" ./scripts/cfn-guardrails.sh --static
 GATE_RC=$?
 if [ "$GATE_RC" -eq 0 ]; then
