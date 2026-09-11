@@ -31,9 +31,11 @@
 # API-validated the moment it was committed. The Task 1 brief asks for "one
 # added validate-template step"; adding a second, cost-stack-specific step would
 # have meant the NEXT template needed a third. What did change is `paths:` above
-# and two new static checks in scripts/cfn-guardrails.sh (tag coverage,
-# TreatMissingData), because those are assertions the three generic tools have
-# no opinion about.
+# and three new static checks in scripts/cfn-guardrails.sh (tag coverage,
+# TreatMissingData, and no AWS Budget aimed at spend AWS does not bill), because
+# those are assertions the three generic tools have no opinion about. The third
+# arrived via the cost-author audit, which found the first two gated on every PR
+# and the third enforced only by whoever remembered it.
 name: cfn-validate
 
 on:

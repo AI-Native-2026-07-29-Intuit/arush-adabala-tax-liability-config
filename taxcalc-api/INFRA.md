@@ -1422,9 +1422,9 @@ itself, and `reconcile-s3` refuses to run (exit 2) rather than creating drift.
 
 `cfn/taxcalc-cost-dev.yaml` layers cost governance over the D3 substrate: a tag-scoped
 `AWS::Budgets::Budget`, an account-wide CloudWatch billing alarm, and the SNS topic both publish
-to. The full runbook — thresholds, tag taxonomy, LLM-plane accounting, per-alarm runbooks — lives
-in the application repo's [`COST.md`](https://github.com/AI-Native-2026-07-29-Intuit/arush-adabala-tax-liability/blob/main/COST.md).
-This section records only what the infrastructure side verified and what it could not.
+to. The full runbook — thresholds, tag taxonomy, LLM-plane accounting, per-alarm runbooks — is
+[`COST.md`](COST.md), beside this file. This section records only what the infrastructure side
+verified and what it could not.
 
 ## Status table
 

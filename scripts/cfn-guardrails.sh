@@ -45,7 +45,7 @@
 #                        security-critical properties (stands in for drift)
 #
 # Usage:
-#   ./scripts/cfn-guardrails.sh                    # run all six checks
+#   ./scripts/cfn-guardrails.sh                    # run all seven checks
 #   ./scripts/cfn-guardrails.sh guard-delete NAME  # the safe delete wrapper
 #
 # Against floci:     export AWS_ENDPOINT_URL=http://localhost:4566
@@ -1119,19 +1119,78 @@ EOF
   # - notBreaching reads every routine gap as "fine" and resets a real breach
   # to OK. `ignore` holds the last state instead. The two spellings are one
   # word apart and the wrong one produces an alarm that never usefully fires.
-  # Matches the PROPERTY ASSIGNMENT, not the bare word. The first spelling of
-  # this check was `grep -RIn 'notBreaching' cfn/` - exactly what the task
-  # text asks for - and it failed on the paragraph in taxcalc-cost-dev.yaml
-  # that explains why notBreaching is wrong. A negative grep that its own
-  # documentation trips is worse than no check: it is red for a reason that
-  # can only be fixed by deleting the explanation, so the next person deletes
-  # the check instead and the real setting goes ungated.
-  NB_RE='^[[:space:]]*TreatMissingData:[[:space:]]*notBreaching'
-  if grep -RInE "$NB_RE" "$CFN_DIR"/ >/dev/null 2>&1; then
-    bad "TreatMissingData: notBreaching found in $CFN_DIR/ - see cfn/taxcalc-cost-dev.yaml for why it is wrong on a billing metric"
-    grep -RInE "$NB_RE" "$CFN_DIR"/ | while read -r l; do note "$l"; done
+  #
+  # THIS IS THE TASK'S LITERAL GREP, deliberately, and it took two goes.
+  #
+  # The first spelling was exactly this. It failed - on the paragraph in
+  # taxcalc-cost-dev.yaml explaining why the value is wrong. The second
+  # spelling anchored the match to the PROPERTY ASSIGNMENT
+  # (`^\s*TreatMissingData:\s*notBreaching`) so prose could not trip it. That
+  # passed, and it was the wrong fix: it quietly replaced the acceptance
+  # command with a different, weaker one. A reviewer pasting the command from
+  # the task would still have seen two matches and had to take our word that
+  # they were benign.
+  #
+  # So the template's prose was hyphenated instead (see the block above
+  # TreatMissingData there, which explains the hyphen at the only place
+  # anybody would wonder about it), and the check is back to the command the
+  # task states. The stronger claim - no occurrence of the token in cfn/ AT
+  # ALL, in a property or a comment - is now the one actually enforced, and
+  # the acceptance command and the CI gate are the same string again.
+  if grep -RIn "notBreaching" "$CFN_DIR"/ >/dev/null 2>&1; then
+    bad "'notBreaching' found in $CFN_DIR/ - see cfn/taxcalc-cost-dev.yaml for why it is wrong on a billing metric"
+    grep -RIn "notBreaching" "$CFN_DIR"/ | while read -r l; do note "$l"; done
   else
-    ok "no 'TreatMissingData: notBreaching' in $CFN_DIR/ (billing alarm uses ignore)"
+    ok "zero matches for 'notBreaching' in $CFN_DIR/ (billing alarm uses ignore)"
+  fi
+
+  head_ '7. No AWS Budget aimed at spend AWS does not bill (static)'
+  # Added as the one ACCEPTED finding of the cost-author audit on
+  # scratch/cost-author. That pass rejected three defects; checks 5 and 6
+  # already gated two of them, and this one - the most convincing of the three
+  # - was gated by nothing at all. It existed only as a paragraph in COST.md
+  # and a row in the skill's table, which is to say it was enforced by whoever
+  # happened to remember it.
+  #
+  # WHAT IT CATCHES. An AWS::Budgets::Budget created to cap Anthropic (or
+  # OpenAI, or any third-party model) spend. Such a budget is syntactically
+  # perfect, deploys cleanly, is returned by describe-budget looking exactly
+  # like a real one, and reports 0% utilisation forever - because that spend
+  # bills to the provider's own account. AWS is not the merchant, so there is
+  # no AWS cost record for the filter to match and no tag anybody could apply
+  # that would create one. It is a control that reports healthy and enforces
+  # nothing: the shape a reviewer ticks off.
+  #
+  # BEDROCK IS DELIBERATELY NOT MATCHED. Amazon Bedrock is a hosted model AND
+  # AWS-resident spend, so a Bedrock-scoped Budget is legitimate and belongs
+  # in cfn/. A detector keyed on "is this about an LLM?" would reject a
+  # correct template and would be deleted within a sprint. The axis is not
+  # "is it AI?" - it is "who is the merchant?", the same split COST.md uses to
+  # put the self-hosted embeddings service on neither plane.
+  #
+  # Comments are stripped before matching, for the reason check 6 learned the
+  # hard way: taxcalc-cost-dev.yaml explains at length why an Anthropic budget
+  # would be wrong, and a check that trips on the explanation of the rule it
+  # enforces gets deleted rather than obeyed.
+  NON_AWS_MERCHANT='anthropic|openai|claude|gpt-|llm-spend|llm_spend'
+  LLM_BUDGETS=$(awk -v pat="$NON_AWS_MERCHANT" '
+      FILENAME != prevfile { prevfile = FILENAME; lid = ""; body = ""; isbudget = 0 }
+      /^  [A-Za-z0-9]+:[ \t]*$/ {
+        if (lid != "" && isbudget && tolower(body) ~ pat) printf "%s: %s\n", FILENAME, lid
+        lid = $1; sub(/:$/, "", lid); body = ""; isbudget = 0; next
+      }
+      {
+        stripped = $0; sub(/#.*$/, "", stripped); body = body " " stripped
+        if ($0 ~ /^    Type: AWS::Budgets::Budget[ \t]*$/) isbudget = 1
+      }
+      END { if (lid != "" && isbudget && tolower(body) ~ pat) printf "%s: %s\n", FILENAME, lid }
+    ' "$CFN_DIR"/*.yaml)
+  if [ -n "$LLM_BUDGETS" ]; then
+    bad "an AWS Budget in $CFN_DIR/ targets non-AWS spend - it will report 0% forever"
+    echo "$LLM_BUDGETS" | while read -r l; do note "$l"; done
+    note "cap that spend at the provider's platform; attribute it with CostLogger + X-Cost-Usd."
+  else
+    ok "no AWS Budget in $CFN_DIR/ targets spend AWS cannot see"
   fi
 
   head_ 'Result (static mode - no AWS calls made)'

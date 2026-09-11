@@ -165,7 +165,7 @@ engine: `describe-stacks` reports `CREATE_COMPLETE` for a stack containing an
 empty list for tags that are genuinely applied. Of the two shimmed checks, the tagging one serves
 **real tags** through a reimplemented index; the budgets one is a **projection of the deployed
 template** and is not evidence that a budget exists. Every workaround refuses to run with
-`AWS_ENDPOINT_URL` unset. Full accounting in [`taxcalc-api/COST.md`](https://github.com/AI-Native-2026-07-29-Intuit/arush-adabala-tax-liability/blob/main/COST.md).
+`AWS_ENDPOINT_URL` unset. Full accounting in [`taxcalc-api/COST.md`](taxcalc-api/COST.md).
 
 ## Bootstrapping this into a cluster
 
@@ -212,4 +212,5 @@ The reasoning, the measurements and the things that did not work the first time 
 The AWS substrate write-up lives **here**, because the templates do:
 
 - [`taxcalc-api/INFRA.md`](taxcalc-api/INFRA.md) — the four stacks, deploy ordering, the ChangeSet flow and what to read in `describe-change-set`, export naming, drift detection, the cross-stack delete refusal, six decisions that departed from the reference layout, every `cfn-nag` suppression with its reasoning, and the `cfn-author` Skill audit.
-- The application repo's `README.md`, Week 6 Day 3 section.
+- [`taxcalc-api/COST.md`](taxcalc-api/COST.md) — the cost-governance runbook: the two spending planes and why only one is visible to AWS billing, the four-key tag taxonomy and its manual activation (which does **not** backfill), the Budget and billing-alarm runbooks, the NAT cost lever, the LLM plane's per-request attribution and where its cap actually sits, and the `cost-author` Skill audit. Moved here on W6 D4 for the same reason INFRA.md is here — the Budget, the alarm, the topic and the tags are all in `cfn/`, and so are the three static checks that enforce them.
+- The application repo's `README.md`, Week 6 Day 3 and Day 4 sections.

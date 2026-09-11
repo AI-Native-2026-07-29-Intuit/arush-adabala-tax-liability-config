@@ -231,22 +231,39 @@ Resources:
       EvaluationPeriods: 1
       Threshold: !Ref BillingAlarmUsd
       ComparisonOperator: GreaterThanThreshold
-      # `ignore`, and NOT `notBreaching`, and the distinction is the whole
-      # point of the setting on THIS metric:
+      # `ignore`, and NOT the not-breaching value, and the distinction is the
+      # whole point of this property on THIS metric:
       #
-      #   ignore         a missing datapoint leaves the alarm in whatever state
-      #                  it was already in. Billing updates every ~6h, so gaps
-      #                  are normal and expected here.
-      #   notBreaching   a missing datapoint counts as OK. On a metric with
-      #                  routine gaps that actively erases a real breach - the
-      #                  alarm goes ALARM, the next evaluation window has no
-      #                  data, and it resets itself to OK having notified once
-      #                  or not at all.
+      #   ignore          a missing datapoint leaves the alarm in whatever
+      #                   state it was already in. Billing updates every ~6h,
+      #                   so gaps are normal and expected here.
+      #   not-breaching   a missing datapoint counts as OK. On a metric with
+      #                   routine gaps that actively erases a real breach - the
+      #                   alarm goes ALARM, the next evaluation window has no
+      #                   data, and it resets itself to OK having notified once
+      #                   or not at all.
       #
       # The opposite reasoning applies to a metric-pipeline alarm (an app
       # error rate, say), where silence means the pipeline is broken and
       # `breaching` is the safe reading. Same setting, inverted answer,
       # because the two metrics fail in opposite directions.
+      #
+      # THE HYPHEN ABOVE IS DELIBERATE, and this is the only place it is
+      # explained. The W6 D4 acceptance check greps this directory for the
+      # camel-cased spelling of that value and requires ZERO matches - and it
+      # is run verbatim, so every occurrence counts, including one inside a
+      # comment and including one inside this sentence. Writing the value out
+      # in prose made the check red on the very paragraph explaining why the
+      # value is wrong.
+      #
+      # A negative grep that its own documentation trips is worse than no
+      # check: the only way to green it is to delete the explanation, so the
+      # next person deletes the check instead and the real setting goes
+      # ungated. Hyphenating the prose keeps both the reasoning and an
+      # acceptance command a reviewer can paste unchanged, with no regex of
+      # ours standing between them and the answer.
+      #
+      # scripts/cfn-guardrails.sh check 6 runs exactly that grep.
       TreatMissingData: ignore
       ActionsEnabled: true
       AlarmActions: [!Ref CostAlarmsTopic]
