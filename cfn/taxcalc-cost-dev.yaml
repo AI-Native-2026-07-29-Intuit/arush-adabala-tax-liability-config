@@ -53,12 +53,18 @@ Parameters:
     MinValue: 20
     MaxValue: 100000
     Description: >-
-      Monthly cost cap for the tagged stack. Derived from the W6 D3 figures
-      rather than picked: one dev NAT Gateway is ~$32/mo before data-processing
-      charges, RDS db.t4g.micro + 20GB gp3 is ~$15/mo, and S3 is cents. $100
-      leaves genuine headroom over ~$50 of steady state, so FORECASTED>80%
-      ($80) means something has actually changed rather than that the month
-      has a 31st day in it.
+      Monthly cost cap for the tagged stack. Derived from list price for what
+      this stack actually deploys, rather than picked: one dev NAT Gateway is
+      ~$32.85/mo before data-processing charges, db.t4g.small is ~$23.36/mo,
+      20GB of storage is ~$2.30, and S3/SNS are cents - ~$58.50 of steady
+      state. $100 leaves genuine headroom, so FORECASTED>80% ($80) means
+      something has actually changed rather than that the month has a 31st day
+      in it.
+
+      Corrected 2026-09-11: this said "db.t4g.micro ... ~$15/mo ... over ~$50".
+      db.t4g.micro is not in taxcalc-app-dev's DbInstanceClass AllowedValues,
+      so the derivation costed a machine this stack cannot deploy. See
+      taxcalc-api/COST.md.
 
   BillingAlarmUsd:
     Type: Number
@@ -272,6 +278,58 @@ Resources:
       # sees is the bad one.
       OKActions: [!Ref CostAlarmsTopic]
 
+  # --- The saved cost report ---------------------------------------------------------------
+  #
+  # W6 D4 Task 4 asks for a Cost Explorer view "saved as a report". A Cost
+  # Explorer SAVED VIEW is a console object with no public API - there is no
+  # `aws ce create-report` - so that exact artefact cannot be declared, reviewed
+  # in a PR, or rebuilt after a teardown. It exists in one person's console.
+  #
+  # AWS::CUR::ReportDefinition is the API-addressable answer to the same
+  # question, and for a GitOps repository it is the better one:
+  #
+  #   - it is a REAL resource. `cur put-report-definition` creates it and
+  #     `describe-report-definitions` reads it back, which is a round trip a
+  #     saved console view cannot offer.
+  #   - it is declared HERE, so it is reviewed in the PR that introduces it and
+  #     recreated identically by the next deploy.
+  #   - AdditionalSchemaElements: [RESOURCES] puts the individual resource id
+  #     AND its cost-allocation tags on every line, which is strictly MORE than
+  #     a Cost Explorer group-by shows: the NAT gateway appears as its own row
+  #     with its own service/env/tenant/feature values rather than folded into
+  #     a "EC2 - Other" bucket.
+  #
+  # What it is NOT: an interactive view. Cost Explorer renders; this delivers
+  # Parquet to S3 for Athena. The console view remains the right tool for
+  # eyeballing a spike, and this is the right tool for a report that has to
+  # survive a rebuild and be diffable.
+  #
+  # us-east-1 ONLY, like the billing alarm and for the same shape of reason:
+  # the CUR API is a global service with a us-east-1 endpoint.
+  CostUsageReport:
+    Type: AWS::CUR::ReportDefinition
+    Condition: IsUsEast1
+    DeletionPolicy: Retain
+    # Retain, because deleting the definition orphans the delivered objects in
+    # S3 while removing the only record of what produced them. The bucket's own
+    # lifecycle rule is what ages them out.
+    Properties:
+      ReportName: !Sub "taxcalc-cost-${EnvName}"
+      TimeUnit: DAILY
+      Format: Parquet
+      Compression: Parquet
+      # RESOURCES is the whole point - without it the report aggregates and the
+      # per-resource, per-tag drill-down this exists for is gone.
+      AdditionalSchemaElements: [RESOURCES]
+      S3Bucket: !ImportValue taxcalc-artifacts-dev-BucketName
+      S3Prefix: !Sub "cur/${EnvName}/"
+      S3Region: !Ref "AWS::Region"
+      AdditionalArtifacts: [ATHENA]
+      # Re-state a closed month when AWS restates it (credits, refunds, late
+      # charges). Without this the report and the invoice drift apart silently.
+      RefreshClosedReports: true
+      ReportVersioning: OVERWRITE_REPORT
+
 Outputs:
   CostAlarmsTopicArn:
     Description: >-
@@ -300,3 +358,12 @@ Outputs:
           and this stack is deployed to ${AWS::Region}. The tag-scoped budget
           is active; the account-wide billing alarm is not. Redeploy in
           us-east-1 to get it.
+
+  CostUsageReportName:
+    Description: >-
+      The saved cost report, for `aws cur describe-report-definitions`. This is
+      the API-addressable stand-in for a Cost Explorer saved view, which has no
+      public API - see the resource's comment for why it is the better artefact
+      in a GitOps repo.
+    Condition: IsUsEast1
+    Value: !Sub "taxcalc-cost-${EnvName}"

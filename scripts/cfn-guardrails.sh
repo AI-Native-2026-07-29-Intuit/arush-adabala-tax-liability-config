@@ -375,8 +375,94 @@ _physical_map() {
 
 _cost_extract() {  # stack, template, [Key=Value ...]
   local stack="$1" tpl="$2"; shift 2
-  CFN_STACK_NAME="$stack" ruby "$HERE/cfn-extract-cost.rb" "$tpl" "$(_physical_map "$stack")" "$@"
+  CFN_STACK_NAME="$stack" CFN_EXPORTS="$(_exports_map)" \
+    ruby "$HERE/cfn-extract-cost.rb" "$tpl" "$(_physical_map "$stack")" "$@"
 }
+
+# The live cross-stack export table, so the extractor can resolve
+# Fn::ImportValue the way CloudFormation does rather than leaving a hole where
+# a bucket name should be.
+_exports_map() {
+  aws_ cloudformation list-exports --output json 2>/dev/null \
+    | jq -c '[.Exports[] | {(.Name): .Value}] | add // {}' 2>/dev/null || echo '{}'
+}
+
+# ---------------------------------------------------------------------------
+# reconcile-cur - create the Cost and Usage Report definition the stack
+# declares, over the cur API, because this endpoint's execute-change-set will
+# not apply it.
+#
+# WHY THIS RESOURCE EXISTS AT ALL. W6 D4 Task 4 asks for a Cost Explorer view
+# "saved as a report". A Cost Explorer SAVED VIEW has no public API - there is
+# no `aws ce create-report` - so that artefact cannot be declared, reviewed in
+# a PR, or rebuilt. AWS::CUR::ReportDefinition answers the same question with a
+# resource that CAN be: put-report-definition creates it and
+# describe-report-definitions reads it back.
+#
+# WHY IT NEEDS A RECONCILE. `guard-update taxcalc-cost-dev` plans the Add
+# correctly and then REFUSES to execute, because this endpoint's
+# execute-change-set does not honour the plan. The guard's own advice is to
+# apply the planned change deliberately over the per-service API, which is
+# what this does - and unlike reconcile-cloudwatch, it fully closes the gap:
+# floci's cur stores every property correctly when it arrives over the cur API.
+# Only the CloudFormation-to-cur wiring is missing.
+#
+# Refuses against real AWS, like every other reconcile here: there
+# CloudFormation creates it and a put around the outside is exactly the drift
+# detect-drift exists to catch.
+reconcile_cur() {
+  if ! is_emulator; then
+    printf 'refusing: reconcile-cur is an emulator-parity shim.\n' >&2
+    printf 'Against real AWS, CloudFormation creates AWS::CUR::ReportDefinition\n' >&2
+    printf 'itself; a put-report-definition around it would register as drift.\n' >&2
+    return 2
+  fi
+  command -v ruby >/dev/null 2>&1 || { printf 'refusing: ruby not found.\n' >&2; return 2; }
+
+  local stack="${1:-taxcalc-cost-dev}" tpl extracted count rc=0
+  tpl="$HERE/../$CFN_DIR/$stack.yaml"
+  head_ "reconcile-cur: $stack"
+  [ -f "$tpl" ] || { note "no template at $CFN_DIR/$stack.yaml; skipped"; return 0; }
+
+  extracted=$(_cost_extract "$stack" "$tpl" "${@:2}") || {
+    bad "could not read the report definition out of $(basename "$tpl")"; return 1; }
+
+  count=$(echo "$extracted" | jq '.cur | length')
+  if [ "$count" = "0" ]; then
+    note "template declares no AWS::CUR::ReportDefinition; nothing to reconcile"
+    return 0
+  fi
+
+  local i lid defn name live
+  for i in $(seq 0 $((count - 1))); do
+    lid=$(echo "$extracted" | jq -r ".cur[$i].LogicalId")
+    defn=$(echo "$extracted" | jq -c ".cur[$i].ReportDefinition")
+    name=$(echo "$defn" | jq -r '.ReportName')
+
+    # An unresolved Fn::ImportValue would arrive as a JSON object where a
+    # bucket name belongs. Refuse rather than create a report pointed at
+    # something that is not a bucket.
+    if [ "$(echo "$defn" | jq -r '.S3Bucket | type')" != "string" ]; then
+      bad "$lid: S3Bucket did not resolve to a string (unresolved ImportValue?)"
+      rc=1; continue
+    fi
+
+    aws_ cur put-report-definition --report-definition "$defn" >/dev/null 2>&1
+    live=$(aws_ cur describe-report-definitions \
+      --query "ReportDefinitions[?ReportName=='$name'].ReportName" --output text 2>/dev/null)
+    if [ "$live" = "$name" ]; then
+      ok "$lid - report definition '$name' is live and readable"
+      note "$(echo "$defn" | jq -r '"  s3://\(.S3Bucket)/\(.S3Prefix)  \(.TimeUnit) \(.Format)  schema: \(.AdditionalSchemaElements | join(","))"')"
+    else
+      bad "$lid - put-report-definition did not produce a readable '$name'"
+      rc=1
+    fi
+  done
+  return "$rc"
+}
+if [ "${1:-}" = "reconcile-cur" ]; then
+  shift; reconcile_cur "$@"; exit $?
+fi
 
 # ---------------------------------------------------------------------------
 # reconcile-cloudwatch - re-PUT the billing alarm so the properties this

@@ -392,10 +392,27 @@ if is_emulator; then
     fi
   fi
 
-  # (d) and the part no workaround touches at all.
-  note "STILL UNREACHABLE: a saved Cost Explorer report. Saved reports are a"
-  note "console object with NO public API - there is no 'aws ce create-report' -"
-  note "so this is unscriptable even on a real account with real spend."
+  # (d) the saved report - a REAL resource, not a stand-in.
+  #
+  # "Saved reports have no public API" is true of a Cost Explorer SAVED VIEW
+  # and was being treated as if it were true of saved cost reports generally.
+  # AWS::CUR::ReportDefinition is declarable, creatable and readable back.
+  CUR_NAME=$(aws_ cur describe-report-definitions \
+    --query "ReportDefinitions[?ReportName=='taxcalc-cost-${COST_STACK##*-}'].ReportName" \
+    --output text 2>/dev/null)
+  if [ -n "$CUR_NAME" ]; then
+    ok "saved cost report '$CUR_NAME' exists and is readable back"
+    note "AWS::CUR::ReportDefinition, declared in cfn/taxcalc-cost-dev.yaml and"
+    note "applied by 'cfn-guardrails.sh reconcile-cur' because this endpoint's"
+    note "execute-change-set will not (guard-update plans it, then refuses)."
+    note "AdditionalSchemaElements: [RESOURCES] puts the resource id AND its"
+    note "cost-allocation tags on every line - more than a group-by shows."
+  else
+    gap "no saved cost report; run 'cfn-guardrails.sh reconcile-cur $COST_STACK EnvName=dev'"
+  fi
+  note "Still out of reach: an INTERACTIVE Cost Explorer view saved in the"
+  note "console. That specific object has no public API. It is a much narrower"
+  note "gap than 'no saved report is possible', which is what this said before."
 else
   if [ "${CE_TAGS:-0}" = "0" ]; then
     bad "real account, but ce get-tags returns no cost-allocation keys - activate them in Billing"

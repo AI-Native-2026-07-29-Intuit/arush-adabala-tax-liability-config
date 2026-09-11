@@ -44,11 +44,36 @@ Four mandatory keys on every billable resource:
 Applied to: `NatGateway*` and their EIPs (`cfn/taxcalc-network-dev.yaml`), `DbInstance`
 (`cfn/taxcalc-app-dev.yaml`), and the cost stack's own SNS topic.
 
-**Activation is manual and does NOT backfill.** Cost-allocation tag keys must be activated by
-hand in the Billing console before they can be used as a filter, and spend incurred before
-activation is never attributed, whatever the resource was tagged with at the time. Tagging a
-resource is therefore only half the job; the console step is the other half, and it is the half
-with no diff to review.
+**Activation is a second step, and tagging a resource does not perform it.** A cost-allocation
+tag key must be activated before it can be used as a filter; spend incurred before activation is
+not attributed, whatever the resource was tagged with at the time.
+
+**It is scriptable, and this document previously said it was not.** The claim here used to be
+"activation is manual and does NOT backfill … the console step is the other half, and it is the
+half with no diff to review." Both halves of that are wrong, and checking rather than repeating
+it is what found them:
+
+```bash
+aws ce update-cost-allocation-tags-status \
+  --cost-allocation-tags-status TagKey=service,Status=Active TagKey=env,Status=Active \
+                                TagKey=tenant,Status=Active TagKey=feature,Status=Active
+aws ce list-cost-allocation-tags --status Active     # read it back
+aws ce start-cost-allocation-tag-backfill --backfill-from 2026-01-01T00:00:00Z
+aws ce list-cost-allocation-tag-backfill-history
+```
+
+`UpdateCostAllocationTagsStatus` makes activation an API call that belongs in the deploy path
+like anything else, and **`StartCostAllocationTagBackfill` does backfill** — up to twelve months,
+which is the thing the old sentence said was impossible. The honest residue is narrower: there is
+no CloudFormation resource for tag activation, so it cannot be *declared* alongside the resources
+it governs; it has to be a deliberate step in a runbook or a deploy script. That is a much smaller
+claim than "manual, console-only, never backfills", and it is the one that survives contact with
+the API reference.
+
+Neither call exists on floci — `ce` there answers `UnknownOperationException` for both — so the
+commands above are quoted from the service model rather than run. That is the opposite failure
+from the usual one here: the emulator is *less* capable than the docs, where elsewhere it has been
+more permissive than the template.
 
 Three rules that are not stylistic:
 
@@ -415,7 +440,49 @@ different things** — `./scripts/cost-explorer-report.sh` renders
 | 1 NAT in dev, 3 in staging/prod | **PASS** | template evaluation, not spend — see below |
 | every billable resource groups under `service$taxcalc` | **PASS** | tags read live off the deployed resources |
 | the NAT line item at `$32.85/mo`, 56% of the total | **SHIM** | projected at list price; never observed, never invoiced |
-| the view saved as a report | **GAP** | saved reports are a console object with no public API |
+| the report is saved, named and readable back | **PASS** | `AWS::CUR::ReportDefinition` — a real resource, see below |
+| an *interactive Cost Explorer view* saved in the console | **GAP** | no public API for that specific object |
+
+### The saved report: a real resource, not a stand-in
+
+This one moved from `GAP` to `PASS`, and the reason is worth separating from the excuse it
+replaced. "Saved reports are a console object with no public API" is true **of a Cost Explorer
+saved view** and was quietly treated as if it were true of saved cost reports in general. It is
+not. `AWS::CUR::ReportDefinition` is the API-addressable answer to the same question, and for a
+GitOps repository it is the better artefact:
+
+```
+$ ./scripts/cfn-guardrails.sh reconcile-cur taxcalc-cost-dev EnvName=dev
+  PASS  CostUsageReport - report definition 'taxcalc-cost-dev' is live and readable
+          s3://uptimecrew-taxcalc-artifacts-dev/cur/dev/  DAILY Parquet  schema: RESOURCES
+
+$ aws cur describe-report-definitions
+  ReportName taxcalc-cost-dev | DAILY | Parquet | AdditionalSchemaElements: [RESOURCES]
+```
+
+Three things it has that a console-saved view does not:
+
+- **It round-trips.** `put-report-definition` creates it, `describe-report-definitions` reads it
+  back. A saved view can only be looked at by the person who saved it.
+- **It is declared in `cfn/taxcalc-cost-dev.yaml`**, so it is reviewed in the PR that introduces
+  it and rebuilt identically after a teardown. This is the actual point of "save it as a report" —
+  the report should outlive the session that produced it.
+- **`AdditionalSchemaElements: [RESOURCES]` is strictly more than a group-by shows.** Every line
+  carries the individual resource id *and* its cost-allocation tags, so the NAT gateway appears as
+  its own row with its own `service`/`env`/`tenant`/`feature` values rather than folded into an
+  `EC2 - Other` bucket.
+
+What it is not is an interactive view — Cost Explorer renders, this delivers Parquet to S3 for
+Athena. The console remains the right tool for eyeballing a spike. That distinction is the
+remaining `GAP` row above, and it is much narrower than the one it replaced.
+
+**It needed a reconcile, and the guard is why.** `guard-update taxcalc-cost-dev` plans the `Add`
+correctly and then **refuses to execute**, because this endpoint's `execute-change-set` does not
+honour the plan. Its own advice is to apply the change deliberately over the per-service API,
+which is what `reconcile-cur` does — and unlike `reconcile-cloudwatch`, it **fully closes** the
+gap: floci's `cur` stores every property correctly when it arrives over the `cur` API, so only the
+CloudFormation-to-`cur` wiring is missing. The plan, the refusal and the reconcile are three
+separate artefacts and each says something the others do not.
 
 **The NAT lever is the strongest thing in this document, and it did not need a real account.**
 The same template evaluated with `EnvName=dev` and `EnvName=prod` through CREATE ChangeSets
@@ -564,8 +631,42 @@ than becoming a `SHIM`.
 | `ce GetCostAndUsage` / `GetTags` | "running", answers **all-zero with no tag keys** | a list-price projection over live deployed resources | the **tags** are real; the **dollars** have never been invoiced |
 
 The second is the one to be careful with. There is no budget on this endpoint to read, so the
-response cannot be evidence that a budget exists, that its `CostFilters` match anything, or that
-it would ever notify.
+response cannot be evidence that a budget exists or that its `CostFilters` match anything.
+
+**"Or that it would ever notify" used to be on that list, and it conceded too much.** That phrase
+covers two separable questions, and only one of them actually needs AWS Budgets:
+
+| Question | Answerable here? |
+|---|---|
+| would the **threshold logic** fire on this stack's shape? | **yes** — arithmetic over a cost figure and two declared thresholds |
+| would the notification **reach anybody**? | **yes** — SNS is real on this endpoint, not projected |
+| would **AWS Budgets itself** evaluate and publish? | **no** — and this is the only genuine gap |
+
+`./scripts/cost-notify-probe.sh` answers the first two and refuses to blur them into the third:
+
+```
+2  Threshold evaluation - dev shape vs prod shape
+  shape         projected  FORECASTED>80%  ACTUAL>100%
+  dev              $58.51  ok              ok
+  prod-like       $124.21  BREACH          BREACH
+  PASS  the thresholds DISCRIMINATE: dev stays under, prod-like breaches
+
+3  Delivery - does the topic actually reach a subscriber?
+  PASS  a message published to the topic reached a subscriber
+```
+
+The discrimination is the part that makes step 2 evidence rather than decoration. A threshold
+check that fired for both shapes, or for neither, would have tested nothing; the $65.70 between
+them is exactly the two extra NAT gateways `IsProdLike` adds, which ties this back to the one
+lever in the stack worth pulling. And step 3 is a genuine end-to-end round trip — a throwaway SQS
+queue subscribed to the topic the template actually created, receiving a real published message.
+
+**Two things the probe is careful to disclaim, and the second is uncomfortable.** It cannot show
+AWS Budgets wiring step 2 to step 3 — floci runs no budgets service, so the join has no local
+proof. And the publish in step 3 **succeeded without the `TopicPolicy` being in force**, because
+floci drops the policy and leaves the topic on its default open policy. On a real account that
+policy is load-bearing; this probe would not notice its absence. A green step 3 is therefore
+evidence that SNS delivers, *not* that the least-privilege wiring is correct.
 
 **The third exists because neither of the first two can answer the Done-When as written.** It asks
 for "two notifications **wired to the SNS topic**", and both `DescribeBudget` and
@@ -677,30 +778,40 @@ the stack reaches `CREATE_COMPLETE` through the real ChangeSet flow and the alar
 readable. Check 4's **tags are real** and only the index is stood in for. Check 2 is a template
 projection and establishes nothing about a budget.
 
-**Five things a real account is still the only way to establish**, and no local workaround
-touches any of them — every workaround above changes what can be *read*, never what the
-infrastructure *does*:
+**Four things a real account is still the only way to establish.** This list was five, and before
+that it was four with two rows that turned out to be softer than they were written. Each round of
+"is that actually true?" moved something off it, so what is left has been argued down rather than
+merely asserted:
 
 | still unverifiable | why no shim helps |
 |---|---|
-| the Budget exists and would notify | there is no budget to read; the shim projects the template |
-| the SNS `TopicPolicy` takes effect | floci drops it and leaves the topic **wider** than the template asks |
+| **AWS Budgets itself** evaluates and publishes | floci runs no budgets service; the thresholds and the delivery are each provable, the join between them is not |
+| the SNS `TopicPolicy` takes effect | floci drops it and leaves the topic **wider** than the template asks — so a successful publish here proves nothing about it |
 | the alarm's firing behaviour on a gappy metric | floci's alarm evaluates as `missing` whatever `describe-alarms` reports |
-| tag-scoped cost **attribution** | an emulator bills nobody, so no tag key is activated and there is no spend to group |
-| a **saved** Cost Explorer report | saved reports are a console object with **no public API** — unscriptable even on real AWS |
+| tag-scoped cost **attribution** | an emulator bills nobody, so there is no spend to attribute and no invoice to reconcile against |
 
-The last row is the odd one out and is worth separating from the rest: it is not an emulator
-limitation at all. There is no `aws ce create-report`. Even with a real account, real spend and
-activated tags, that Done-When is satisfied by a human clicking Save and pasting a screenshot —
-which is why the stand-in is a **file rendered into the repository**, reviewable in a PR, rather
-than an image of a console nobody else can re-run.
+**What moved off, and why it should have been questioned sooner.**
 
-One nuance the table would otherwise flatten. The subscriber ARNs **are** live and cross-checked,
-so "the notifications point at a topic that exists" is established here; what is not is that a
-notification would ever be **delivered**. Those are different claims and the first is much cheaper
-than it sounds — it is exactly the check that catches a `!Ref` typo, and it is the one that
-[crashed](#4-floci-cost-apis-shimpy--four-missing-read-apis-not-equally-trustworthy) the first
-time it was pointed at a template that had one.
+- *"A saved report is impossible"* → **false as stated.** True of a Cost Explorer saved view;
+  untrue of saved cost reports generally. `AWS::CUR::ReportDefinition` is declarable, creatable
+  and readable back, and it carries more per-resource detail than the console view it stood in
+  for.
+- *"Activation is manual and never backfills"* → **false on both counts.**
+  `ce update-cost-allocation-tags-status` activates and `ce start-cost-allocation-tag-backfill`
+  backfills up to twelve months. What survives is only that there is no *CloudFormation resource*
+  for it.
+- *"The Budget would never notify"* → **too broad.** The thresholds discriminate correctly and
+  the topic delivers end to end; only AWS Budgets' own evaluation is out of reach.
+- *"The notifications point at a topic that exists"* → **established**, via live physical ids
+  cross-checked against `sns list-topics`. It is exactly the check that catches a `!Ref` typo, and
+  it is the one that
+  [crashed](#4-floci-cost-apis-shimpy--four-missing-read-apis-not-equally-trustworthy) the first
+  time it met a template with one.
+
+The pattern is consistent enough to be worth naming: **every one of those was an honest-sounding
+limitation that had never been checked against the service model.** Being scrupulous about what
+the evidence is worth is only half the job; the other half is being equally scrupulous about
+claims of impossibility, which are just as easy to state and much less likely to be challenged.
 
 ---
 

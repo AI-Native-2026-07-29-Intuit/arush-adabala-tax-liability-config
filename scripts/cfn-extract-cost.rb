@@ -101,6 +101,14 @@ PSEUDO = {
   'AWS::StackName' => ENV.fetch('CFN_STACK_NAME', '')
 }.freeze
 
+# Live cross-stack exports, for Fn::ImportValue. Empty unless the caller
+# supplies them, which keeps this usable on a template with no imports.
+EXPORTS = begin
+  JSON.parse(ENV.fetch('CFN_EXPORTS', '{}'))
+rescue JSON::ParserError
+  {}
+end.freeze
+
 # Resolve the intrinsics that actually occur in these properties, and nothing
 # else. `Ref` to a resource resolves through the live physical-id map, which is
 # how AlarmActions picks up the real SNS topic ARN rather than a logical name.
@@ -121,6 +129,12 @@ def resolve(node, params, physical)
       when 'Fn::GetAtt'
         # e.g. !GetAtt Topic.TopicName - only the physical id is knowable here.
         return physical[arg.first] if arg.is_a?(Array) && physical.key?(arg.first)
+      when 'Fn::ImportValue'
+        # Resolved through the LIVE export table (cloudformation list-exports),
+        # passed in as CFN_EXPORTS. An unresolvable import is left as the node
+        # rather than blanked, so a caller sees an unresolved intrinsic instead
+        # of an empty string that looks like a legitimate value.
+        return EXPORTS[arg] if arg.is_a?(String) && EXPORTS.key?(arg)
       end
     end
     node.transform_values { |v| resolve(v, params, physical) }
@@ -142,7 +156,7 @@ def sub(str, params, physical)
 end
 
 # ---------------------------------------------------------------------------
-out = { 'alarms' => {}, 'budgets' => [], 'tags' => {} }
+out = { 'alarms' => {}, 'budgets' => [], 'tags' => {}, 'cur' => [] }
 
 (tpl['Resources'] || {}).each do |lid, res|
   type  = res['Type']
@@ -188,6 +202,27 @@ out = { 'alarms' => {}, 'budgets' => [], 'tags' => {} }
         'CostTypes'   => b['CostTypes']
       }.compact,
       'NotificationsWithSubscribers' => nf
+    }
+
+  when 'AWS::CUR::ReportDefinition'
+    # Shaped for `aws cur put-report-definition --report-definition`, so the
+    # reconcile can apply the template's own declaration verbatim rather than
+    # a hand-written copy of it that drifts.
+    out['cur'] << {
+      'LogicalId' => lid,
+      'ReportDefinition' => {
+        'ReportName'               => props['ReportName'],
+        'TimeUnit'                 => props['TimeUnit'],
+        'Format'                   => props['Format'],
+        'Compression'              => props['Compression'],
+        'AdditionalSchemaElements' => props['AdditionalSchemaElements'] || [],
+        'S3Bucket'                 => props['S3Bucket'],
+        'S3Prefix'                 => props['S3Prefix'],
+        'S3Region'                 => props['S3Region'],
+        'AdditionalArtifacts'      => props['AdditionalArtifacts'],
+        'RefreshClosedReports'     => props['RefreshClosedReports'],
+        'ReportVersioning'         => props['ReportVersioning']
+      }.compact
     }
   end
 
