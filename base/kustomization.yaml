@@ -47,7 +47,10 @@ kind: Kustomization
 
 resources:
   - 05-dev-dependencies.yaml
+  - 06-kafka.yaml                          # W6 D5 Task 1: a real broker, at last
   - 10-taxcalc-api.deployment.yaml
+  - 12-taxcalc-worker.deployment.yaml      # W6 D5 Task 1: the KEDA scale target
+  - 13-taxcalc-worker-scaledobject.yaml    # W6 D5 Task 1: KEDA on Kafka lag
   - 20-taxcalc-api.service.yaml
   - 30-taxcalc-api.configmap.yaml
   - 50-taxcalc-api.hpa.yaml
@@ -116,3 +119,30 @@ patches:
         name: mongo
         annotations:
           argocd.argoproj.io/sync-wave: "-1"
+
+  # W6 D5 Task 1: the broker joins wave -1 with the other backing stores.
+  # It is a store the workloads dial, and the worker in particular has no
+  # readiness probe to hold it out of service while the broker forms its KRaft
+  # quorum - it would simply log connection failures until the broker arrived.
+  - target: { kind: Deployment, name: kafka }
+    patch: |
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: kafka
+        annotations:
+          argocd.argoproj.io/sync-wave: "-1"
+
+  # W6 D5 Task 1: the ScaledObject must land AFTER its scale target exists.
+  # KEDA reconciles a ScaledObject whose scaleTargetRef points at nothing into
+  # READY=False with "scaletarget not found" and does NOT retry on a schedule
+  # tight enough to look self-healing - it waits for the next resync. Wave 1
+  # makes the ordering explicit instead of relying on alphabetical luck.
+  - target: { kind: ScaledObject, name: taxcalc-worker-scaledobject }
+    patch: |
+      apiVersion: keda.sh/v1alpha1
+      kind: ScaledObject
+      metadata:
+        name: taxcalc-worker-scaledobject
+        annotations:
+          argocd.argoproj.io/sync-wave: "1"
