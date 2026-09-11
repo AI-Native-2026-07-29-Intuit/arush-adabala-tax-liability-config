@@ -54,6 +54,7 @@ resources:
   - 20-taxcalc-api.service.yaml
   - 30-taxcalc-api.configmap.yaml
   - 50-taxcalc-api.hpa.yaml
+  - 55-taxcalc-api.pdb.yaml                # W6 D5 Task 2: the availability floor
   - 60-taxcalc-api.ingress.yaml
   - 70-taxcalc-api.servicemonitor.yaml
 

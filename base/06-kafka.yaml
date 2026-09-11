@@ -73,7 +73,27 @@ spec:
     spec:
       containers:
         - name: kafka
-          image: apache/kafka:3.8.1
+          # 3.9.1, NOT 3.8.1, and the reason is a JVM bug rather than anything
+          # about Kafka.
+          #
+          # apache/kafka:3.8.1 ships JDK 21.0.4, which on an arm64 Lima/Rancher
+          # Desktop VM dies instantly with
+          #
+          #   SIGILL (0x4) ... Problematic frame:
+          #   j java.lang.System.registerNatives()V+0 java.base
+          #
+          # That frame is the JVM's very first native call, so the crash reads
+          # like a corrupt image or a wrong-architecture pull. It is neither:
+          # the JVM probes for SVE (the ARM vector extension), this VM's kernel
+          # cannot report an SVE vector length, and 21.0.4 executes an SVE
+          # instruction anyway. 21.0.7 in 3.9.1 detects the same condition and
+          # disables SVE with a warning instead of crashing.
+          #
+          # UseSVE=0 below states it explicitly rather than relying on that
+          # auto-detection, so the behaviour does not change under a future
+          # patch release - and so the next person to read this manifest does
+          # not have to rediscover the SIGILL.
+          image: apache/kafka:3.9.1
           imagePullPolicy: IfNotPresent
           ports:
             - { name: kafka,      containerPort: 9092 }
@@ -111,6 +131,9 @@ spec:
             - { name: KAFKA_AUTO_CREATE_TOPICS_ENABLE,                 value: "true" }
             - { name: KAFKA_LOG_DIRS,                                  value: "/var/lib/kafka/data" }
             - { name: CLUSTER_ID,                                      value: "taxcalc-dev-kraft-0001" }
+            # See the image comment above. Harmless on hardware that does
+            # report an SVE length; load-bearing on the VM this lab runs in.
+            - { name: KAFKA_OPTS,                                      value: "-XX:UseSVE=0" }
           volumeMounts:
             - { name: data, mountPath: /var/lib/kafka/data }
           readinessProbe:

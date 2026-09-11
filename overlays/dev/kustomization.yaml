@@ -81,7 +81,7 @@ images:
 # drift. This is the one field where "Git is the source of truth" is wrong.
 replicas:
   - name:  taxcalc-api
-    count: 1
+    count: 2
 
 # Per-env config patch - override the W5 D3 ConfigMap entries that should
 # differ between environments (Spring profile, log level).
@@ -121,11 +121,25 @@ patches:
   # the HPA agree at rest. ignoreDifferences is still correct and still needed
   # - it is what lets the HPA scale UP under load without Argo CD calling that
   # drift - but the two no longer contradict each other at the floor.
+  # W6 D5 Task 2: the floor moves BACK UP to 2, and the `replicas: 1` above with it.
+  #
+  # The note above describes aligning the HPA floor with dev's single replica so Git and the HPA
+  # agreed at rest. That reasoning was right and its conclusion is now wrong, because 55-taxcalc
+  # -api.pdb.yaml introduces a third party: a PodDisruptionBudget with minAvailable: 2.
+  #
+  # A PDB floor above the HPA floor is unsatisfiable at rest. At one replica, allowed disruptions
+  # pins at 0 and `kubectl drain` on the node holding that pod hangs indefinitely - not with an
+  # error, but politely retrying, which during a node upgrade looks like a stuck cluster rather
+  # than a misconfigured budget. Task 4's Karpenter NodePool consolidates underutilised nodes on
+  # exactly that path, so this is not hypothetical.
+  #
+  # So dev runs two replicas now. That is the cost of having a disruption budget that means
+  # something, and it is the same number base/ and the PDB already agree on.
   - target: { kind: HorizontalPodAutoscaler, name: taxcalc-api }
     patch: |
       - op: replace
         path: /spec/minReplicas
-        value: 1
+        value: 2
 
   - target: { kind: Ingress, name: taxcalc-api }
     patch: |

@@ -1,0 +1,88 @@
+# base/prometheus-adapter-values.yaml - Helm values for prometheus-adapter (W6 D5 Task 2).
+#
+# NOT a Kubernetes manifest and deliberately NOT in base/kustomization.yaml's `resources`. This
+# is a Helm values file for a CLUSTER-INFRASTRUCTURE component, installed once per cluster
+# alongside kube-prometheus-stack:
+#
+#   helm upgrade --install prom-adapter prometheus-community/prometheus-adapter \
+#     --version 5.3.0 --namespace monitoring \
+#     -f base/prometheus-adapter-values.yaml
+#
+# It lives in this repo, next to the HPA that depends on it, because the RULE below is
+# application-specific even though the component is not: nothing else in the cluster knows or
+# cares about taxcalc_inflight_requests, and separating the rule from the HPA that reads it is
+# how the two drift into naming different metrics.
+#
+# WHAT THE ADAPTER ACTUALLY DOES
+#
+# An HPA cannot query Prometheus. It reads the Kubernetes custom-metrics API
+# (custom.metrics.k8s.io/v1beta1), which is an APIService that must be BACKED by something. The
+# adapter registers itself as that backend and translates each request into a PromQL query. So
+# the chain is:
+#
+#   InflightRequestsGauge -> /actuator/prometheus -> ServiceMonitor -> Prometheus
+#     -> [this rule] -> custom.metrics.k8s.io -> HPA
+#
+# Every link is silent when it breaks. The HPA's only symptom for a failure ANYWHERE in that
+# chain is `<unknown>` in the TARGETS column, with no indication of which link is at fault.
+# `kubectl get --raw /apis/custom.metrics.k8s.io/v1beta1/namespaces/taxcalc-dev/pods/*/taxcalc_inflight_requests`
+# is what splits the chain in half: a value there means the fault is between the adapter and the
+# HPA, an error means it is between Prometheus and the adapter.
+prometheus:
+  # The kube-prometheus-stack Prometheus Service. This must be the Service, not a pod IP, and the
+  # port must be the Service port (9090). A wrong value here does not fail at install time - the
+  # adapter starts happily and every metric it is asked for simply does not exist.
+  url:  http://kube-prometheus-stack-prometheus.monitoring.svc
+  port: 9090
+
+rules:
+  # `custom` REPLACES the chart's default rule set rather than adding to it. That default set
+  # exposes a broad sweep of container metrics and is not wanted here: it costs a series-discovery
+  # query against Prometheus every discovery interval, and it makes the metric list long enough
+  # that a typo in the HPA's metric name is hard to spot by eye.
+  custom:
+    - # seriesQuery selects WHICH series the adapter will serve. The two label filters are not
+      # cosmetic: `namespace!="",pod!=""` excludes any copy of this series that arrived without
+      # Kubernetes attribution - for example a scrape of a port-forwarded pod during debugging.
+      # A series with an empty pod label cannot be associated with a pod, and the adapter's
+      # association step fails for the whole rule rather than for that one series.
+      seriesQuery: 'taxcalc_inflight_requests{namespace!="",pod!=""}'
+      resources:
+        # Tells the adapter which label is the namespace and which is the pod, so it can answer
+        # "the value for THIS pod". Micrometer does not set these; the ServiceMonitor's scrape
+        # adds them, which is why the W5 D5 ServiceMonitor is a prerequisite for this rule rather
+        # than an unrelated observability object.
+        overrides:
+          namespace: { resource: namespace }
+          pod:       { resource: pod }
+      name:
+        matches: "taxcalc_inflight_requests"
+        # The name the HPA asks for. Kept identical to the Prometheus name on purpose - the
+        # adapter's `as:` is free to rename, and renaming here is how an HPA ends up asking for a
+        # metric that exists under a different name. All three spellings (Micrometer's
+        # taxcalc.inflight.requests, Prometheus's taxcalc_inflight_requests, and the HPA's
+        # metric.name) have to line up, and this is the one place a mismatch could be introduced
+        # for no benefit.
+        as: "taxcalc_inflight_requests"
+      # avg_over_time, NOT the instantaneous value.
+      #
+      # This is a gauge sampled every 30s by the scrape, and in-flight count is spiky by nature -
+      # it is 0 between requests and jumps with each one. Feeding raw samples to an HPA means the
+      # scaling decision depends on whether the last scrape happened to land during a burst or a
+      # gap, which produces scale-ups from a single unlucky sample and scale-downs from a single
+      # lucky one. A 1-minute average is roughly two scrapes' worth and is what makes the signal
+      # a saturation measure rather than a coin flip.
+      #
+      # It is deliberately SHORTER than the HPA's 600s scaleDown stabilisation window. Smoothing
+      # belongs in one place; doing it here as well as there would compound into an autoscaler
+      # that reacts minutes after the load it is reacting to.
+      metricsQuery: 'avg_over_time(taxcalc_inflight_requests{<<.LabelMatchers>>}[1m])'
+
+# Single replica: this is a dev cluster, and the adapter is stateless. In production this wants
+# two, because while it is down every HPA reading a custom metric reports <unknown> and holds its
+# current replica count - a silent freeze of autoscaling rather than an outage.
+replicas: 1
+
+resources:
+  requests: { cpu: 50m, memory: 128Mi }
+  limits:   { memory: 256Mi }
