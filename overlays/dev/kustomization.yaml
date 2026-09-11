@@ -68,7 +68,7 @@ namespace: taxcalc-dev
 images:
   - name:    uptimecrew/taxcalc-api
     newName: ghcr.io/ai-native-2026-07-29-intuit/taxcalc-api
-    newTag:  "9d3c9e8b74b4f06799da2044833fe09abb9bd872"
+    newTag:  "5806c4ec643b530e3f56e75f7cd64d890c1300a4"
 
 # Per-env replica count. dev runs hot at one replica.
 #
