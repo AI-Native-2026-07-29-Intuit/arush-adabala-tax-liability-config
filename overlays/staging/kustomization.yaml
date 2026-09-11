@@ -37,7 +37,7 @@ patches:
 
   # HPA floor, patched per env to MATCH the replica count above.
   #
-  # k8s/taxcalc-api/taxcalc-api.hpa.yaml sets minReplicas: 2 for every environment,
+  # k8s/taxcalc-api/hpa.yaml sets minReplicas: 2 for every environment,
   # which silently overrides `replicas:` here: the HPA scales the Deployment
   # back up to its own floor within a reconcile, and because
   # Deployment.spec.replicas is in ignoreDifferences, Argo CD reports Synced
@@ -47,7 +47,7 @@ patches:
   # the HPA agree at rest. ignoreDifferences is still correct and still needed
   # - it is what lets the HPA scale UP under load without Argo CD calling that
   # drift - but the two no longer contradict each other at the floor.
-  - target: { kind: HorizontalPodAutoscaler, name: taxcalc-api }
+  - target: { kind: HorizontalPodAutoscaler, name: taxcalc-api-hpa }
     patch: |
       - op: replace
         path: /spec/minReplicas

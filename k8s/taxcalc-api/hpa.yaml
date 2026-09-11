@@ -1,4 +1,23 @@
-# k8s/taxcalc-api/taxcalc-api.hpa.yaml - SLO-derived HPA on a custom metric (W6 D5 Task 2, RUNNABLE).
+# k8s/taxcalc-api/hpa.yaml - SLO-derived HPA on a custom metric (W6 D5 Task 2, RUNNABLE).
+#
+# THE FILENAME AND THE OBJECT NAME BOTH CHANGED, AND NEITHER WAS COSMETIC
+#
+# This file was `taxcalc-api.hpa.yaml` and held an HPA named `taxcalc-api`.
+# Both are now the names the W6 D5 deliverable states: the file is hpa.yaml
+# (pdb.yaml alongside it) and the object is `taxcalc-api-hpa`.
+#
+# The object name is the one that actually mattered. The deliverable's check is
+# `kubectl -n taxcalc-dev get hpa taxcalc-api-hpa`, and against an HPA named
+# `taxcalc-api` that command returns NotFound - not a wrong value, not an
+# `<unknown>` target, but the same output an operator would get if this
+# autoscaler did not exist. Every scaling property below was already correct
+# and none of it was reachable by the name anyone would type. A resource whose
+# documented name does not resolve is indistinguishable from a missing
+# resource, which is the worst failure mode for a verification step.
+#
+# The `-hpa` suffix also matches taxcalc-api-pdb, which was already suffixed;
+# the two objects of this task now read as a pair on `kubectl get` output
+# instead of one bare name and one suffixed one.
 #
 # WHAT CHANGED TODAY, AND WHY THE OLD VERSION WAS WORSE THAN IT LOOKED
 #
@@ -54,7 +73,11 @@
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
-  name: taxcalc-api
+  # `taxcalc-api-hpa`, NOT `taxcalc-api`. The name is what the deliverable's
+  # verification command addresses; see the header. It is deliberately
+  # different from scaleTargetRef.name below - they are two objects, and
+  # sharing one name here only ever hid which of the two an error was about.
+  name: taxcalc-api-hpa
   namespace: taxcalc-dev
   labels:
     app.kubernetes.io/name:       taxcalc-api
@@ -67,7 +90,7 @@ spec:
     kind:       Deployment
     name:       taxcalc-api
   # Paired with the PodDisruptionBudget's minAvailable in
-  # taxcalc-api.pdb.yaml. The two numbers move together: a PDB floor ABOVE
+  # pdb.yaml. The two numbers move together: a PDB floor ABOVE
   # the HPA floor can never be satisfied once the HPA scales to its minimum
   # (allowed disruptions pins at 0 and node drains hang forever), and a PDB
   # floor BELOW it does not protect the availability the HPA floor exists for.

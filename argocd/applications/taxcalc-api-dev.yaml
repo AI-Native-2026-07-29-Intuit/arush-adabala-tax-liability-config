@@ -75,7 +75,7 @@ spec:
 
   # THE ONE FIELD WHERE "GIT IS THE SOURCE OF TRUTH" IS WRONG.
   #
-  # k8s/taxcalc-api/taxcalc-api.hpa.yaml sets minReplicas: 2; overlays/dev sets
+  # k8s/taxcalc-api/hpa.yaml sets minReplicas: 2; overlays/dev sets
   # replicas: 1. Both are correct - Git holds the value the Deployment is
   # CREATED with, and the HorizontalPodAutoscaler owns it from then on. Without
   # this block the two controllers fight forever: the HPA scales to 2, Argo CD

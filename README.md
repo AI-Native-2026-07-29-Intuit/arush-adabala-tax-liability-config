@@ -22,8 +22,10 @@ k8s/taxcalc-api/                   the manifest set every environment shares. Na
   taxcalc-worker.deployment.yaml       W6 D5 - the KEDA scale target (same image, worker profile)
   taxcalc-worker-scaledobject.yaml     W6 D5 - KEDA on taxpayers.events consumer-group lag
   taxcalc-api.configmap.yaml
-  taxcalc-api.hpa.yaml             W6 D5 - now on taxcalc_inflight_requests, no longer on CPU
-  taxcalc-api.pdb.yaml             W6 D5 - minAvailable 2, paired with the HPA floor
+  hpa.yaml                         W6 D5 - now on taxcalc_inflight_requests, no longer on CPU.
+                                   Object renamed taxcalc-api -> taxcalc-api-hpa: the old name made
+                                   the deliverable's own `get hpa taxcalc-api-hpa` return NotFound
+  pdb.yaml                         W6 D5 - minAvailable 2, paired with the HPA floor
   taxcalc-api.ingress.yaml
   taxcalc-api.servicemonitor.yaml
   prometheus-adapter-values.yaml   W6 D5 - Helm VALUES, not a manifest; the rule the HPA reads
@@ -246,7 +248,7 @@ kubectl -n argocd rollout restart deploy/argocd-notifications-controller
 
 **A change freeze freezes self-healing too.** The AppProject's `syncWindows` deny block (Fri 17:00 → Mon 05:00 UTC) stops *all* automated sync to `taxcalc-api-prod`, `selfHeal` included. Patching a ConfigMap in `taxcalc-prod` during the window left the drift in place for 240 s with the controller logging `Sync prevented by sync window`; the identical patch in `taxcalc-dev` was reverted in **10 seconds**. That is not a bug, but it is a trade-off nobody mentions when adding a freeze: for its duration prod is unprotected against drift as well as against deploys, and only a human `manualSync` closes the gap.
 
-**`Deployment.spec.replicas` is in `ignoreDifferences`, so scaling is not drift here.** `k8s/taxcalc-api/taxcalc-api.hpa.yaml` sets `minReplicas: 2` while the overlays set 1 / 2 / 3 — Git owns the value the Deployment is *created* with, the HPA owns it thereafter. `kubectl scale` is therefore *not* reverted, and that is correct; use a ConfigMap value if you want to watch `selfHeal` work.
+**`Deployment.spec.replicas` is in `ignoreDifferences`, so scaling is not drift here.** `k8s/taxcalc-api/hpa.yaml` sets `minReplicas: 2` while the overlays set 1 / 2 / 3 — Git owns the value the Deployment is *created* with, the HPA owns it thereafter. `kubectl scale` is therefore *not* reverted, and that is correct; use a ConfigMap value if you want to watch `selfHeal` work.
 
 **Never add `finalizers:` to the ApplicationSet template.** It silently defeats `preserveResourcesOnDeletion: true` — dropping an env from the list generator would then take its whole workload with it. See that file's header.
 

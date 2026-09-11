@@ -71,8 +71,8 @@ resources:
   - taxcalc-worker-scaledobject.yaml    # W6 D5 Task 1: KEDA on Kafka lag
   - taxcalc-api.service.yaml
   - taxcalc-api.configmap.yaml
-  - taxcalc-api.hpa.yaml
-  - taxcalc-api.pdb.yaml                # W6 D5 Task 2: the availability floor
+  - hpa.yaml                            # W6 D5 Task 2: renamed from taxcalc-api.hpa.yaml, and the object inside it is now taxcalc-api-hpa
+  - pdb.yaml                            # W6 D5 Task 2: the availability floor
   - taxcalc-api.ingress.yaml
   - taxcalc-api.servicemonitor.yaml
 

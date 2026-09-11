@@ -83,6 +83,42 @@ rules:
 # current replica count - a silent freeze of autoscaling rather than an outage.
 replicas: 1
 
+# MEMORY: 256Mi WAS TOO LOW, AND THE SYMPTOM WAS INVISIBLE FROM THE HPA
+#
+# The first W6 D5 pass set `limits.memory: 256Mi` by eye, reasoning that a
+# component serving ONE rule over two time series cannot need much. That
+# reasoning is wrong about what the adapter holds in memory, and it cost 24
+# OOMKills in the first three hours on this cluster:
+#
+#   $ kubectl -n monitoring top pod -l app.kubernetes.io/name=prometheus-adapter
+#   NAME                                CPU(cores)   MEMORY(bytes)
+#   prom-adapter-prometheus-adapter-…   7m           240Mi          # at IDLE
+#   $ kubectl -n monitoring describe pod … | grep -A2 'Last State'
+#   Last State:  Terminated
+#     Reason:    OOMKilled
+#     Exit Code: 137
+#
+# The rule count is not what sizes this. The adapter runs Kubernetes INFORMERS
+# over every Pod and Namespace in the cluster, so it can answer "which pod is
+# this series" without an API call per request, and that cache is sized by the
+# CLUSTER, not by the rule. On top of it sits the cached Prometheus series-
+# discovery result. One rule, all the pods.
+#
+# WHY THE HPA NEVER REPORTED IT, WHICH IS THE PART WORTH REMEMBERING
+#
+# A restart loop here is the quietest failure in the chain. While the adapter
+# is down custom.metrics.k8s.io has no backend, every HPA reading a custom
+# metric reports `<unknown>`, and an HPA whose metric is unreadable does not
+# fail, retry loudly or alert - it HOLDS its current replica count. So a
+# service under rising load silently stops scaling on a 5-8 minute cycle, and
+# the only evidence is a RESTARTS column in a namespace nobody is watching.
+# A `kubectl get hpa` that shows a healthy `0/6` is a sample taken between
+# OOMKills; the reading being correct proves nothing about the next one.
+#
+# 768Mi is ~3x the observed idle figure rather than a snug fit, because the
+# floor rises with the number of pods in the cluster and the cost of being
+# slightly wrong is a silent autoscaling freeze. requests.memory is raised to
+# the measured idle usage so the scheduler accounts for what this really holds.
 resources:
-  requests: { cpu: 50m, memory: 128Mi }
-  limits:   { memory: 256Mi }
+  requests: { cpu: 50m, memory: 256Mi }
+  limits:   { memory: 768Mi }
