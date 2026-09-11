@@ -56,6 +56,11 @@ A rollback is `git revert` on this repo. A drifted cluster is a controller alarm
 scripts/
   verify-appproject-guardrails.sh  asserts the project actually refuses what it claims to
   cfn-guardrails.sh                backfills the CFN guarantees the emulator does not provide
+  cfn-extract-s3.rb                reads S3 hardening out of a template, for reconcile-s3
+  cfn-extract-cost.rb              reads alarms/budgets/tags out of a template, for the W6 D4 reconciles
+  cfn-resolve-if.rb                collapses list-positioned Fn::If, which the emulator hands over raw
+  floci-cost-apis-shim.py          serves the budgets + tagging reads the emulator does not implement
+  cost-done-when.sh                runs W6 D4 Task 1's four acceptance checks, labelled by what each is worth
 ```
 
 ## The AWS substrate under all of this (W6 D3)
@@ -122,6 +127,46 @@ The Slack webhook that `argocd-system/notifications-cm.yaml` references lives in
 
 Five deny paths (`destinations`, `sourceRepos`, `clusterResourceWhitelist: []` vs `Namespace`, and the `ResourceQuota`/`LimitRange` blacklist) plus a positive control — the real dev Application must still be `Synced`, which is what stops the script from passing by refusing everything. It is validated against a deliberately permissive scratch AppProject; see the script header.
 
+### The W6 D4 cost stack on floci
+
+```bash
+export AWS_ENDPOINT_URL=http://localhost:4566
+
+# taxcalc-network-dev rolls back on floci for one reason: it does not evaluate
+# Fn::If in a LIST position and hands the raw mapping to EC2. Resolve only
+# those, then deploy through the ordinary ChangeSet flow.
+./scripts/cfn-resolve-if.rb cfn/taxcalc-network-dev.yaml EnvName=dev > /tmp/network.json
+#   -> resolved Fn::If [HasDbSg] -> false branch
+# taxcalc-app-dev exits 3 ("none found") and deploys from the committed file.
+
+./scripts/cfn-guardrails.sh reconcile-tags          # 3 passed - CFN drops every tag here
+./scripts/cfn-guardrails.sh reconcile-cloudwatch    # 1 GAP - and it explains why it cannot close
+./scripts/cost-done-when.sh                         # 2 passed, 2 via a local shim, 0 failed
+
+# An UPDATE ChangeSet, with the plan produced and the execution guarded.
+./scripts/cfn-guardrails.sh guard-update taxcalc-app-dev EnvName=dev
+```
+
+**`guard-update` refuses to execute on floci, and the refusal is the right answer.** floci's
+update path iterates every resource in the template rather than the change set's change list, and
+implements several update handlers as create — so it dies on the first non-idempotent one
+(`CreateSecret`) and never reaches the resource the plan actually named. The plan itself is
+correct (`Modify DbInstance … Replacement: False`) and is produced either way; executing it would
+only leave the stack in `UPDATE_ROLLBACK_COMPLETE`. The script probes the endpoint with a
+disposable stack rather than assuming, so against real AWS it executes normally.
+
+This usually goes unnoticed because `CreateTopic` and `CreateBucket` are idempotent: a template of
+purely idempotent types would update green while silently re-creating everything in it.
+
+**`SHIM` is not `PASS`.** `cost-done-when.sh` prints three verdicts rather than an exit status,
+because the four raw acceptance commands produce **one false pass and one false failure** on this
+engine: `describe-stacks` reports `CREATE_COMPLETE` for a stack containing an
+`AWS::Budgets::Budget` against a service floci does not run at all, and `get-resources` returns an
+empty list for tags that are genuinely applied. Of the two shimmed checks, the tagging one serves
+**real tags** through a reimplemented index; the budgets one is a **projection of the deployed
+template** and is not evidence that a budget exists. Every workaround refuses to run with
+`AWS_ENDPOINT_URL` unset. Full accounting in [`taxcalc-api/COST.md`](taxcalc-api/COST.md).
+
 ## Bootstrapping this into a cluster
 
 ```bash
@@ -167,4 +212,5 @@ The reasoning, the measurements and the things that did not work the first time 
 The AWS substrate write-up lives **here**, because the templates do:
 
 - [`taxcalc-api/INFRA.md`](taxcalc-api/INFRA.md) — the four stacks, deploy ordering, the ChangeSet flow and what to read in `describe-change-set`, export naming, drift detection, the cross-stack delete refusal, six decisions that departed from the reference layout, every `cfn-nag` suppression with its reasoning, and the `cfn-author` Skill audit.
-- The application repo's `README.md`, Week 6 Day 3 section.
+- [`taxcalc-api/COST.md`](taxcalc-api/COST.md) — the cost-governance runbook: the two spending planes and why only one is visible to AWS billing, the four-key tag taxonomy and its manual activation (which does **not** backfill), the Budget and billing-alarm runbooks, the NAT cost lever, the LLM plane's per-request attribution and where its cap actually sits, and the `cost-author` Skill audit. Moved here on W6 D4 for the same reason INFRA.md is here — the Budget, the alarm, the topic and the tags are all in `cfn/`, and so are the three static checks that enforce them.
+- The application repo's `README.md`, Week 6 Day 3 and Day 4 sections.

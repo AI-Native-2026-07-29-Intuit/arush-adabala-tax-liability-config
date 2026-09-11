@@ -45,7 +45,7 @@
 #                        security-critical properties (stands in for drift)
 #
 # Usage:
-#   ./scripts/cfn-guardrails.sh                    # run all six checks
+#   ./scripts/cfn-guardrails.sh                    # run all seven checks
 #   ./scripts/cfn-guardrails.sh guard-delete NAME  # the safe delete wrapper
 #
 # Against floci:     export AWS_ENDPOINT_URL=http://localhost:4566
@@ -58,6 +58,7 @@
 
 set -uo pipefail
 
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CFN_DIR="${CFN_DIR:-cfn}"
 REGION="${AWS_REGION:-us-east-1}"
 PASS=0; FAIL=0; GAP=0
@@ -364,6 +365,651 @@ if [ "${1:-}" = "reconcile-s3" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# Shared helper for the W6 D4 cost reconciles: the logical->physical id map a
+# deployed stack exposes, as the JSON object cfn-extract-cost.rb expects.
+_physical_map() {
+  aws_ cloudformation describe-stack-resources --stack-name "$1" \
+    --query 'StackResources[].[LogicalResourceId,PhysicalResourceId]' --output json 2>/dev/null |
+    ruby -rjson -e 'begin; puts JSON.dump(JSON.parse(STDIN.read).to_h); rescue; puts "{}"; end'
+}
+
+_cost_extract() {  # stack, template, [Key=Value ...]
+  local stack="$1" tpl="$2"; shift 2
+  CFN_STACK_NAME="$stack" CFN_EXPORTS="$(_exports_map)" \
+    ruby "$HERE/cfn-extract-cost.rb" "$tpl" "$(_physical_map "$stack")" "$@"
+}
+
+# The live cross-stack export table, so the extractor can resolve
+# Fn::ImportValue the way CloudFormation does rather than leaving a hole where
+# a bucket name should be.
+_exports_map() {
+  aws_ cloudformation list-exports --output json 2>/dev/null \
+    | jq -c '[.Exports[] | {(.Name): .Value}] | add // {}' 2>/dev/null || echo '{}'
+}
+
+# ---------------------------------------------------------------------------
+# reconcile-cur - create the Cost and Usage Report definition the stack
+# declares, over the cur API, because this endpoint's execute-change-set will
+# not apply it.
+#
+# WHY THIS RESOURCE EXISTS AT ALL. W6 D4 Task 4 asks for a Cost Explorer view
+# "saved as a report". A Cost Explorer SAVED VIEW has no public API - there is
+# no `aws ce create-report` - so that artefact cannot be declared, reviewed in
+# a PR, or rebuilt. AWS::CUR::ReportDefinition answers the same question with a
+# resource that CAN be: put-report-definition creates it and
+# describe-report-definitions reads it back.
+#
+# WHY IT NEEDS A RECONCILE. `guard-update taxcalc-cost-dev` plans the Add
+# correctly and then REFUSES to execute, because this endpoint's
+# execute-change-set does not honour the plan. The guard's own advice is to
+# apply the planned change deliberately over the per-service API, which is
+# what this does - and unlike reconcile-cloudwatch, it fully closes the gap:
+# floci's cur stores every property correctly when it arrives over the cur API.
+# Only the CloudFormation-to-cur wiring is missing.
+#
+# Refuses against real AWS, like every other reconcile here: there
+# CloudFormation creates it and a put around the outside is exactly the drift
+# detect-drift exists to catch.
+reconcile_cur() {
+  if ! is_emulator; then
+    printf 'refusing: reconcile-cur is an emulator-parity shim.\n' >&2
+    printf 'Against real AWS, CloudFormation creates AWS::CUR::ReportDefinition\n' >&2
+    printf 'itself; a put-report-definition around it would register as drift.\n' >&2
+    return 2
+  fi
+  command -v ruby >/dev/null 2>&1 || { printf 'refusing: ruby not found.\n' >&2; return 2; }
+
+  local stack="${1:-taxcalc-cost-dev}" tpl extracted count rc=0
+  tpl="$HERE/../$CFN_DIR/$stack.yaml"
+  head_ "reconcile-cur: $stack"
+  [ -f "$tpl" ] || { note "no template at $CFN_DIR/$stack.yaml; skipped"; return 0; }
+
+  extracted=$(_cost_extract "$stack" "$tpl" "${@:2}") || {
+    bad "could not read the report definition out of $(basename "$tpl")"; return 1; }
+
+  count=$(echo "$extracted" | jq '.cur | length')
+  if [ "$count" = "0" ]; then
+    note "template declares no AWS::CUR::ReportDefinition; nothing to reconcile"
+    return 0
+  fi
+
+  local i lid defn name live
+  for i in $(seq 0 $((count - 1))); do
+    lid=$(echo "$extracted" | jq -r ".cur[$i].LogicalId")
+    defn=$(echo "$extracted" | jq -c ".cur[$i].ReportDefinition")
+    name=$(echo "$defn" | jq -r '.ReportName')
+
+    # An unresolved Fn::ImportValue would arrive as a JSON object where a
+    # bucket name belongs. Refuse rather than create a report pointed at
+    # something that is not a bucket.
+    if [ "$(echo "$defn" | jq -r '.S3Bucket | type')" != "string" ]; then
+      bad "$lid: S3Bucket did not resolve to a string (unresolved ImportValue?)"
+      rc=1; continue
+    fi
+
+    aws_ cur put-report-definition --report-definition "$defn" >/dev/null 2>&1
+    live=$(aws_ cur describe-report-definitions \
+      --query "ReportDefinitions[?ReportName=='$name'].ReportName" --output text 2>/dev/null)
+    if [ "$live" = "$name" ]; then
+      ok "$lid - report definition '$name' is live and readable"
+      note "$(echo "$defn" | jq -r '"  s3://\(.S3Bucket)/\(.S3Prefix)  \(.TimeUnit) \(.Format)  schema: \(.AdditionalSchemaElements | join(","))"')"
+    else
+      bad "$lid - put-report-definition did not produce a readable '$name'"
+      rc=1
+    fi
+  done
+  return "$rc"
+}
+if [ "${1:-}" = "reconcile-cur" ]; then
+  shift; reconcile_cur "$@"; exit $?
+fi
+
+# ---------------------------------------------------------------------------
+# reconcile-cloudwatch - re-PUT the billing alarm so the properties this
+# endpoint's CloudFormation dropped are actually live.
+#
+# floci accepts AWS::CloudWatch::Alarm and creates a real, readable alarm with
+# the right namespace, metric, threshold and actions - and then reports
+# `TreatMissingData: None`. That is the subtlest of the three cost-stack parity
+# gaps, because the alarm looks correct in every field a reviewer skims, and
+# the single property it loses is the one that decides whether the alarm fires
+# correctly on a metric with routine gaps. AWS/Billing refreshes about every
+# six hours, so gaps ARE the normal case here.
+#
+# UNLIKE reconcile-s3, THIS ONE CANNOT ALWAYS CLOSE THE GAP, and saying so is
+# the point of the script. reconcile-s3 works because floci's S3 stores the
+# properties correctly when they arrive over the S3 API, so only the
+# CFN-to-S3 wiring is broken. TreatMissingData is dropped by floci's
+# CloudWatch itself: a direct put-metric-alarm --treat-missing-data ignore on
+# a throwaway alarm reads back `None` too. So the reconcile re-PUTs the
+# template's properties and then MEASURES, with that same probe, whether the
+# endpoint is capable of storing the value at all:
+#
+#   stored      -> PASS. The CFN wiring was the only problem, and it is fixed.
+#   not stored  -> GAP, not FAIL. The template is correct and the endpoint
+#                  cannot represent it. Reporting this as a template failure
+#                  would be the inverse error of reporting it as a pass.
+#
+# Note what is NOT affected: the deliverable's own Done-When for this alarm is
+# namespace + metric name, and those are live and correct without any of this.
+# TreatMissingData is the property COST.md flags as lost, and it stays lost.
+#
+# Refuses against real AWS: there CloudFormation applies TreatMissingData
+# itself, and a put-metric-alarm around it is exactly the out-of-band change
+# detect-drift exists to catch.
+reconcile_cloudwatch() {
+  if ! is_emulator; then
+    printf 'refusing: reconcile-cloudwatch is an emulator-parity shim.\n' >&2
+    printf 'Against real AWS, CloudFormation applies TreatMissingData itself;\n' >&2
+    printf 'a put-metric-alarm around it would register as stack drift.\n' >&2
+    return 2
+  fi
+  command -v ruby >/dev/null 2>&1 || { printf 'refusing: ruby not found.\n' >&2; return 2; }
+
+  local stack="${1:-taxcalc-cost-dev}" tpl extracted count rc=0
+  tpl="$HERE/../$CFN_DIR/$stack.yaml"
+  head_ "reconcile-cloudwatch: $stack"
+  [ -f "$tpl" ] || { note "no template at $CFN_DIR/$stack.yaml; skipped"; return 0; }
+
+  extracted=$(_cost_extract "$stack" "$tpl" "${@:2}") || {
+    bad "could not read alarm settings out of $(basename "$tpl")"; return 1; }
+
+  count=$(echo "$extracted" | jq '.alarms | length')
+  if [ "$count" = "0" ]; then
+    note "template declares no AWS::CloudWatch::Alarm; nothing to reconcile"
+    return 0
+  fi
+
+  local lid name declared live
+  for lid in $(echo "$extracted" | jq -r '.alarms | keys[]'); do
+    name=$(echo "$extracted" | jq -r ".alarms[\"$lid\"].AlarmName")
+
+    # Only reconcile an alarm the stack actually created. An alarm gated off by
+    # a Condition (EstimatedChargesAlarm outside us-east-1) must stay absent -
+    # creating it here would manufacture exactly the alarm-that-cannot-fire the
+    # Condition exists to prevent.
+    if ! aws_ cloudwatch describe-alarms --alarm-names "$name" \
+         --query 'MetricAlarms[0].AlarmName' --output text 2>/dev/null | grep -q .; then
+      note "$lid ($name) is not deployed in $REGION; skipped"
+      continue
+    fi
+
+    aws_ cloudwatch put-metric-alarm --cli-input-json "$(echo "$extracted" | jq -c ".alarms[\"$lid\"]")" \
+      >/dev/null 2>&1 || { bad "$lid: put-metric-alarm was rejected"; rc=1; continue; }
+
+    declared=$(echo "$extracted" | jq -r ".alarms[\"$lid\"].TreatMissingData // \"unset\"")
+    live=$(aws_ cloudwatch describe-alarms --alarm-names "$name" \
+      --query 'MetricAlarms[0].TreatMissingData' --output text 2>/dev/null)
+    if [ "$live" = "$declared" ]; then
+      ok "$lid - TreatMissingData is live as '$live'"
+    elif _cw_stores_treat_missing_data; then
+      # The endpoint CAN store it and this alarm still does not have it: that
+      # is a genuine failure of the reconcile, not an emulator limitation.
+      bad "$lid - TreatMissingData is '${live:-unset}' after a successful PUT, template declares '$declared'"
+      rc=1
+    else
+      gap "$lid - TreatMissingData stays '${live:-None}'; this endpoint drops it"
+      note "Measured, not assumed: a direct put-metric-alarm --treat-missing-data"
+      note "ignore on a throwaway alarm also reads back None, and the property is"
+      note "absent from the stored record entirely rather than set to a default."
+      note "The loss is in this CloudWatch, not in the CFN wiring and not in the"
+      note "template, so NO API CALL CLOSES IT. The template declares 'ignore'"
+      note "and real CloudWatch would apply it."
+      note ""
+      note "To READ the declared value through the normal API, run"
+      note "floci-cost-apis-shim.py and point describe-alarms at it: the alarm is"
+      note "forwarded from floci unchanged and this one property is overlaid from"
+      note "the template, named in the response's OverlaidFromTemplate."
+      note "That changes what you can READ, not how the alarm BEHAVES. floci's"
+      note "alarm still evaluates a gappy metric as 'missing', so this alarm's"
+      note "firing behaviour cannot be tested on this engine by any means."
+    fi
+
+    # notBreaching on a metric with routine gaps erases a real breach; assert
+    # the reconcile did not introduce it, whatever the template says.
+    if [ "$live" = "notBreaching" ]; then
+      bad "$lid - notBreaching on a gappy metric silently resets a real ALARM to OK"; rc=1
+    fi
+  done
+
+  echo
+  [ "$rc" -eq 0 ] && {
+    printf 'Reconciled as far as this endpoint allows. Whatever is live is live\n'
+    printf 'because THIS SCRIPT PUT it, not because CloudFormation applied it,\n'
+    printf 'and evidence taken from describe-alarms must say so.\n'
+  }
+  return $rc
+}
+
+# Does this endpoint's CloudWatch persist TreatMissingData through its own
+# native API? Answered with a disposable alarm rather than assumed, so the
+# same script reports honestly against floci and against real AWS.
+_cw_stores_treat_missing_data() {
+  local probe="cfn-guardrails-tmd-probe-$$" got
+  aws_ cloudwatch put-metric-alarm --alarm-name "$probe" \
+    --namespace CfnGuardrailsProbe --metric-name Probe --statistic Maximum \
+    --period 300 --evaluation-periods 1 --threshold 1 \
+    --comparison-operator GreaterThanThreshold --treat-missing-data ignore >/dev/null 2>&1 || return 1
+  got=$(aws_ cloudwatch describe-alarms --alarm-names "$probe" \
+    --query 'MetricAlarms[0].TreatMissingData' --output text 2>/dev/null)
+  aws_ cloudwatch delete-alarms --alarm-names "$probe" >/dev/null 2>&1
+  [ "$got" = "ignore" ]
+}
+
+if [ "${1:-}" = "reconcile-cloudwatch" ]; then
+  shift; reconcile_cloudwatch "$@"; exit $?
+fi
+
+# ---------------------------------------------------------------------------
+# reconcile-tags - apply the four cost-allocation keys this endpoint's
+# CloudFormation accepted and dropped.
+#
+# floci's CFN provider applies NO declared tag to ANY resource type measured
+# here - EC2, RDS, SNS, IAM all come back with an empty tag set - while
+# reporting CREATE_COMPLETE. The per-service tagging APIs (ec2 create-tags,
+# rds add-tags-to-resource, sns tag-resource) all work, so this reads each
+# resource's declared Tags out of its template and applies them there.
+#
+# This matters more than the other reconciles rather than less: a resource
+# missing `service` or `env` is INVISIBLE to the tag-scoped Budget. Untagged,
+# the Budget still reports healthy while guarding nothing - and the NAT Gateway
+# is the single largest line item it is meant to be guarding.
+#
+# Refuses against real AWS for the usual reason: there CloudFormation owns
+# these tags, and setting them out of band is drift.
+reconcile_tags() {
+  if ! is_emulator; then
+    printf 'refusing: reconcile-tags is an emulator-parity shim.\n' >&2
+    printf 'Against real AWS, CloudFormation applies resource tags itself;\n' >&2
+    printf 'setting them out of band would register as stack drift.\n' >&2
+    return 2
+  fi
+  command -v ruby >/dev/null 2>&1 || { printf 'refusing: ruby not found.\n' >&2; return 2; }
+
+  local stacks stack tpl extracted rc=0
+  stacks="${1:-taxcalc-network-dev taxcalc-app-dev taxcalc-cost-dev}"
+
+  for stack in $stacks; do
+    head_ "reconcile-tags: $stack"
+    tpl="$HERE/../$CFN_DIR/$stack.yaml"
+    if [ ! -f "$tpl" ]; then note "no template at $CFN_DIR/$stack.yaml; skipped"; continue; fi
+    if ! aws_ cloudformation describe-stacks --stack-name "$stack" >/dev/null 2>&1; then
+      note "$stack is not deployed; skipped"; continue
+    fi
+
+    extracted=$(_cost_extract "$stack" "$tpl") || {
+      bad "could not read tags out of $(basename "$tpl")"; rc=1; continue; }
+
+    # --- Pass 1: apply every tag set the template declares.
+    local lid type phys tagjson
+    for lid in $(echo "$extracted" | jq -r '.tags | keys[]'); do
+      type=$(echo "$extracted" | jq -r ".tags[\"$lid\"].type")
+      phys=$(_physical_id "$stack" "$lid")
+      # A Condition-gated resource (the per-AZ NAT gateways outside prod) is
+      # absent by design, not missing.
+      [ -n "$phys" ] && [ "$phys" != "None" ] || continue
+      tagjson=$(echo "$extracted" | jq -c ".tags[\"$lid\"].tags | map({Key,Value})")
+      _apply_tags "$type" "$phys" "$tagjson"
+    done
+
+    # --- Pass 2: verify the four cost-allocation keys are LIVE, and do it by
+    # reading them back rather than by trusting the write.
+    #
+    # Reading back is not belt-and-braces here, it is the only reliable
+    # signal: floci's `sns tag-resource` stores the tags correctly and then
+    # returns a response botocore cannot parse ("'TagResourceResult'"), so the
+    # CLI exits non-zero on a write that succeeded. Trusting exit status
+    # reports a false failure; trusting neither and re-reading reports what is
+    # actually there.
+    #
+    # The four-key requirement is scoped to BILLABLE types. A VPC, subnet,
+    # route table or security group is free, carries no line item, and can
+    # never appear in a cost report - demanding the taxonomy there would
+    # produce a wall of findings that are not cost-governance problems and
+    # would bury the one case that is. The billable set is what the Budget's
+    # CostFilters can actually match.
+    local billable
+    billable=$(aws_ cloudformation describe-stack-resources --stack-name "$stack" \
+      --query "StackResources[?contains(['AWS::EC2::NatGateway','AWS::EC2::EIP','AWS::RDS::DBInstance','AWS::RDS::DBCluster','AWS::S3::Bucket','AWS::EC2::Instance','AWS::EC2::Volume','AWS::ElasticLoadBalancingV2::LoadBalancer'], ResourceType)].[LogicalResourceId,ResourceType,PhysicalResourceId]" \
+      --output text 2>/dev/null)
+
+    if [ -z "$billable" ]; then
+      note "no billable resource types in this stack; nothing the Budget can see"
+    fi
+
+    while IFS=$'\t' read -r lid type phys; do
+      [ -n "$lid" ] || continue
+      local live missing=""
+      live=$(_live_tag_keys "$type" "$phys")
+      for k in service env tenant feature; do
+        echo "$live" | grep -qx "$k" || missing="$missing $k"
+      done
+      if [ -z "$missing" ]; then
+        ok "$lid ($type) - service/env/tenant/feature live on $phys"
+      else
+        # This is the finding that matters. A billable resource missing
+        # `service` or `env` is invisible to the tag-scoped Budget, which then
+        # keeps reporting healthy while guarding less than it claims to.
+        bad "$lid ($type) - not live:$missing - invisible to the tag-scoped Budget"
+        rc=1
+      fi
+    done <<EOF_BILLABLE
+$billable
+EOF_BILLABLE
+  done
+
+  echo
+  if [ "$rc" -eq 0 ]; then
+    printf 'Reconciled. These tags are live because THIS SCRIPT applied them over\n'
+    printf 'the per-service APIs, not because CloudFormation did - floci applies\n'
+    printf 'no declared tag to any resource type measured here.\n\n'
+    printf 'And note what it still does NOT buy: floci bills nobody, so no\n'
+    printf 'cost-allocation tag key is activated and no Cost Explorer report can\n'
+    printf 'group by one. The tags are real; the attribution they exist for\n'
+    printf 'remains unverifiable on this engine.\n'
+  fi
+  return $rc
+}
+
+_physical_id() {  # stack, logical id
+  aws_ cloudformation describe-stack-resources --stack-name "$1" \
+    --query "StackResources[?LogicalResourceId=='$2'].PhysicalResourceId" --output text 2>/dev/null
+}
+
+# RDS tagging is ARN-addressed. A DBInstance's physical id is its identifier
+# and floci happens to accept that, but a DBSubnetGroup's is rejected
+# (DBSubnetGroupNotFoundFault), so build the ARN rather than relying on which
+# of the two a given endpoint tolerates.
+_rds_arn() {  # type, physical id
+  case "$1" in
+    *DBInstance)    printf 'arn:aws:rds:%s:%s:db:%s' "$REGION" "$(_account_id)" "$2" ;;
+    *DBCluster)     printf 'arn:aws:rds:%s:%s:cluster:%s' "$REGION" "$(_account_id)" "$2" ;;
+    *DBSubnetGroup) printf 'arn:aws:rds:%s:%s:subgrp:%s' "$REGION" "$(_account_id)" "$2" ;;
+    *)              printf '%s' "$2" ;;
+  esac
+}
+
+_account_id() {
+  [ -n "${_ACCT_CACHE:-}" ] || _ACCT_CACHE=$(aws_ sts get-caller-identity --query Account --output text 2>/dev/null)
+  printf '%s' "${_ACCT_CACHE:-000000000000}"
+}
+
+_apply_tags() {  # type, physical id, tags JSON array
+  local type="$1" phys="$2" tags="$3"
+  case "$type" in
+    AWS::EC2::*)
+      aws_ ec2 create-tags --resources "$phys" --tags "$tags" >/dev/null 2>&1 ;;
+    AWS::RDS::*)
+      aws_ rds add-tags-to-resource --resource-name "$(_rds_arn "$type" "$phys")" \
+        --tags "$tags" >/dev/null 2>&1 ;;
+    AWS::SNS::Topic)
+      aws_ sns tag-resource --resource-arn "$phys" --tags "$tags" >/dev/null 2>&1 ;;
+    AWS::S3::Bucket)
+      aws_ s3api put-bucket-tagging --bucket "$phys" \
+        --tagging "$(echo "$tags" | jq -c '{TagSet: .}')" >/dev/null 2>&1 ;;
+    *)
+      note "$phys ($type) - no tagging API wired for this type; skipped"; return 0 ;;
+  esac
+  # Deliberately no error branch: the write's exit status is not trustworthy
+  # on this endpoint (see pass 2), so the read-back is the verdict.
+  return 0
+}
+
+_live_tag_keys() {  # type, physical id -> one tag key per line
+  case "$1" in
+    AWS::EC2::EIP)
+      aws_ ec2 describe-tags --filters "Name=resource-id,Values=$2" \
+        --query 'Tags[].Key' --output text 2>/dev/null | tr '\t' '\n' ;;
+    AWS::EC2::*)
+      aws_ ec2 describe-tags --filters "Name=resource-id,Values=$2" \
+        --query 'Tags[].Key' --output text 2>/dev/null | tr '\t' '\n' ;;
+    AWS::RDS::*)
+      aws_ rds list-tags-for-resource --resource-name "$(_rds_arn "$1" "$2")" \
+        --query 'TagList[].Key' --output text 2>/dev/null | tr '\t' '\n' ;;
+    AWS::SNS::Topic)
+      aws_ sns list-tags-for-resource --resource-arn "$2" \
+        --query 'Tags[].Key' --output text 2>/dev/null | tr '\t' '\n' ;;
+    AWS::S3::Bucket)
+      aws_ s3api get-bucket-tagging --bucket "$2" \
+        --query 'TagSet[].Key' --output text 2>/dev/null | tr '\t' '\n' ;;
+    *) : ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# guard-update - run an UPDATE ChangeSet, and refuse to execute it on an
+# endpoint whose execution does not honour the plan.
+#
+# THE PLAN AND THE EXECUTION DISAGREE ON floci, AND THE PLAN IS THE CORRECT
+# ONE. Measured with a four-resource probe stack whose update changes exactly
+# one resource's tags:
+#
+#   describe-change-set   Modify  Vpc  Replacement: False        <- correct
+#   execute-change-set    Sec UPDATE_IN_PROGRESS -> UPDATE_FAILED
+#                         "A secret with the name ... already exists."
+#
+# `Sec` is not in the change set. floci's update path iterates EVERY resource
+# in the template instead of the plan's change list, and its update handler
+# for several types is implemented as create. It aborts on the first one, so
+# `Vpc` - the only planned change - is never reached and the stack lands in
+# UPDATE_ROLLBACK_COMPLETE.
+#
+# Why it usually looks like it works: most create APIs are idempotent.
+# CreateTopic and CreateBucket on an existing name return the existing
+# resource, so re-creating them is invisible. CreateSecret is NOT idempotent
+# and throws. So the blast radius is not "Secrets Manager is special" - it is
+# "every resource is re-created on every update, and you only find out where
+# the create API happens to object". A template of purely idempotent types
+# would update green while silently re-creating everything in it.
+#
+# What this does about it:
+#   1. create-change-set + describe-change-set ALWAYS. The plan is the
+#      artefact the review is actually about - "tags changed, Replacement:
+#      False" - and it is correct on this endpoint.
+#   2. Probes THIS endpoint with a disposable stack to find out whether
+#      execution honours the plan. Measured, not assumed, so the same command
+#      is correct against real AWS.
+#   3. Honoured    -> execute-change-set, normally.
+#      Not honoured -> REFUSES to execute, because executing would roll the
+#      stack back and leave it in UPDATE_ROLLBACK_COMPLETE - strictly worse
+#      than not trying. It then names the planned changes so they can be
+#      applied deliberately (for a tag-only change: reconcile-tags).
+#
+# Usage:
+#   ./scripts/cfn-guardrails.sh guard-update taxcalc-app-dev EnvName=dev
+guard_update() {
+  local stack="${1:-}"; shift || true
+  [ -n "$stack" ] || { printf 'usage: cfn-guardrails.sh guard-update STACK [Key=Value ...]\n' >&2; return 2; }
+
+  local tpl="$HERE/../$CFN_DIR/$stack.yaml"
+  [ -f "$tpl" ] || { printf 'refusing: no template at %s/%s.yaml\n' "$CFN_DIR" "$stack" >&2; return 2; }
+
+  local csname="guard-update-$$" params=()
+  local p
+  for p in "$@"; do
+    params+=("ParameterKey=${p%%=*},ParameterValue=${p#*=}")
+  done
+
+  head_ "guard-update: $stack"
+
+  if ! aws_ cloudformation describe-stacks --stack-name "$stack" >/dev/null 2>&1; then
+    bad "$stack is not deployed; an UPDATE ChangeSet needs an existing stack"
+    return 1
+  fi
+
+  # --- 1. the plan
+  if ! aws_ cloudformation create-change-set --stack-name "$stack" --change-set-name "$csname" \
+        --change-set-type UPDATE --template-body "file://$tpl" \
+        ${params[@]+"${params[@]/#/--parameters=}"} \
+        --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM >/dev/null 2>&1; then
+    bad "create-change-set was rejected"
+    return 1
+  fi
+  # No wait API worth trusting here; poll for a terminal ChangeSet status.
+  local cstatus=""
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    cstatus=$(aws_ cloudformation describe-change-set --stack-name "$stack" \
+      --change-set-name "$csname" --query Status --output text 2>/dev/null)
+    case "$cstatus" in CREATE_COMPLETE|FAILED) break ;; esac
+    sleep 1
+  done
+
+  if [ "$cstatus" = "FAILED" ]; then
+    local reason
+    reason=$(aws_ cloudformation describe-change-set --stack-name "$stack" \
+      --change-set-name "$csname" --query StatusReason --output text 2>/dev/null)
+    case "$reason" in
+      *"didn't contain changes"*|*"No updates"*|*"no updates"*)
+        ok "no changes - the deployed stack already matches the template"
+        aws_ cloudformation delete-change-set --stack-name "$stack" --change-set-name "$csname" >/dev/null 2>&1
+        return 0 ;;
+      *) bad "change set failed: $reason"
+         aws_ cloudformation delete-change-set --stack-name "$stack" --change-set-name "$csname" >/dev/null 2>&1
+         return 1 ;;
+    esac
+  fi
+
+  # Real CloudFormation FAILS a no-op change set ("didn't contain changes");
+  # floci reports CREATE_COMPLETE with an empty Changes list instead. Handle
+  # both, or an empty plan reads as "nothing is replaced" - which is true and
+  # completely uninformative.
+  local nchanges
+  nchanges=$(aws_ cloudformation describe-change-set --stack-name "$stack" \
+    --change-set-name "$csname" --query 'length(Changes)' --output text 2>/dev/null)
+  if [ "${nchanges:-0}" = "0" ]; then
+    ok "no changes - the deployed stack already matches the template"
+    note "This endpoint returned an empty change set rather than failing it;"
+    note "real CloudFormation fails a no-op change set outright."
+    aws_ cloudformation delete-change-set --stack-name "$stack" --change-set-name "$csname" >/dev/null 2>&1
+    return 0
+  fi
+
+  printf '\n  \033[1mPlan\033[0m (this is the artefact the review is about)\n'
+  aws_ cloudformation describe-change-set --stack-name "$stack" --change-set-name "$csname" \
+    --query 'Changes[].ResourceChange.[Action,LogicalResourceId,ResourceType,Replacement]' \
+    --output text 2>/dev/null | sed 's/^/    /'
+
+  # `Replacement: True` on a data resource is destroy-and-recreate. Flag it
+  # here rather than leaving it to be noticed in the diff.
+  local replacing
+  replacing=$(aws_ cloudformation describe-change-set --stack-name "$stack" --change-set-name "$csname" \
+    --query "Changes[?ResourceChange.Replacement=='True'].ResourceChange.LogicalResourceId" \
+    --output text 2>/dev/null)
+  if [ -n "$replacing" ] && [ "$replacing" != "None" ]; then
+    printf '\n'
+    bad "Replacement: True on:$(printf ' %s' $replacing)"
+    note "Destroy-and-recreate. On a data resource that is data loss unless"
+    note "UpdateReplacePolicy: Retain is set. Not executing."
+    aws_ cloudformation delete-change-set --stack-name "$stack" --change-set-name "$csname" >/dev/null 2>&1
+    return 1
+  fi
+  ok "no resource is replaced by this change set"
+
+  # --- 2. does THIS endpoint's execution honour the plan?
+  printf '\n'
+  if _update_honours_plan; then
+    ok "this endpoint's execute-change-set honours the change set"
+    # --- 3a. execute
+    aws_ cloudformation execute-change-set --stack-name "$stack" --change-set-name "$csname" >/dev/null 2>&1
+    local s=""
+    for _ in $(seq 1 60); do
+      s=$(aws_ cloudformation describe-stacks --stack-name "$stack" --query 'Stacks[0].StackStatus' --output text 2>/dev/null)
+      case "$s" in *COMPLETE|*FAILED) break ;; esac
+      sleep 1
+    done
+    if [ "$s" = "UPDATE_COMPLETE" ]; then ok "$stack is $s"; return 0; fi
+    bad "$stack is $s after execute"
+    aws_ cloudformation describe-stack-events --stack-name "$stack" \
+      --query 'StackEvents[?contains(ResourceStatus,`FAILED`)].[LogicalResourceId,ResourceStatusReason]' \
+      --output text 2>/dev/null | head -3 | sed 's/^/        /'
+    return 1
+  fi
+
+  # --- 3b. refuse
+  gap "this endpoint's execute-change-set does NOT honour the change set"
+  note "Probed with a disposable stack: the plan named one resource and the"
+  note "execution touched a different one that the plan said was unchanged."
+  note "floci iterates every resource in the template rather than the plan's"
+  note "change list, and implements several update handlers as create."
+  note ""
+  note "NOT EXECUTING. Executing would fail on the first non-idempotent create"
+  note "and leave $stack in UPDATE_ROLLBACK_COMPLETE - worse than not trying."
+  note "The plan above is still valid evidence, and is the correct answer to"
+  note "'does this change replace anything'."
+  note ""
+  note "To apply the planned change on this endpoint, do it deliberately over"
+  note "the per-service APIs. For a tag-only change that is:"
+  note "    ./scripts/cfn-guardrails.sh reconcile-tags $stack"
+  aws_ cloudformation delete-change-set --stack-name "$stack" --change-set-name "$csname" >/dev/null 2>&1
+  return 0
+}
+
+# Probe: does execute-change-set act on the plan, or on the whole template?
+#
+# A four-resource stack updated so that exactly ONE resource changes. If the
+# endpoint honours the plan, the update completes. If it re-creates
+# everything, it dies on the non-idempotent CreateSecret - which is the
+# canary, not the bug.
+_update_honours_plan() {
+  local probe="cfn-guardrails-updateprobe-$$" secret="cfn-guardrails-probe-secret-$$" tmp verdict=1
+  tmp=$(mktemp -t cfnguardrails)
+  cat > "$tmp" <<EOF_PROBE
+AWSTemplateFormatVersion: "2010-09-09"
+Parameters:
+  TagValue: {Type: String, Default: one}
+Resources:
+  Sec:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: $secret
+      SecretString: '{"probe":"1"}'
+  Topic:
+    Type: AWS::SNS::Topic
+    Properties: {TopicName: $probe-topic}
+  Net:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.253.0.0/16
+      Tags: [{Key: probe, Value: !Ref TagValue}]
+EOF_PROBE
+
+  _update_probe_cleanup() {
+    aws_ cloudformation delete-stack --stack-name "$probe" >/dev/null 2>&1
+    aws_ secretsmanager delete-secret --secret-id "$secret" --force-delete-without-recovery >/dev/null 2>&1
+    rm -f "$tmp"
+  }
+
+  if aws_ cloudformation create-stack --stack-name "$probe" --template-body "file://$tmp" >/dev/null 2>&1; then
+    local s=""
+    for _ in $(seq 1 40); do
+      s=$(aws_ cloudformation describe-stacks --stack-name "$probe" --query 'Stacks[0].StackStatus' --output text 2>/dev/null)
+      case "$s" in *COMPLETE|*FAILED) break ;; esac
+      sleep 1
+    done
+    if [ "$s" = "CREATE_COMPLETE" ]; then
+      aws_ cloudformation update-stack --stack-name "$probe" --template-body "file://$tmp" \
+        --parameters ParameterKey=TagValue,ParameterValue=two >/dev/null 2>&1
+      for _ in $(seq 1 40); do
+        s=$(aws_ cloudformation describe-stacks --stack-name "$probe" --query 'Stacks[0].StackStatus' --output text 2>/dev/null)
+        case "$s" in UPDATE_COMPLETE|*ROLLBACK_COMPLETE|*FAILED) break ;; esac
+        sleep 1
+      done
+      [ "$s" = "UPDATE_COMPLETE" ] && verdict=0
+    fi
+  fi
+  _update_probe_cleanup
+  return $verdict
+}
+
+if [ "${1:-}" = "guard-update" ]; then
+  shift; guard_update "$@"; exit $?
+fi
+
+if [ "${1:-}" = "reconcile-tags" ]; then
+  shift; reconcile_tags "$@"; exit $?
+fi
+
+# ---------------------------------------------------------------------------
 # detect-drift - the console-edit / detect / revert exercise, worked around.
 #
 # detect-stack-drift is UnknownAction on floci (verified; see
@@ -506,6 +1152,133 @@ if [ "$STATIC" = "true" ]; then
   else
     ok "app SG template has no 0.0.0.0/0 ingress"
   fi
+  # ---------------------------------------------------------------------
+  # W6 D4 Task 1. Both checks below are template-derived, so they gate every
+  # PR whether or not an AWS account is wired - which matters more here than
+  # elsewhere, because both failures are INVISIBLE at deploy time. An
+  # untagged NAT Gateway and an alarm set to notBreaching both reach
+  # CREATE_COMPLETE and both look correct in the console.
+  head_ '5. Cost-allocation tag coverage on billable resources (static)'
+  # A tag-scoped Budget filters on service AND env; a resource missing either
+  # key contributes spend the Budget cannot see. That is not a cosmetic gap -
+  # it silently shrinks what the guardrail guards, while the guardrail keeps
+  # reporting green. So the four keys are asserted here rather than left to
+  # a convention nobody re-checks.
+  #
+  # Scoped to the resource types that actually carry a recurring charge; a
+  # route table has no line item and demanding tags on it would train people
+  # to ignore this check.
+  BILLABLE_TYPES='AWS::EC2::NatGateway|AWS::EC2::EIP|AWS::RDS::DBInstance'
+  TAG_MISSING=0
+  while IFS= read -r block; do
+    tpl=${block%%$'\t'*}; rest=${block#*$'\t'}
+    lid=${rest%%$'\t'*}; body=${rest#*$'\t'}
+    for k in service env tenant feature; do
+      case "$body" in
+        *"Key: $k,"*|*"Key: $k}"*|*"Key: $k "*) ;;
+        *) bad "$tpl: $lid is billable but has no '$k' cost-allocation tag"
+           TAG_MISSING=$((TAG_MISSING+1)) ;;
+      esac
+    done
+  done <<EOF
+$(awk -v types="$BILLABLE_TYPES" '
+    FILENAME != prevfile { prevfile = FILENAME; lid = ""; body = ""; billable = 0 }
+    # A top-level resource starts at exactly two spaces of indent.
+    /^  [A-Za-z0-9]+:[ \t]*$/ {
+      if (lid != "" && billable) printf "%s\t%s\t%s\n", FILENAME, lid, body
+      lid = $1; sub(/:$/, "", lid); body = ""; billable = 0; next
+    }
+    # ANCHORED to a four-space "    Type:" and not a bare "Type:" substring.
+    # Unanchored, `TargetType: AWS::RDS::DBInstance` on the
+    # SecretTargetAttachment matched, and the check demanded cost-allocation
+    # tags on a resource that has no charge and cannot carry tags at all - a
+    # red check nobody can make green, which gets the check deleted rather
+    # than the template fixed.
+    { body = body " " $0; if ($0 ~ ("^    Type: (" types ")[ \t]*$")) billable = 1 }
+    END { if (lid != "" && billable) printf "%s\t%s\t%s\n", FILENAME, lid, body }
+  ' "$CFN_DIR"/*.yaml)
+EOF
+  [ "$TAG_MISSING" -eq 0 ] && ok "every billable resource in $CFN_DIR/ carries all four cost-allocation tags"
+
+  head_ '6. Billing alarm does not use TreatMissingData: notBreaching (static)'
+  # On AWS/Billing EstimatedCharges - a metric that publishes roughly every 6h
+  # - notBreaching reads every routine gap as "fine" and resets a real breach
+  # to OK. `ignore` holds the last state instead. The two spellings are one
+  # word apart and the wrong one produces an alarm that never usefully fires.
+  #
+  # THIS IS THE TASK'S LITERAL GREP, deliberately, and it took two goes.
+  #
+  # The first spelling was exactly this. It failed - on the paragraph in
+  # taxcalc-cost-dev.yaml explaining why the value is wrong. The second
+  # spelling anchored the match to the PROPERTY ASSIGNMENT
+  # (`^\s*TreatMissingData:\s*notBreaching`) so prose could not trip it. That
+  # passed, and it was the wrong fix: it quietly replaced the acceptance
+  # command with a different, weaker one. A reviewer pasting the command from
+  # the task would still have seen two matches and had to take our word that
+  # they were benign.
+  #
+  # So the template's prose was hyphenated instead (see the block above
+  # TreatMissingData there, which explains the hyphen at the only place
+  # anybody would wonder about it), and the check is back to the command the
+  # task states. The stronger claim - no occurrence of the token in cfn/ AT
+  # ALL, in a property or a comment - is now the one actually enforced, and
+  # the acceptance command and the CI gate are the same string again.
+  if grep -RIn "notBreaching" "$CFN_DIR"/ >/dev/null 2>&1; then
+    bad "'notBreaching' found in $CFN_DIR/ - see cfn/taxcalc-cost-dev.yaml for why it is wrong on a billing metric"
+    grep -RIn "notBreaching" "$CFN_DIR"/ | while read -r l; do note "$l"; done
+  else
+    ok "zero matches for 'notBreaching' in $CFN_DIR/ (billing alarm uses ignore)"
+  fi
+
+  head_ '7. No AWS Budget aimed at spend AWS does not bill (static)'
+  # Added as the one ACCEPTED finding of the cost-author audit on
+  # scratch/cost-author. That pass rejected three defects; checks 5 and 6
+  # already gated two of them, and this one - the most convincing of the three
+  # - was gated by nothing at all. It existed only as a paragraph in COST.md
+  # and a row in the skill's table, which is to say it was enforced by whoever
+  # happened to remember it.
+  #
+  # WHAT IT CATCHES. An AWS::Budgets::Budget created to cap Anthropic (or
+  # OpenAI, or any third-party model) spend. Such a budget is syntactically
+  # perfect, deploys cleanly, is returned by describe-budget looking exactly
+  # like a real one, and reports 0% utilisation forever - because that spend
+  # bills to the provider's own account. AWS is not the merchant, so there is
+  # no AWS cost record for the filter to match and no tag anybody could apply
+  # that would create one. It is a control that reports healthy and enforces
+  # nothing: the shape a reviewer ticks off.
+  #
+  # BEDROCK IS DELIBERATELY NOT MATCHED. Amazon Bedrock is a hosted model AND
+  # AWS-resident spend, so a Bedrock-scoped Budget is legitimate and belongs
+  # in cfn/. A detector keyed on "is this about an LLM?" would reject a
+  # correct template and would be deleted within a sprint. The axis is not
+  # "is it AI?" - it is "who is the merchant?", the same split COST.md uses to
+  # put the self-hosted embeddings service on neither plane.
+  #
+  # Comments are stripped before matching, for the reason check 6 learned the
+  # hard way: taxcalc-cost-dev.yaml explains at length why an Anthropic budget
+  # would be wrong, and a check that trips on the explanation of the rule it
+  # enforces gets deleted rather than obeyed.
+  NON_AWS_MERCHANT='anthropic|openai|claude|gpt-|llm-spend|llm_spend'
+  LLM_BUDGETS=$(awk -v pat="$NON_AWS_MERCHANT" '
+      FILENAME != prevfile { prevfile = FILENAME; lid = ""; body = ""; isbudget = 0 }
+      /^  [A-Za-z0-9]+:[ \t]*$/ {
+        if (lid != "" && isbudget && tolower(body) ~ pat) printf "%s: %s\n", FILENAME, lid
+        lid = $1; sub(/:$/, "", lid); body = ""; isbudget = 0; next
+      }
+      {
+        stripped = $0; sub(/#.*$/, "", stripped); body = body " " stripped
+        if ($0 ~ /^    Type: AWS::Budgets::Budget[ \t]*$/) isbudget = 1
+      }
+      END { if (lid != "" && isbudget && tolower(body) ~ pat) printf "%s: %s\n", FILENAME, lid }
+    ' "$CFN_DIR"/*.yaml)
+  if [ -n "$LLM_BUDGETS" ]; then
+    bad "an AWS Budget in $CFN_DIR/ targets non-AWS spend - it will report 0% forever"
+    echo "$LLM_BUDGETS" | while read -r l; do note "$l"; done
+    note "cap that spend at the provider's platform; attribute it with CostLogger + X-Cost-Usd."
+  else
+    ok "no AWS Budget in $CFN_DIR/ targets spend AWS cannot see"
+  fi
+
   head_ 'Result (static mode - no AWS calls made)'
   printf '%d passed, %d failed\n' "$PASS" "$FAIL"
   [ "$FAIL" -eq 0 ] || exit 1

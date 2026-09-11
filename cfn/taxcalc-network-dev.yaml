@@ -206,19 +206,56 @@ Resources:
   # DependsOn IgwAttachment on every EIP - an Elastic IP allocated before the
   # IGW is attached to the VPC can fail to associate, and the resulting error
   # names the EIP rather than the missing attachment.
+  #
+  # W6 D4 Task 1: every NAT Gateway and its EIP now carries the four-key
+  # cost-allocation taxonomy (service / env / tenant / feature) on top of the
+  # existing Name tag. The NAT Gateway is the single largest line item in this
+  # account (~$32/mo per gateway before data processing), so it is the resource
+  # the taxcalc-monthly-cost-<env> Budget most needs to be able to see - and a
+  # tag-scoped Budget sees NOTHING that is missing either key.
+  #
+  # The EIPs are tagged too, which the task does not ask for. An EIP attached
+  # to a running NAT Gateway is free, so tagging it looks like nothing; a
+  # DETACHED EIP bills ~$3.60/mo, and a detached EIP is exactly what a
+  # half-finished teardown leaves behind. Untagged, that charge would be
+  # invisible to the Budget and would surface only on the account-wide alarm,
+  # which is the backstop rather than the attribution.
+  #
+  # These four keys are ADDITIONAL to the existing Env/Project tags, not a
+  # rename: AWS cost-allocation tag keys are case-sensitive, so `Env` and `env`
+  # are two distinct keys that must be activated separately in the Billing
+  # console. Renaming would have been the tidier diff and would have silently
+  # detached this resource from any historical `Env`-keyed report.
   NatEipA:
     Type: AWS::EC2::EIP
     DependsOn: IgwAttachment
     Properties:
       Domain: vpc
-      Tags: [{Key: Name, Value: !Sub "taxcalc-${EnvName}-nat-eip-a"}]
+      Tags:
+        - {Key: Name, Value: !Sub "taxcalc-${EnvName}-nat-eip-a"}
+        - {Key: service, Value: taxcalc}
+        - {Key: env, Value: !Ref EnvName}
+        - {Key: tenant, Value: shared}
+        - {Key: feature, Value: egress}
 
   NatGatewayA:
     Type: AWS::EC2::NatGateway
     Properties:
       AllocationId: !GetAtt NatEipA.AllocationId
       SubnetId: !Ref PublicSubnetA
-      Tags: [{Key: Name, Value: !Sub "taxcalc-${EnvName}-nat-a"}]
+      Tags:
+        - {Key: Name, Value: !Sub "taxcalc-${EnvName}-nat-a"}
+        - {Key: service, Value: taxcalc}
+        - {Key: env, Value: !Ref EnvName}
+        - {Key: tenant, Value: shared}
+        # feature=egress, not feature=explain-liability. The NAT Gateway is
+        # shared infrastructure every outbound call crosses - including, but
+        # not only, the Anthropic call the explain-liability feature makes.
+        # Tagging it after one of its consumers would attribute all egress to
+        # that feature and make the per-feature view actively misleading. The
+        # feature key earns its keep on the LLM plane, where CostLogger
+        # dimensions each call by the feature that made it.
+        - {Key: feature, Value: egress}
 
   NatEipB:
     Type: AWS::EC2::EIP
@@ -226,7 +263,12 @@ Resources:
     DependsOn: IgwAttachment
     Properties:
       Domain: vpc
-      Tags: [{Key: Name, Value: !Sub "taxcalc-${EnvName}-nat-eip-b"}]
+      Tags:
+        - {Key: Name, Value: !Sub "taxcalc-${EnvName}-nat-eip-b"}
+        - {Key: service, Value: taxcalc}
+        - {Key: env, Value: !Ref EnvName}
+        - {Key: tenant, Value: shared}
+        - {Key: feature, Value: egress}
 
   NatGatewayBPerAz:
     Type: AWS::EC2::NatGateway
@@ -234,7 +276,12 @@ Resources:
     Properties:
       AllocationId: !GetAtt NatEipB.AllocationId
       SubnetId: !Ref PublicSubnetB
-      Tags: [{Key: Name, Value: !Sub "taxcalc-${EnvName}-nat-b"}]
+      Tags:
+        - {Key: Name, Value: !Sub "taxcalc-${EnvName}-nat-b"}
+        - {Key: service, Value: taxcalc}
+        - {Key: env, Value: !Ref EnvName}
+        - {Key: tenant, Value: shared}
+        - {Key: feature, Value: egress}
 
   NatEipC:
     Type: AWS::EC2::EIP
@@ -242,7 +289,12 @@ Resources:
     DependsOn: IgwAttachment
     Properties:
       Domain: vpc
-      Tags: [{Key: Name, Value: !Sub "taxcalc-${EnvName}-nat-eip-c"}]
+      Tags:
+        - {Key: Name, Value: !Sub "taxcalc-${EnvName}-nat-eip-c"}
+        - {Key: service, Value: taxcalc}
+        - {Key: env, Value: !Ref EnvName}
+        - {Key: tenant, Value: shared}
+        - {Key: feature, Value: egress}
 
   NatGatewayCPerAz:
     Type: AWS::EC2::NatGateway
@@ -250,7 +302,12 @@ Resources:
     Properties:
       AllocationId: !GetAtt NatEipC.AllocationId
       SubnetId: !Ref PublicSubnetC
-      Tags: [{Key: Name, Value: !Sub "taxcalc-${EnvName}-nat-c"}]
+      Tags:
+        - {Key: Name, Value: !Sub "taxcalc-${EnvName}-nat-c"}
+        - {Key: service, Value: taxcalc}
+        - {Key: env, Value: !Ref EnvName}
+        - {Key: tenant, Value: shared}
+        - {Key: feature, Value: egress}
 
   # --- Public route table: 0.0.0.0/0 -> IGW. Shared across all 3 AZs, because
   # every public subnet wants the identical route.

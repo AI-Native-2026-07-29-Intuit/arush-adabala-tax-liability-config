@@ -21,6 +21,21 @@
 #   pip install cfn-lint==1.56.1 cfn-lint-serverless==0.3.5
 #   cfn-lint cfn/*.yaml -a cfn_lint_serverless.rules
 #   gem install cfn-nag -v 0.8.10 && cfn_nag_scan --input-path cfn --fail-on-warnings
+#   # ...or, on a host whose Ruby is 4.x and therefore cannot run cfn-nag at all:
+#   docker run --rm -v "$PWD/cfn:/cfn" stelligent/cfn_nag /cfn --fail-on-warnings
+#
+# W6 D4 note - this workflow needed NO new step for the cost stack, and that is
+# the design working rather than an omission. Every tool here is already
+# directory-scoped (`cfn/*.yaml`, `--input-path cfn`) and validate-template is a
+# loop over the same glob, so cfn/taxcalc-cost-dev.yaml was linted, scanned and
+# API-validated the moment it was committed. The Task 1 brief asks for "one
+# added validate-template step"; adding a second, cost-stack-specific step would
+# have meant the NEXT template needed a third. What did change is `paths:` above
+# and three new static checks in scripts/cfn-guardrails.sh (tag coverage,
+# TreatMissingData, and no AWS Budget aimed at spend AWS does not bill), because
+# those are assertions the three generic tools have no opinion about. The third
+# arrived via the cost-author audit, which found the first two gated on every PR
+# and the third enforced only by whoever remembered it.
 name: cfn-validate
 
 on:
@@ -28,6 +43,7 @@ on:
     paths:
       - "cfn/**"
       - "scripts/cfn-guardrails.sh"
+      - "scripts/cfn-extract-s3.rb"
       - ".github/workflows/cfn-validate.yml"
 
 permissions:
