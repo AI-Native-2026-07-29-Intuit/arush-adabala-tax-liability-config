@@ -1,0 +1,149 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+# CANDIDATE UNDER REVIEW - NOT A DEPLOYABLE ARTEFACT.
+#
+# Planted defects 2 and 3 of 3:
+#
+#   2. TreatMissingData: notBreaching on the AWS/Billing EstimatedCharges
+#      alarm - a meaningful alarm on a metric with routine gaps.
+#   3. A second AWS::Budgets::Budget created to cap Anthropic/LLM spend.
+#
+# Both reach CREATE_COMPLETE. Both look correct in the console. Neither does
+# what its author believed it did. That is the entire point of planting them:
+# a review that only reads for syntax passes this file.
+#
+# Reviewed by .claude/skills/cost-author/SKILL.md section 6, rows 2 and 3.
+
+Parameters:
+  EnvName:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+  MonthlyBudgetUsd:
+    Type: Number
+    Default: 100
+  BillingAlarmUsd:
+    Type: Number
+    Default: 120
+  MonthlyLlmBudgetUsd:
+    Type: Number
+    Default: 50
+
+Resources:
+  CostAlarmsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "taxcalc-cost-alarms-${EnvName}"
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - {Key: service, Value: taxcalc}
+        - {Key: env, Value: !Ref EnvName}
+        - {Key: tenant, Value: shared}
+        - {Key: feature, Value: cost-governance}
+
+  CostAlarmsTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: [!Ref CostAlarmsTopic]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowBudgetsPublish
+            Effect: Allow
+            Principal: {Service: budgets.amazonaws.com}
+            Action: sns:Publish
+            Resource: !Ref CostAlarmsTopic
+            Condition:
+              StringEquals: {AWS:SourceAccount: !Ref AWS::AccountId}
+          - Sid: AllowCloudWatchPublish
+            Effect: Allow
+            Principal: {Service: cloudwatch.amazonaws.com}
+            Action: sns:Publish
+            Resource: !Ref CostAlarmsTopic
+            Condition:
+              StringEquals: {AWS:SourceAccount: !Ref AWS::AccountId}
+
+  # This one is fine - tag-scoped, two notifications, both to SNS.
+  MonthlyCostBudget:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetName: !Sub "taxcalc-monthly-cost-${EnvName}"
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit: {Amount: !Ref MonthlyBudgetUsd, Unit: USD}
+        CostFilters:
+          TagKeyValue:
+            - !Sub "user:service$$taxcalc"
+            - !Sub "user:env$$${EnvName}"
+      NotificationsWithSubscribers:
+        - Notification:
+            NotificationType: FORECASTED
+            ComparisonOperator: GREATER_THAN
+            Threshold: 80
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - {SubscriptionType: SNS, Address: !Ref CostAlarmsTopic}
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 100
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - {SubscriptionType: SNS, Address: !Ref CostAlarmsTopic}
+
+  # DEFECT 3: an AWS Budget created to cap Anthropic token spend.
+  #
+  # It is syntactically perfect. It deploys. `describe-budget` returns it. It
+  # will report 0% utilisation forever, because Anthropic bills to an
+  # Anthropic workspace and AWS is not the merchant - there is no AWS cost
+  # record for this filter to match, and no tag anyone could apply that would
+  # create one. The failure mode is the dangerous one: a control that reports
+  # healthy and enforces nothing, ticked off by the next reviewer.
+  LlmSpendBudget:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetName: !Sub "taxcalc-anthropic-llm-${EnvName}"
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit: {Amount: !Ref MonthlyLlmBudgetUsd, Unit: USD}
+        CostFilters:
+          TagKeyValue:
+            - !Sub "user:service$$taxcalc"
+            - !Sub "user:feature$$explain-liability"
+      NotificationsWithSubscribers:
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 80
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - {SubscriptionType: SNS, Address: !Ref CostAlarmsTopic}
+
+  BillingAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "taxcalc/estimated-charges-${EnvName}"
+      AlarmDescription: Account-wide estimated charges backstop.
+      Namespace: AWS/Billing
+      MetricName: EstimatedCharges
+      Dimensions:
+        - {Name: Currency, Value: USD}
+      Statistic: Maximum
+      Period: 21600
+      EvaluationPeriods: 1
+      Threshold: !Ref BillingAlarmUsd
+      ComparisonOperator: GreaterThanThreshold
+      # DEFECT 2: EstimatedCharges publishes roughly every 6h, so missing
+      # datapoints are routine. This setting reads each gap as OK, so a real
+      # breach goes ALARM once and then resets itself on the next empty
+      # window. The alarm spends its life looking healthy.
+      TreatMissingData: notBreaching
+      ActionsEnabled: true
+      AlarmActions: [!Ref CostAlarmsTopic]
+      OKActions: [!Ref CostAlarmsTopic]
+
+Outputs:
+  CostAlarmsTopicArn:
+    Value: !Ref CostAlarmsTopic

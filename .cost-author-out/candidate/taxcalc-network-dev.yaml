@@ -1,0 +1,62 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+# CANDIDATE UNDER REVIEW - NOT A DEPLOYABLE ARTEFACT.
+#
+# Planted defect 1 of 3: an untagged NAT Gateway and an untagged Elastic IP.
+# This is the shape a reviewer actually meets in the wild - the resources are
+# correct, they deploy, and nothing about them looks wrong in the console.
+# They are simply invisible to a Budget filtered on user:service$taxcalc.
+#
+# Reviewed by .claude/skills/cost-author/SKILL.md section 6, row 1.
+
+Parameters:
+  EnvName:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+
+Resources:
+  TaxcalcVpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.20.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref TaxcalcVpc
+      CidrBlock: 10.20.0.0/20
+      AvailabilityZone: !Select [0, !GetAZs ""]
+
+  # DEFECT: billable (~$3.60/mo the moment it detaches) and carries no
+  # cost-allocation tags at all.
+  NatGatewayAEip:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  # DEFECT: the single largest recurring line item in the account
+  # (~$32/mo gateway-hours + ~$0.045/GB processed) and carries no
+  # cost-allocation tags at all.
+  NatGatewayA:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGatewayAEip.AllocationId
+      SubnetId: !Ref PublicSubnetA
+
+  TaxcalcAppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Application security group.
+      VpcId: !Ref TaxcalcVpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          CidrIp: 10.20.0.0/16
+
+Outputs:
+  VpcId:
+    Value: !Ref TaxcalcVpc

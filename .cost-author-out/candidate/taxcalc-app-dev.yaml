@@ -1,0 +1,38 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+# CANDIDATE UNDER REVIEW - NOT A DEPLOYABLE ARTEFACT.
+#
+# Planted defect 1 of 3, second instance: an untagged RDS instance.
+# Paired with the untagged NAT in taxcalc-network-dev.yaml so the review has
+# to catch the defect on BOTH resource types the task names, not just the one
+# that happens to sort first.
+
+Parameters:
+  EnvName:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+
+Resources:
+  # DEFECT: ~$15/mo (db.t4g.micro + 20GB gp3) and carries only the legacy
+  # Env/Project tags. Note the second, subtler problem layered on top - `Env`
+  # is capitalised, so even once somebody "adds tags" it is a DIFFERENT
+  # cost-allocation key from `env` and needs its own activation.
+  DbInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    Properties:
+      DBInstanceClass: db.t4g.micro
+      Engine: postgres
+      AllocatedStorage: "20"
+      StorageType: gp3
+      StorageEncrypted: true
+      MasterUsername: taxcalc
+      ManageMasterUserPassword: true
+      Tags:
+        - {Key: Env, Value: !Ref EnvName}
+        - {Key: Project, Value: taxcalc}
+
+Outputs:
+  DbEndpoint:
+    Value: !GetAtt DbInstance.Endpoint.Address
