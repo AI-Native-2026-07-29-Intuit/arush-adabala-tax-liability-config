@@ -174,8 +174,30 @@ esac
 
 # ---------------------------------------------------------------------------
 head_ '2  budgets describe-budget -> BudgetLimit 100 USD, two notifications'
+# Three possible backends, in descending order of what the answer is worth:
+#
+#   floci   the real thing would be here, if floci ran budgets. It does not.
+#   moto    a third-party STATEFUL budgets implementation. The budget is an
+#           object with a lifecycle: created by an explicit API call, read back
+#           from storage, refused on duplicate, gone after delete. Editing the
+#           template changes nothing, which is exactly what the projection
+#           could not do. Started by scripts/budget-real-backend.sh.
+#   shim    the projection of last resort. Correct about what the template
+#           ASKED FOR and nothing else.
+#
+# Preferring moto when it is up is not a cosmetic upgrade - it moves this from
+# "the template says so" to "a budget exists and reads back". What neither can
+# establish is that AWS Budgets would EVALUATE a breach and publish.
 BUDGET_JSON=$(aws_ budgets describe-budget --account-id "$ACCOUNT" --budget-name "$BUDGET_NAME" 2>/dev/null)
 VIA="floci"
+MOTO_PORT="${MOTO_PORT:-5600}"
+motom_() { aws --region "$REGION" --endpoint-url "http://127.0.0.1:$MOTO_PORT" "$@"; }
+if [ -z "$BUDGET_JSON" ] && curl -s -m 2 -o /dev/null "http://127.0.0.1:$MOTO_PORT" 2>/dev/null; then
+  MOTO_JSON=$(motom_ budgets describe-budget --account-id "$ACCOUNT" --budget-name "$BUDGET_NAME" 2>/dev/null)
+  if [ -n "$MOTO_JSON" ]; then
+    BUDGET_JSON="$MOTO_JSON"; VIA="moto"
+  fi
+fi
 if [ -z "$BUDGET_JSON" ] && [ -n "$SHIM_PID" ]; then
   BUDGET_JSON=$(awss_ budgets describe-budget --account-id "$ACCOUNT" --budget-name "$BUDGET_NAME" 2>/dev/null)
   VIA="shim"
@@ -191,19 +213,16 @@ else
   TUNIT=$(echo "$BUDGET_JSON" | jq -r '.Budget.TimeUnit // empty')
   FILTERS=$(echo "$BUDGET_JSON" | jq -r '[.Budget.CostFilters.TagKeyValue[]?] | join(", ")')
 
-  if [ "$VIA" = "shim" ]; then
-    NOTIFS=$(awss_ budgets describe-notifications-for-budget --account-id "$ACCOUNT" \
-      --budget-name "$BUDGET_NAME" --query 'length(Notifications)' --output text 2>/dev/null)
-    NKINDS=$(awss_ budgets describe-notifications-for-budget --account-id "$ACCOUNT" \
-      --budget-name "$BUDGET_NAME" \
-      --query 'Notifications[].[NotificationType,Threshold]' --output text 2>/dev/null | tr '\n' ' ')
-  else
-    NOTIFS=$(aws_ budgets describe-notifications-for-budget --account-id "$ACCOUNT" \
-      --budget-name "$BUDGET_NAME" --query 'length(Notifications)' --output text 2>/dev/null)
-    NKINDS=$(aws_ budgets describe-notifications-for-budget --account-id "$ACCOUNT" \
-      --budget-name "$BUDGET_NAME" \
-      --query 'Notifications[].[NotificationType,Threshold]' --output text 2>/dev/null | tr '\n' ' ')
-  fi
+  case "$VIA" in
+    shim) RUN_NOTIF=awss_ ;;
+    moto) RUN_NOTIF=motom_ ;;
+    *)    RUN_NOTIF=aws_ ;;
+  esac
+  NOTIFS=$("$RUN_NOTIF" budgets describe-notifications-for-budget --account-id "$ACCOUNT" \
+    --budget-name "$BUDGET_NAME" --query 'length(Notifications)' --output text 2>/dev/null)
+  NKINDS=$("$RUN_NOTIF" budgets describe-notifications-for-budget --account-id "$ACCOUNT" \
+    --budget-name "$BUDGET_NAME" \
+    --query 'Notifications[].[NotificationType,Threshold]' --output text 2>/dev/null | tr '\n' ' ')
 
   # --- Do the two notifications actually point AT THE SNS TOPIC? ------------
   # The Done-When says "two notifications wired to the SNS topic", and neither
@@ -218,7 +237,14 @@ else
   # Pick the caller by NAME. `{ cond && a || b ; } args` is not valid shell -
   # a brace group cannot take a command's arguments - and bash -n does not
   # catch it because the error only surfaces inside the command substitution.
-  if [ "$VIA" = "shim" ]; then RUN_BUDGETS=awss_; else RUN_BUDGETS=aws_; fi
+  #
+  # NOTE the backend split. moto does NOT implement
+  # DescribeSubscribersForNotification, so even when the budget itself is a
+  # real stored object in moto, the subscriber read falls back to the shim -
+  # which is the component that cross-checks the address against a live
+  # `sns list-topics`. Two backends, each used for what it can actually do,
+  # rather than one pretending to cover both.
+  if [ "$VIA" = "floci" ]; then RUN_BUDGETS=aws_; else RUN_BUDGETS=awss_; fi
   for PAIR in "FORECASTED 80" "ACTUAL 100"; do
     set -- $PAIR
     ADDR=$("$RUN_BUDGETS" budgets describe-subscribers-for-notification \
@@ -233,18 +259,34 @@ else
 
   DESC="BudgetLimit ${AMOUNT} ${UNIT}, ${BTYPE}/${TUNIT}, ${NOTIFS:-0} notification(s): ${NKINDS}"
   if [ "$AMOUNT" = "100" ] && [ "$UNIT" = "USD" ] && [ "${NOTIFS:-0}" = "2" ]; then
-    if [ "$VIA" = "shim" ]; then
-      shim "$DESC"
-      note "Provenance: PROJECTED from $COST_STACK's deployed template, not read"
-      note "from a budget - there is no budget on this endpoint to read. This is"
-      note "evidence of what the stack ASKED FOR. It is not evidence that a"
-      note "budget exists, that its CostFilters match anything, or that it would"
-      note "ever notify. Only a real account can establish those."
-      note "CostFilters: $FILTERS"
-    else
-      ok "$DESC"
-      note "CostFilters: $FILTERS"
-    fi
+    case "$VIA" in
+      shim)
+        shim "$DESC"
+        note "Provenance: PROJECTED from $COST_STACK's deployed template, not read"
+        note "from a budget - there is no budget on this endpoint to read. This is"
+        note "evidence of what the stack ASKED FOR and nothing else. Edit the"
+        note "template and this answer changes; that is the whole of its fidelity."
+        note "Start scripts/budget-real-backend.sh for a stronger answer."
+        note "CostFilters: $FILTERS"
+        ;;
+      moto)
+        shim "$DESC"
+        note "Provenance: a REAL STORED BUDGET in moto (a third-party stateful"
+        note "budgets implementation), created by an explicit API call and read"
+        note "back from storage. Editing the template changes NOTHING here, a"
+        note "duplicate create is refused, and a delete makes this a 404 -"
+        note "four properties the projection could not have. Proof:"
+        note "  ./scripts/budget-real-backend.sh prove"
+        note "Still a SHIM, and the reason is narrow and specific: moto STORES a"
+        note "budget, it does not EVALUATE one. Nothing local watches spend,"
+        note "crosses a threshold, or publishes. That join needs a real account."
+        note "CostFilters: $FILTERS"
+        ;;
+      *)
+        ok "$DESC"
+        note "CostFilters: $FILTERS"
+        ;;
+    esac
     # The subscriber half is reported separately, because it is worth more than
     # the thresholds beside it: the topic ARN is a live physical id, and the
     # shim cross-checks it against `sns list-topics` before answering. A
@@ -253,8 +295,14 @@ else
     # emulator can still refute.
     if [ "$SUBS_OK" = "2" ]; then
       note "both notifications subscribe an SNS topic:$SUBS_SEEN"
-      note "The ARN is a LIVE physical id, cross-checked against sns list-topics -"
-      note "stronger than the thresholds above, which are template projection."
+      note "The ARN is a LIVE physical id, cross-checked against sns list-topics."
+      if [ "$VIA" = "shim" ]; then
+        note "Stronger than the thresholds above, which are template projection."
+      else
+        note "Read via the shim even on the moto path: moto does not implement"
+        note "DescribeSubscribersForNotification, so each backend is used only"
+        note "for what it can actually do."
+      fi
     else
       bad "only $SUBS_OK of 2 notifications resolve to an SNS subscriber"
     fi

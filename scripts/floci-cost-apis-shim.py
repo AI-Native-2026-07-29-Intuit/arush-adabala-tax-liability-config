@@ -143,8 +143,17 @@ CE_PREFIX = "AWSInsightsIndexService"
 # stays correct, the response stays well-formed, and the number simply is not
 # what an invoice would say. Nothing here can detect that.
 #
-# Re-check against the AWS pricing pages whenever a resource type is added.
-PRICEBOOK_DATE = "2026-09-10"
+# NO LONGER RE-CHECKED BY HAND. scripts/pricebook-verify.sh compares every rate
+# below against AWS's own published price list - the Price List Bulk API is
+# public and UNAUTHENTICATED, so it works with no account - and fails on drift.
+#
+# It found two wrong rates on its first run, both hand-typed and both silent:
+#   rds_storage_gb_month.gp3   0.08  -> 0.115   (0.08 is the EBS gp3 rate; RDS
+#                                                gp3 is priced like gp2 here)
+#   rds_instance_hour.m6g.large 0.171 -> 0.159
+# Neither would ever have failed a test. That is the whole argument for the
+# gate: this table's failure mode is confident, well-formed, wrong money.
+PRICEBOOK_DATE = "2026-09-11"
 PRICEBOOK_REGION = "us-east-1"
 PRICEBOOK = {
     "nat_gateway_hour": 0.045,
@@ -157,9 +166,10 @@ PRICEBOOK = {
     "eip_idle_hour": 0.005,
     "rds_instance_hour": {
         "db.t4g.micro": 0.016, "db.t4g.small": 0.032,
-        "db.t4g.medium": 0.065, "db.m6g.large": 0.171,
+        "db.t4g.medium": 0.065, "db.m6g.large": 0.159,
     },
-    "rds_storage_gb_month": {"gp2": 0.115, "gp3": 0.08},
+    # gp3 is NOT cheaper than gp2 for RDS in us-east-1, unlike EBS. Verified.
+    "rds_storage_gb_month": {"gp2": 0.115, "gp3": 0.115},
     "s3_storage_gb_month": 0.023,
 }
 

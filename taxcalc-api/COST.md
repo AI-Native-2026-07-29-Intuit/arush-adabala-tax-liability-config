@@ -292,7 +292,33 @@ state that under-counts by a factor of the replica count, plus a new failure mod
 being down) on the request path of a feature meant to degrade gracefully. The cap belongs at the
 platform; the app's job is to say where the money went.
 
-### `PriceBook` is the highest-maintenance file here
+### The AWS price book has a gate now — and it caught two wrong rates
+
+The AWS-side `PRICEBOOK` in `floci-cost-apis-shim.py` carried the same warning as the LLM one
+below: a stale rate makes every figure wrong while nothing fails. That was stated as an
+unavoidable property. **It was not unavoidable — it was a missing check.**
+
+The **AWS Price List Bulk API is public and unauthenticated**: no account, no credentials, no
+signature. `scripts/pricebook-verify.sh` fetches AWS's own published rates and fails on drift:
+
+```
+$ ./scripts/pricebook-verify.sh
+  PASS  nat_gateway_hour                 $0.045
+  PASS  eip_idle_hour                    $0.005
+  FAIL  rds_instance_hour.db.m6g.large   $0.171  <- published 0.159
+  FAIL  rds_storage_gb_month.gp3         $0.08   <- published 0.115
+```
+
+**Two hand-typed rates were wrong on the first run.** `gp3` at `$0.08` is the *EBS* gp3 rate —
+RDS gp3 in us-east-1 is `$0.115`, the same as gp2, not the discount the EBS number implies. The
+deployed volume reports `gp2` so the live projection was unaffected, but the template declares
+`gp3`, and the moment that took effect the storage line would have understated by $0.70/mo with
+nothing failing. Both are fixed; the file is now 9/9 verified against AWS's published list.
+
+This does not make the projection into billed spend — it verifies **rates, not quantities, and
+nothing was invoiced.** What it removes is the one input that was pure assertion.
+
+### `PriceBook` (the LLM one) is still the highest-maintenance file here
 
 A stale price book makes every cost figure wrong while every test still passes: the arithmetic is
 correct, the log line is well-formed, the header is present, and the number simply is not what the
@@ -630,8 +656,41 @@ than becoming a `SHIM`.
 | `budgets DescribeSubscribersForNotification` | service **absent entirely** | the template's subscribers, with each SNS address **cross-checked against live `sns list-topics`** | the thresholds are projection; **the topic ARN is a live physical id** |
 | `ce GetCostAndUsage` / `GetTags` | "running", answers **all-zero with no tag keys** | a list-price projection over live deployed resources | the **tags** are real; the **dollars** have never been invoiced |
 
-The second is the one to be careful with. There is no budget on this endpoint to read, so the
-response cannot be evidence that a budget exists or that its `CostFilters` match anything.
+The second **was** the one to be careful with, and it has been replaced rather than re-argued.
+
+### The budget is a real object now, not a projection
+
+The criticism of the projection was exact: *change the template and the answer changes, which is
+the whole of its fidelity.* The fix is not a better disclaimer — it is a backend that actually
+stores a budget. **moto** (a third-party, independently maintained AWS emulator) implements the
+budgets API with real storage, so `scripts/budget-real-backend.sh` stands it up and seeds it from
+the deployed template via the same extractor the shim uses:
+
+```
+$ ./scripts/budget-real-backend.sh prove
+  PASS  1. describe-budget reads STORED state (BudgetLimit 100 USD)
+  PASS  2. editing the template changed NOTHING (FORECASTED stayed 80)
+  PASS  3. duplicate create refused (DuplicateRecordException)
+  PASS  4. after delete, describe-budget is NotFoundException
+```
+
+Property 2 is the one that matters, and it is a genuine A/B: with the template's
+`Threshold: 80` edited to `55`, the **projection shim answers 55** and the **stored budget still
+answers 80**. That difference is the difference between reading a resource and restating a file.
+Properties 3 and 4 are the rest of a lifecycle the projection never had.
+
+`cost-done-when.sh` now prefers moto when it is running and falls back to the projection when it
+is not, labelling which one answered.
+
+**It is still reported as a `SHIM`, for one narrow reason: moto *stores* a budget, it does not
+*evaluate* one.** Nothing local watches spend, crosses a threshold, or publishes. "A budget exists
+and reads back" is established; "AWS Budgets would notice a breach and notify" is not, and that is
+now the whole of the gap rather than a blanket disclaimer covering four separate claims.
+
+One deliberate split worth noting: moto does **not** implement
+`DescribeSubscribersForNotification`, so even on the moto path the subscriber read still goes to
+the shim — the component that cross-checks the address against a live `sns list-topics`. Two
+backends, each used only for what it can actually do.
 
 **"Or that it would ever notify" used to be on that list, and it conceded too much.** That phrase
 covers two separable questions, and only one of them actually needs AWS Budgets:
