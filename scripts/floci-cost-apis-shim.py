@@ -52,6 +52,57 @@ worth knowing - an in-body caveat cannot be made to reach a CLI user.
 Neither half invents a value. If the stack is not deployed, DescribeBudget
 returns NotFoundException exactly as the real API would.
 
+THE COST EXPLORER HALF IS WEAKER STILL - READ THIS BEFORE QUOTING A FIGURE
+--------------------------------------------------------------------------
+GetCostAndUsage and GetTags were added for W6 D4 Task 4, whose Done-When asks
+for a Cost Explorer drill-down grouped by the `service` tag with the NAT
+gateway line item visible. floci DOES run a `ce` service and it answers the
+API with the correct SHAPE - and every amount is 0.0000000000, every tag group
+key is "", and GetTags returns {"Tags": [], "TotalSize": 0}.
+
+That is not a gap a later floci version closes. AN EMULATOR BILLS NOBODY.
+There is no spend to report and no cost-allocation tag activated, because
+activation is a Billing-console action against an account that is being
+invoiced. Unlike the budgets gap - a provider bug, fixable - this one is
+structural.
+
+So this half does NOT read cost. It PROJECTS what the live, deployed, tagged
+resources would bill over a STEADY-STATE MONTH at published list price. Two
+inputs, worth two different things:
+
+  live       which resources exist, their instance class, their storage type
+             and size, and their tags - all read from floci at request time.
+             Untag or delete a resource and the projection changes.
+  list price PRICEBOOK below. A hand-maintained table, dated, us-east-1 only.
+             Stale prices produce confidently wrong money.
+
+A steady-state month (730h for everything) and NOT month-to-date. The
+month-to-date version was written first and withdrawn: floci returns a real
+CreateTime for a NAT gateway, null for an RDS instance and nothing at all for
+an EIP, so resources without a timestamp fell back to the month start and were
+billed ~245h against the NAT's ~4.5h. That rendered the NAT gateway - the line
+item this exists to look at - as the SMALLEST row in the table. A uniform
+stated basis cannot be wrong in that direction.
+
+TWO THINGS IT REFUSES TO GUESS, and both are reported as zero with a reason:
+
+  *-NatGateway-Bytes         the emulator moves no bytes through a gateway, so
+                             there is no volume to price. A made-up GiB figure
+                             would be the number here most likely to be quoted
+                             at somebody.
+  *-ElasticIP:IdleAddress    describe-addresses returns neither AssociationId
+                             nor NetworkInterfaceId for an EIP that IS attached
+                             to a live NAT, so attached and detached are
+                             indistinguishable here. Reading "no association
+                             field" as detached invented a $1.22 charge against
+                             an attached address. The detached case is the one
+                             the taxonomy tags EIPs FOR, and it is the one this
+                             engine cannot see: a GAP to report, not a number.
+
+Read the output as "what this shape of infrastructure costs at list price",
+never as "what was spent". No dollar figure from this shim has ever been on an
+invoice.
+
 USAGE
 -----
   ./scripts/floci-cost-apis-shim.py --port 5557 &
@@ -71,6 +122,7 @@ account these APIs exist and shimming them would replace true answers with
 projected ones.
 """
 import argparse
+import datetime
 import json
 import os
 import subprocess
@@ -82,6 +134,41 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 BUDGETS_PREFIX = "AWSBudgetServiceGateway"
 TAGGING_PREFIX = "ResourceGroupsTaggingAPI_20170126"
 CLOUDWATCH_PREFIX = "GraniteServiceVersion20100801"
+CE_PREFIX = "AWSInsightsIndexService"
+
+# --- The price book. -------------------------------------------------------
+# us-east-1 on-demand list price, USD. THIS IS THE HIGHEST-MAINTENANCE THING
+# IN THIS FILE, for exactly the reason COST.md gives for the LLM PriceBook: a
+# stale rate makes every figure wrong while nothing fails. The arithmetic
+# stays correct, the response stays well-formed, and the number simply is not
+# what an invoice would say. Nothing here can detect that.
+#
+# Re-check against the AWS pricing pages whenever a resource type is added.
+PRICEBOOK_DATE = "2026-09-10"
+PRICEBOOK_REGION = "us-east-1"
+PRICEBOOK = {
+    "nat_gateway_hour": 0.045,
+    # Charged per GB processed, on top of the hourly rate. Deliberately unused
+    # for a volume: see the docstring. Kept so the rate is documented where
+    # anyone reading the zero will look for it.
+    "nat_gateway_gb": 0.045,
+    # An EIP costs nothing while attached and ~$0.005/h detached. That gap is
+    # why the taxonomy tags EIPs at all.
+    "eip_idle_hour": 0.005,
+    "rds_instance_hour": {
+        "db.t4g.micro": 0.016, "db.t4g.small": 0.032,
+        "db.t4g.medium": 0.065, "db.m6g.large": 0.171,
+    },
+    "rds_storage_gb_month": {"gp2": 0.115, "gp3": 0.08},
+    "s3_storage_gb_month": 0.023,
+}
+
+PROVENANCE_CE = (
+    "PROJECTED AT LIST PRICE from live deployed resources - NOT read cost. "
+    f"floci bills nobody: its own ce returns all-zero amounts and no activated "
+    f"tag keys. Prices are {PRICEBOOK_REGION} list as of {PRICEBOOK_DATE}. "
+    "No figure here has ever been on an invoice."
+)
 
 # Members of MetricAlarm that botocore expects as epoch numbers under a JSON
 # protocol. The AWS CLI prints them as ISO-8601 strings, so a forwarded
@@ -405,6 +492,266 @@ def describe_notifications(body, region, endpoint, cfn_dir, stack):
     return 400, {"__type": "NotFoundException", "message": f"budget {name} is not declared by stack {stack}"}
 
 
+def _same_number(a, b):
+    try:
+        return abs(float(a) - float(b)) < 1e-9
+    except (TypeError, ValueError):
+        return a == b
+
+
+def describe_subscribers(body, region, endpoint, cfn_dir, stack):
+    """The call that actually proves a notification points AT THE SNS TOPIC.
+
+    DescribeBudget and DescribeNotificationsForBudget both omit subscribers, so
+    neither can answer the Done-When's "two notifications wired to the SNS
+    topic" - they show the thresholds and stop. This is the modelled call that
+    carries the Address, which is why the task's evidence needs it.
+
+    The thresholds here are projected from the template like every other budget
+    field. The ADDRESS IS NOT: it is the physical id CloudFormation assigned to
+    the topic, read live from describe-stack-resources, and it is cross-checked
+    against `sns list-topics` before being returned. A subscriber pointing at a
+    topic that does not exist is the single most likely way this wiring is
+    wrong in practice, and it is the one part of the budget an emulator can
+    still refute.
+    """
+    name = body.get("BudgetName")
+    want = body.get("Notification") or {}
+    try:
+        found = budgets_from_stack(stack, region, endpoint, cfn_dir) or []
+    except UpstreamError as exc:
+        return 500, {"__type": "InternalFailure", "message": str(exc)}
+
+    live_topics = {t["TopicArn"] for t in
+                   (aws("sns", "list-topics", region=region, endpoint=endpoint) or {}).get("Topics", [])}
+
+    for entry in found:
+        if entry["Budget"].get("BudgetName") != name:
+            continue
+        for pair in entry.get("NotificationsWithSubscribers", []):
+            got = pair.get("Notification", {})
+            # Compare the threshold NUMERICALLY. The template carries 80 and
+            # botocore sends 80.0 (the model types Threshold as a double), so a
+            # string compare misses every real match.
+            if want and (got.get("NotificationType") != want.get("NotificationType")
+                         or not _same_number(got.get("Threshold"), want.get("Threshold"))):
+                continue
+            subs = pair.get("Subscribers", [])
+            # An Address that is not a string is an intrinsic the extractor
+            # could not resolve - {"Ref": "SomeTopic"} when the logical id is
+            # not in the deployed stack. Found by the negative control, which
+            # crashed here with a TypeError before this line existed. A crash
+            # is not a refusal: it reads as "the shim is broken" when the
+            # actual finding is "this budget cannot notify anybody".
+            unresolved = [s.get("Address") for s in subs
+                          if s.get("SubscriptionType") == "SNS"
+                          and (not isinstance(s.get("Address"), str)
+                               or s["Address"] not in live_topics)]
+            if unresolved:
+                # Louder than a quiet pass. A subscriber aimed at a topic that
+                # is not there is a budget that cannot notify, and that is a
+                # real failure the emulator CAN see.
+                return 400, {"__type": "NotFoundException",
+                             "message": f"subscriber topic(s) not present on this endpoint: {unresolved}"}
+            return 200, {"Subscribers": subs, "ShimProvenance": PROVENANCE_BUDGETS}
+        return 400, {"__type": "NotFoundException",
+                     "message": f"no notification matching {want} on budget {name}"}
+    return 400, {"__type": "NotFoundException", "message": f"budget {name} is not declared by stack {stack}"}
+
+
+# ---------------------------------------------------------------------------
+# Cost Explorer, PROJECTED. Read the docstring before quoting any figure.
+def _month_bounds(time_period):
+    """(start, end, now) as naive UTC datetimes, defaulting to this month."""
+    now = datetime.datetime.utcnow()
+    start = datetime.datetime(now.year, now.month, 1)
+    end = (datetime.datetime(now.year + (now.month == 12), (now.month % 12) + 1, 1))
+    if time_period:
+        try:
+            start = datetime.datetime.strptime(time_period["Start"], "%Y-%m-%d")
+            end = datetime.datetime.strptime(time_period["End"], "%Y-%m-%d")
+        except (KeyError, ValueError):
+            pass
+    return start, end, now
+
+
+# A FULL MONTH, for every hourly resource, always. This is a steady-state
+# monthly projection - "what does this shape of infrastructure cost to run for
+# a month at list price" - and NOT a month-to-date view.
+#
+# The first version did compute month-to-date from each resource's real
+# creation timestamp, and it had to be abandoned because floci supplies that
+# timestamp inconsistently: describe-nat-gateways returns a real CreateTime,
+# describe-db-instances returns InstanceCreateTime: null, and
+# describe-addresses returns no creation time at all. Resources with no
+# timestamp fell back to the month start and were charged ~245 hours while the
+# NAT was charged ~4.5, which rendered THE NAT GATEWAY - the line item this
+# whole exercise exists to look at - as the smallest row in the table.
+#
+# That is worse than useless: it is a plausible-looking table that inverts the
+# finding. A uniform, stated basis cannot be subtly wrong in that way, and it
+# is also the basis the Budget's own $100 limit was derived on and the basis
+# the 1-NAT-vs-3 comparison needs.
+HOURS_PER_MONTH = 730
+
+
+def project_line_items(region, endpoint, account):
+    """One row per (service, usage type, tagged resource), at list price.
+
+    Every structural fact - which resources exist, their class, their storage,
+    their tags, when they were created - is read live. Only the RATE comes from
+    the price book, and only the elapsed hours are computed.
+    """
+    rows = []
+    tagged = collect_tagged_resources(region, endpoint, account)
+
+    def tags_for(*candidates):
+        for arn in candidates:
+            if arn in tagged:
+                return {t["Key"]: t.get("Value", "") for t in tagged[arn]}
+        return {}
+
+    # --- NAT gateways. The line item the Done-When asks for by name.
+    for nat in (aws("ec2", "describe-nat-gateways", region=region, endpoint=endpoint) or {}).get("NatGateways", []):
+        nid = nat.get("NatGatewayId", "")
+        tags = {t["Key"]: t.get("Value", "") for t in nat.get("Tags", [])} or tags_for(
+            _arn("ec2", f"natgateway/{nid}", account, region), _arn("ec2", f"nat-gateway/{nid}", account, region))
+        rows.append({"service": "EC2 - Other", "usage_type": "USE1-NatGateway-Hours",
+                     "resource": nid, "tags": tags, "qty": HOURS_PER_MONTH, "unit": "Hrs",
+                     "amount": HOURS_PER_MONTH * PRICEBOOK["nat_gateway_hour"]})
+        # Emitted at zero ON PURPOSE - see the docstring. The line item has to
+        # be visible (it is half the answer to "find the NAT line item"), and
+        # its value has to not be fiction.
+        rows.append({"service": "EC2 - Other", "usage_type": "USE1-NatGateway-Bytes",
+                     "resource": nid, "tags": tags, "qty": 0.0, "unit": "GB",
+                     "amount": 0.0, "note": "no traffic observable: the emulator moves no bytes"})
+
+    # --- Elastic IPs. Reported at ZERO, with the reason attached.
+    #
+    # An EIP is free while attached and ~$3.65/mo while detached, and the
+    # detached case is the entire reason the taxonomy tags EIPs at all. This
+    # endpoint cannot tell the two apart: describe-addresses returns neither
+    # AssociationId nor NetworkInterfaceId for an EIP that IS attached to a
+    # live NAT gateway (measured 2026-09-10). Treating "no association field"
+    # as detached invented a $1.22 charge against a resource that is attached.
+    #
+    # So the line item is emitted, and its value is zero, and the note says
+    # the state could not be observed. The one case worth catching is the one
+    # case this engine cannot see, and that is a GAP to report - not a number
+    # to guess.
+    for addr in (aws("ec2", "describe-addresses", region=region, endpoint=endpoint) or {}).get("Addresses", []):
+        pub = addr.get("PublicIp", "")
+        observable = "AssociationId" in addr or "NetworkInterfaceId" in addr
+        attached = bool(addr.get("AssociationId") or addr.get("NetworkInterfaceId"))
+        tags = {t["Key"]: t.get("Value", "") for t in addr.get("Tags", [])} or tags_for(
+            _arn("ec2", f"elastic-ip/{pub}", account, region))
+        hours = HOURS_PER_MONTH if (observable and not attached) else 0.0
+        note = ("attached: no charge" if attached else
+                "DETACHED and billing" if observable else
+                "attachment state NOT reported by this endpoint - "
+                "reported as 0; a detached EIP would bill ~$3.65/mo")
+        rows.append({"service": "EC2 - Other", "usage_type": "USE1-ElasticIP:IdleAddress",
+                     "resource": pub, "tags": tags, "qty": hours, "unit": "Hrs",
+                     "amount": hours * PRICEBOOK["eip_idle_hour"], "note": note})
+
+    # --- RDS. Class and storage are read live, not taken from the template,
+    # because the deployed value is the one that bills.
+    for db in (aws("rds", "describe-db-instances", region=region, endpoint=endpoint) or {}).get("DBInstances", []):
+        arn = db.get("DBInstanceArn") or _arn("rds", f"db:{db['DBInstanceIdentifier']}", account, region)
+        klass = db.get("DBInstanceClass", "")
+        rate = PRICEBOOK["rds_instance_hour"].get(klass)
+        tags = tags_for(arn)
+        rows.append({"service": "Amazon Relational Database Service",
+                     "usage_type": f"USE1-InstanceUsage:{klass}", "resource": db["DBInstanceIdentifier"],
+                     "tags": tags, "qty": HOURS_PER_MONTH, "unit": "Hrs",
+                     "amount": (HOURS_PER_MONTH * rate) if rate else 0.0,
+                     # A class absent from the price book reports 0 and says so,
+                     # rather than picking a neighbouring rate. A wrong number
+                     # that looks right is the failure mode here.
+                     "note": None if rate else f"no list price for {klass} in PRICEBOOK - reported as 0"})
+        stype = (db.get("StorageType") or "gp3").lower()
+        gb = float(db.get("AllocatedStorage") or 0)
+        srate = PRICEBOOK["rds_storage_gb_month"].get(stype, 0.0)
+        rows.append({"service": "Amazon Relational Database Service",
+                     "usage_type": f"USE1-RDS:{stype.upper()}-Storage", "resource": db["DBInstanceIdentifier"],
+                     "tags": tags, "qty": gb, "unit": "GB-Mo", "amount": gb * srate})
+
+    return rows
+
+
+def _group_key(row, definition):
+    gtype, key = definition.get("Type"), definition.get("Key")
+    if gtype == "TAG":
+        value = row["tags"].get(key)
+        # Real Cost Explorer renders an untagged resource as `key$` with an
+        # empty value, and that row is the whole point of a tag-scoped view:
+        # it is the spend the Budget cannot see.
+        return f"{key}${value}" if value else f"{key}$"
+    if key == "SERVICE":
+        return row["service"]
+    if key == "USAGE_TYPE":
+        return row["usage_type"]
+    if key == "RESOURCE_ID":
+        return row["resource"]
+    return row["service"]
+
+
+def _money(value):
+    return f"{value:.10f}"
+
+
+def get_cost_and_usage(body, region, endpoint, account):
+    start, end, now = _month_bounds(body.get("TimePeriod"))
+    groups_def = body.get("GroupBy") or []
+    rows = project_line_items(region, endpoint, account)
+
+    tag_filter = ((body.get("Filter") or {}).get("Tags") or {})
+    if tag_filter.get("Key"):
+        want = set(tag_filter.get("Values") or [])
+        rows = [r for r in rows if r["tags"].get(tag_filter["Key"]) in want]
+
+    total = sum(r["amount"] for r in rows)
+    buckets = {}
+    for row in rows:
+        key = tuple(_group_key(row, d) for d in groups_def) if groups_def else ()
+        buckets.setdefault(key, 0.0)
+        buckets[key] += row["amount"]
+
+    grouped = [{"Keys": list(k), "Metrics": {"UnblendedCost": {"Amount": _money(v), "Unit": "USD"}}}
+               for k, v in sorted(buckets.items())] if groups_def else []
+
+    return 200, {
+        "GroupDefinitions": groups_def,
+        "ResultsByTime": [{
+            "TimePeriod": {"Start": start.strftime("%Y-%m-%d"), "End": end.strftime("%Y-%m-%d")},
+            "Total": {} if groups_def else {"UnblendedCost": {"Amount": _money(total), "Unit": "USD"}},
+            "Groups": grouped,
+            "Estimated": True,
+        }],
+        "DimensionValueAttributes": [],
+        "ShimProvenance": PROVENANCE_CE,
+    }
+
+
+def get_tags(body, region, endpoint, account):
+    """The cost-allocation tag keys/values actually present on billable things.
+
+    NOT the same as "activated". Activation is a Billing-console action on an
+    account being invoiced, it does not backfill, and nothing on this endpoint
+    can perform or observe it. This answers the weaker question the emulator
+    can answer: would a group-by on this key have anything to group?
+    """
+    start, end, now = _month_bounds(body.get("TimePeriod"))
+    rows = project_line_items(region, endpoint, account)
+    key = body.get("TagKey")
+    if key:
+        values = sorted({r["tags"][key] for r in rows if r["tags"].get(key)})
+    else:
+        values = sorted({k for r in rows for k in r["tags"]})
+    return 200, {"Tags": values, "ReturnSize": len(values), "TotalSize": len(values),
+                 "ShimProvenance": PROVENANCE_CE}
+
+
 # ---------------------------------------------------------------------------
 def make_handler(opts):
     class Handler(BaseHTTPRequestHandler):
@@ -442,9 +789,15 @@ def make_handler(opts):
             elif prefix == BUDGETS_PREFIX:
                 handlers = {"DescribeBudget": describe_budget,
                             "DescribeBudgets": describe_budgets,
-                            "DescribeNotificationsForBudget": describe_notifications}
+                            "DescribeNotificationsForBudget": describe_notifications,
+                            "DescribeSubscribersForNotification": describe_subscribers}
                 if op in handlers:
                     status, payload = handlers[op](body, *common, opts.cfn_dir, opts.stack)
+                    return self._reply(status, payload)
+            elif prefix == CE_PREFIX:
+                handlers = {"GetCostAndUsage": get_cost_and_usage, "GetTags": get_tags}
+                if op in handlers:
+                    status, payload = handlers[op](body, *common, opts.account)
                     return self._reply(status, payload)
             elif prefix == CLOUDWATCH_PREFIX:
                 if op == "DescribeAlarms":

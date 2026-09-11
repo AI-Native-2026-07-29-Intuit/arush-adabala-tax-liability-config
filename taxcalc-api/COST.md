@@ -84,11 +84,35 @@ resource type so this is a red CI check rather than a convention.
 - **`FORECASTED > 80%`** — the only one of the two that can still change the outcome.
 - **`ACTUAL > 100%`** — a post-mortem trigger.
 
-**$100 is derived, not round.** Steady state is roughly: one dev NAT Gateway ~$32/mo before data
-processing, `db.t4g.micro` + 20GB gp3 ~$15/mo, S3 in cents — call it ~$50. A limit at roughly 2x
-steady state means `FORECASTED > 80%` ($80) fires because something changed, not because the
-month has a 31st day in it. A limit set at $55 would page somebody every month for nothing, and
-an alarm that cries wolf monthly is an alarm that gets muted.
+**$100 is derived, not round.** Steady state at us-east-1 list price, for what the stack actually
+deploys:
+
+| Line item | Monthly |
+|---|--:|
+| one dev NAT Gateway (730h × $0.045) — before any data processing | $32.85 |
+| `db.t4g.small` (730h × $0.032) | $23.36 |
+| 20GB storage | $2.30 |
+| EIP (attached), S3, SNS | cents |
+| **Steady state** | **~$58.50** |
+
+`FORECASTED > 80%` fires at $80, which is ~1.4x steady state — enough headroom that the alarm
+means *something changed*, not *the month has a 31st day in it*. A limit set at $65 would page
+somebody every month for nothing, and an alarm that cries wolf monthly is an alarm that gets
+muted.
+
+> **Corrected 2026-09-11.** This paragraph previously read "`db.t4g.micro` + 20GB gp3 ~$15/mo —
+> call it ~$50 … a limit at roughly 2x steady state". Two things were wrong and the projection in
+> `scripts/cost-explorer-report.sh` surfaced both. `db.t4g.micro` is **not in the template's
+> `AllowedValues`** (`[db.t4g.small, db.t4g.medium, db.m6g.large]`) — the derivation costed an
+> instance class this stack cannot deploy, understating the database by ~$10/mo. And the deployed
+> volume reports `gp2`, not the `gp3` the template declares, which is one more property floci
+> accepts and drops. Real steady state is ~$58.50 and the limit is ~1.7x, not 2x.
+>
+> The limit stays at $100. The number was defensible for a different reason than the one written
+> down, and that is worth saying plainly rather than quietly restating the arithmetic: **nothing
+> in the process would have caught this.** The template lints, the stack deploys, the budget is
+> well-formed, and the sentence justifying its threshold cited a machine size that no ChangeSet
+> could ever produce. It took building something that priced the *deployed* resources to notice.
 
 ### `taxcalc/estimated-charges-dev` — the account-wide billing alarm
 
@@ -382,6 +406,46 @@ The substitute is honest but weaker, and is not the same claim: `cfn-guardrails.
 check 5 asserts from the templates that every billable resource carries all four keys, so the
 *input* to a tag-scoped report is verified even though the report itself is not.
 
+**A fuller stand-in now exists, and it splits this Done-When into three claims worth three
+different things** — `./scripts/cost-explorer-report.sh` renders
+[`reports/cost-explorer-2026-09.md`](../reports/cost-explorer-2026-09.md):
+
+| Claim | Verdict | Why |
+|---|---|---|
+| 1 NAT in dev, 3 in staging/prod | **PASS** | template evaluation, not spend — see below |
+| every billable resource groups under `service$taxcalc` | **PASS** | tags read live off the deployed resources |
+| the NAT line item at `$32.85/mo`, 56% of the total | **SHIM** | projected at list price; never observed, never invoiced |
+| the view saved as a report | **GAP** | saved reports are a console object with no public API |
+
+**The NAT lever is the strongest thing in this document, and it did not need a real account.**
+The same template evaluated with `EnvName=dev` and `EnvName=prod` through CREATE ChangeSets
+produces **1 NAT gateway and 3** — nothing created, nothing executed, the throwaway stacks deleted
+either way. That is the same class of claim as the `IsUsEast1` both-sides check: a question about
+what a template evaluates to, which an emulator answers honestly. At $32.85/gateway-month the
+6.3 `SingleNatForDev` decision is confirmed as a **$65.70/mo** difference.
+
+**The dollar amounts are the weakest and are labelled so everywhere they appear.** They are
+projected by `floci-cost-apis-shim.py` from live deployed resources × a dated list-price table.
+Two line items it explicitly **refuses to guess**, both emitted at `$0.00` with the reason
+attached:
+
+- `*-NatGateway-Bytes` — the emulator moves no bytes through a gateway. On a real account this is
+  the row that grows with traffic; a fabricated GiB figure would be the number here most likely
+  to end up quoted at somebody.
+- `*-ElasticIP:IdleAddress` — `describe-addresses` returns neither `AssociationId` nor
+  `NetworkInterfaceId` for an EIP that *is* attached to a live NAT, so attached and detached are
+  indistinguishable here. The first version read "no association field" as detached and invented
+  a $1.22 charge against an attached address. **The one case the taxonomy tags EIPs for is the
+  one case this engine cannot see** — a gap to report, not a number to produce.
+
+A third thing was withdrawn rather than shipped. The projection originally computed month-to-date
+from each resource's creation timestamp, which floci supplies inconsistently — a real `CreateTime`
+for a NAT gateway, `null` for an RDS instance, nothing at all for an EIP. Resources without one
+fell back to the month start and were billed ~245h against the NAT's ~4.5h, which rendered **the
+NAT gateway — the line item the whole exercise exists to look at — as the smallest row in the
+table.** A plausible-looking table that inverts the finding is worse than no table. The basis is
+now a uniform, stated steady-state month, which cannot be wrong in that direction.
+
 Likewise `aws resourcegroupstaggingapi get-resources --tag-filters Key=service,Values=taxcalc`
 returned an empty list here — partly the gap above, and partly because
 `cfn/taxcalc-network-dev.yaml` did not deploy on this floci at all: it rolled back with
@@ -394,20 +458,31 @@ That rollback is now diagnosed and worked around; see the next section.
 
 ---
 
-## Closing the Done-Whens on floci — four workarounds, and what each is worth
+## Closing the Done-Whens on floci — the workarounds, and what each is worth
 
-All four acceptance commands now answer, and **two of the four answers are worth materially less
-than a pass.** `scripts/cost-done-when.sh` (config repo) runs all four and prints one of three
-verdicts per check — `PASS`, `SHIM`, `GAP` — rather than an exit status, because the raw commands
-produce **one false pass and one false failure** on this engine and reading their exit codes
-would launder both.
+Every acceptance command now answers, and **most of the answers are worth materially less than a
+pass.** `scripts/cost-done-when.sh` runs them all and prints one of three verdicts per check —
+`PASS`, `SHIM`, `GAP` — rather than an exit status, because the raw commands produce **one false
+pass and one false failure** on this engine and reading their exit codes would launder both.
 
 ```
 1  describe-stacks taxcalc-cost-dev            PASS  (qualified)
 2  budgets describe-budget                     SHIM  projected from the template
+   └ describe-subscribers-for-notification     ....  both notifications -> a LIVE topic ARN
 3  describe-alarms                             PASS
 4  get-resources Key=service,Values=taxcalc    SHIM  real tags, stood-in index
+5  Cost Explorer drill-down                    GAP   floci's own ce: $0.00, 0 tag keys
+   ├ SingleNatForDev, both sides               PASS  1 NAT dev / 3 prod, via ChangeSets
+   ├ NAT line item, grouped by service tag     SHIM  $32.85/mo projected at list price
+   └ the view saved as a report                GAP   console object, no public API
+
+3 passed, 3 satisfied via a local shim, 1 gap, 0 failed
 ```
+
+Check 5 is deliberately **not** collapsed into one verdict. Its three sub-findings are a structural
+`GAP`, a genuine `PASS` and a `SHIM`, and a single line covering all three would have to be either
+too generous or too harsh. The `PASS` is real: 1-vs-3 NAT gateways is a question about template
+evaluation, not about spend.
 
 ### 1. `cfn-resolve-if.rb` — why the network stack rolled back
 
@@ -479,16 +554,50 @@ behaviour cannot be tested on this engine by any means. And the Done-When itself
 metric name — is live and correct without any of this, which is why check 3 stays a `PASS` rather
 than becoming a `SHIM`.
 
-### 4. `floci-cost-apis-shim.py` — two missing read APIs, **not equally trustworthy**
+### 4. `floci-cost-apis-shim.py` — four missing read APIs, **not equally trustworthy**
 
 | endpoint | floci | the shim serves | worth |
 |---|---|---|---|
 | `resourcegroupstaggingapi GetResources` | "running", indexes **nothing, ever** | live reads from `ec2 describe-tags`, `rds list-tags-for-resource`, `sns`/`s3api` at request time | a missing **index** reimplemented over real records — untag a resource and the answer changes |
 | `budgets DescribeBudget` | service **absent entirely** | a projection of the deployed stack's template, fetched via `get-template` | evidence of **what the template asked for**, and nothing else |
+| `budgets DescribeSubscribersForNotification` | service **absent entirely** | the template's subscribers, with each SNS address **cross-checked against live `sns list-topics`** | the thresholds are projection; **the topic ARN is a live physical id** |
+| `ce GetCostAndUsage` / `GetTags` | "running", answers **all-zero with no tag keys** | a list-price projection over live deployed resources | the **tags** are real; the **dollars** have never been invoiced |
 
 The second is the one to be careful with. There is no budget on this endpoint to read, so the
 response cannot be evidence that a budget exists, that its `CostFilters` match anything, or that
 it would ever notify.
+
+**The third exists because neither of the first two can answer the Done-When as written.** It asks
+for "two notifications **wired to the SNS topic**", and both `DescribeBudget` and
+`DescribeNotificationsForBudget` omit subscribers entirely — they show the thresholds and stop. A
+budget carrying two perfectly-shaped notifications and no subscriber is configured, green, and
+silent: the same "deployed but cannot fire" shape this whole stack exists to prevent, reproduced
+in the guardrail itself. `DescribeSubscribersForNotification` is the modelled call that carries
+the `Address`, so it is the one the evidence needs:
+
+```
+$ aws budgets describe-subscribers-for-notification --budget-name taxcalc-monthly-cost-dev \
+    --notification NotificationType=FORECASTED,ComparisonOperator=GREATER_THAN,Threshold=80,ThresholdType=PERCENTAGE
+{"Subscribers": [{"SubscriptionType": "SNS",
+                  "Address": "arn:aws:sns:us-east-1:000000000000:taxcalc-cost-alarms-dev"}]}
+```
+
+That ARN is **not** projected — it is the physical id CloudFormation assigned to a topic that
+really exists here, and the shim refuses to return it unless it appears in a live `sns list-topics`.
+A subscriber aimed at a topic that is not there is the most likely way this wiring is wrong in
+practice, and it is the one part of the budget an emulator can still **refute**.
+
+That refusal is tested rather than asserted. Pointing the shim at a copy of the template with the
+topic's logical id renamed — so `!Ref` cannot resolve — produces:
+
+```
+NotFoundException: subscriber topic(s) not present on this endpoint: [{'Ref': 'CostAlarmsTopicRenamed'}]
+```
+
+The negative control earned its keep immediately: before it ran, that path **crashed** with
+`TypeError: cannot use 'dict' as a set element`, because an unresolved intrinsic comes back as a
+dict rather than a string. A crash is not a refusal — it reads as "the shim is broken" when the
+finding is "this budget cannot notify anybody".
 
 An empty `GetResources` list, incidentally, is worse than an error: it is the same answer for
 every possible query, so it reads as a finding. Measured — an S3 bucket whose own
@@ -498,8 +607,8 @@ every possible query, so it reads as a finding. Measured — an S3 bucket whose 
 key *and* an `x-floci-shim` header. Only the header survives: botocore validates responses against
 its own service model and silently drops any member the model does not declare, so
 `aws budgets describe-budget` never shows `ShimProvenance`. Same reason the two notifications must
-be read with `describe-notifications-for-budget` — a modelled call — rather than from
-`DescribeBudget`.
+be read with `describe-notifications-for-budget`, and their subscribers with
+`describe-subscribers-for-notification` — modelled calls — rather than from `DescribeBudget`.
 
 All four workarounds **refuse to run against a real account** (`AWS_ENDPOINT_URL` unset). There,
 CloudFormation applies these properties itself and reaching around it is precisely the drift
@@ -568,7 +677,7 @@ the stack reaches `CREATE_COMPLETE` through the real ChangeSet flow and the alar
 readable. Check 4's **tags are real** and only the index is stood in for. Check 2 is a template
 projection and establishes nothing about a budget.
 
-**Four things a real account is still the only way to establish**, and no local workaround
+**Five things a real account is still the only way to establish**, and no local workaround
 touches any of them — every workaround above changes what can be *read*, never what the
 infrastructure *does*:
 
@@ -577,7 +686,21 @@ infrastructure *does*:
 | the Budget exists and would notify | there is no budget to read; the shim projects the template |
 | the SNS `TopicPolicy` takes effect | floci drops it and leaves the topic **wider** than the template asks |
 | the alarm's firing behaviour on a gappy metric | floci's alarm evaluates as `missing` whatever `describe-alarms` reports |
-| tag-scoped cost attribution | an emulator bills nobody, so no tag key is activated and Cost Explorer has nothing to group |
+| tag-scoped cost **attribution** | an emulator bills nobody, so no tag key is activated and there is no spend to group |
+| a **saved** Cost Explorer report | saved reports are a console object with **no public API** — unscriptable even on real AWS |
+
+The last row is the odd one out and is worth separating from the rest: it is not an emulator
+limitation at all. There is no `aws ce create-report`. Even with a real account, real spend and
+activated tags, that Done-When is satisfied by a human clicking Save and pasting a screenshot —
+which is why the stand-in is a **file rendered into the repository**, reviewable in a PR, rather
+than an image of a console nobody else can re-run.
+
+One nuance the table would otherwise flatten. The subscriber ARNs **are** live and cross-checked,
+so "the notifications point at a topic that exists" is established here; what is not is that a
+notification would ever be **delivered**. Those are different claims and the first is much cheaper
+than it sounds — it is exactly the check that catches a `!Ref` typo, and it is the one that
+[crashed](#4-floci-cost-apis-shimpy--four-missing-read-apis-not-equally-trustworthy) the first
+time it was pointed at a template that had one.
 
 ---
 
