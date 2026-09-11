@@ -29,11 +29,39 @@ namespace: taxcalc-dev
 # Degraded and turns the deliberate-failure experiment in Task 4 into noise
 # that cannot be told apart from the failure being tested.
 #
-# This is THE IMAGE CI ACTUALLY PUSHED, not a local rebuild: tag
-# ec36057e... is the GHCR artefact from the taxcalc-api ci run on that main
-# commit, and it resolves to digest sha256:b1b3c2e7e530b670... which is
-# byte-identical to what `gh api .../packages/container/taxcalc-api/versions`
-# reports for that tag.
+# W6 D5: THIS TAG IS NOT A CI ARTEFACT, AND THE NAME SAYS SO ON PURPOSE
+#
+# The note below used to read "this is THE IMAGE CI ACTUALLY PUSHED, not a
+# local rebuild". That is no longer true of this line and the exception is
+# deliberate, temporary, and load-bearing for Task 2.
+#
+# Every image CI has published predates W6 D5. `InflightRequestsGauge` - the
+# Micrometer gauge the SLO-derived HPA scales on - lives on the application
+# repo's `w6d5-implementation` branch, which has not merged, so the newest
+# published tag (5806c4ec / `main`, the W6 D4 merge) does not contain it.
+# Verified against the previously-pinned tag rather than assumed:
+#
+#   $ curl -s localhost:8080/actuator/prometheus | grep -c inflight
+#   0
+#
+# Pinning an image without the gauge is not a cosmetic mismatch. The HPA reads
+# `<unknown>`, and an HPA whose metric is unreadable does not fail or alert -
+# it HOLDS its replica count. So Task 2 would have been "correct manifests,
+# frozen autoscaler", with every surface reporting health.
+#
+# `w6d5-local-acef557` is therefore a REAL, PULLABLE GHCR tag built from
+# application-repo commit acef557 and pushed by hand. The `-local-` infix is
+# the whole point: this image is linux/arm64 (CI publishes linux/amd64) and was
+# built with the corporate TLS-interception CA injected into the Gradle stage,
+# because `./gradlew bootJar` inside the build container cannot otherwise reach
+# Maven Central here (`PKIX path building failed`). It is NOT byte-comparable
+# to what CI will produce and must never be mistaken for it.
+#
+# THE EXIT PATH IS THE NORMAL ONE. Merge the application branch;
+# `_build-and-push.yml` publishes a real CI image and `_bump-config.yml`
+# rewrites this `newTag` to the commit SHA, overwriting this exception without
+# anyone having to remember it. Until then, this is the only tag for which the
+# manifest half and the application half of Task 2 are true together.
 #
 # TWO THINGS MAKE THIS WORK ON A LAPTOP, AND BOTH ARE WORTH KNOWING BEFORE
 # ANYONE COPIES THIS INTO A REAL CLUSTER:
@@ -50,16 +78,23 @@ namespace: taxcalc-dev
 #      makes that work.
 #
 #   2. CI publishes linux/amd64 ONLY, and k3d nodes on Apple Silicon are
-#      arm64. This image runs anyway because the Rancher Desktop VM has binfmt
+#      arm64. A CI image runs anyway because the Rancher Desktop VM has binfmt
 #      registered, so containerd executes it under emulation - verified with a
-#      throwaway pod before committing this (`java -version` from the image's
-#      own jlinked JRE returned Temurin 21.0.12 on an arm64 node). It is
-#      EMULATED, so it is slower than a native build; that is acceptable for a
-#      lab and is not acceptable for anything measuring latency. The real fix
-#      is a multi-arch build (`platforms: linux/amd64,linux/arm64`) in
-#      _build-and-push.yml, which is not free here - the Dockerfile's builder
-#      stage runs Gradle and the jlink stage builds a custom JRE, both of
-#      which are slow under QEMU.
+#      throwaway pod (`java -version` from the image's own jlinked JRE returned
+#      Temurin 21.0.12 on an arm64 node). It is EMULATED, so it is slower than
+#      a native build; that is acceptable for a lab and is not acceptable for
+#      anything measuring latency. The real fix is a multi-arch build
+#      (`platforms: linux/amd64,linux/arm64`) in _build-and-push.yml, which is
+#      not free here - the Dockerfile's builder stage runs Gradle and the jlink
+#      stage builds a custom JRE, both slow under QEMU.
+#
+#      THIS DOES NOT APPLY TO THE TAG CURRENTLY PINNED. `w6d5-local-acef557`
+#      was built on the host and is NATIVE arm64, so nothing about it is
+#      emulated. That makes it faster than the CI images every latency number
+#      before W6 D5 was measured on - worth knowing before comparing a p99 from
+#      this tag against an older one, and another reason the `-local-` infix
+#      matters. When CI's amd64 image replaces it on merge, the paragraph above
+#      becomes true again.
 #
 # Reproduce the side-load with:
 #   docker pull --platform linux/amd64 ghcr.io/ai-native-2026-07-29-intuit/taxcalc-api:<sha>
@@ -68,7 +103,7 @@ namespace: taxcalc-dev
 images:
   - name:    uptimecrew/taxcalc-api
     newName: ghcr.io/ai-native-2026-07-29-intuit/taxcalc-api
-    newTag:  "9d3c9e8b74b4f06799da2044833fe09abb9bd872"
+    newTag:  "w6d5-local-acef557"
 
 # Per-env replica count. dev runs hot at one replica.
 #
