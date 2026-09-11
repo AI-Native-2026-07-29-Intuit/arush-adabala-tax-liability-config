@@ -1,0 +1,86 @@
+# aws-authored/taxcalc-worker-scaledobject.sqs.yaml
+#
+# AUTHOR-AND-DEFEND. NEVER `kubectl apply` THIS TO k3d.
+#
+# This is the production form of base/13-taxcalc-worker-scaledobject.yaml's trigger. On a managed
+# cluster the worker scales on SQS queue depth instead of Kafka consumer-group lag, and the
+# interesting part is not the scaler swap - it is WHERE THE CREDENTIAL LIVES.
+#
+# Applying this to k3d would produce a ScaledObject stuck READY=False: there is no SQS queue, no
+# IAM role, and no pod-identity webhook to satisfy the TriggerAuthentication.
+#
+# ---------------------------------------------------------------------------------------------
+# THE WHOLE POINT: identityOwner: operator
+# ---------------------------------------------------------------------------------------------
+# KEDA needs `sqs:GetQueueAttributes` to read ApproximateNumberOfMessages. There are two places
+# that permission can live, and they are not equivalent:
+#
+#   identityOwner: workload  (the other option)
+#       KEDA assumes the identity of the SCALE TARGET's ServiceAccount. The worker pod's IRSA
+#       role must then carry sqs:GetQueueAttributes - which means the application pod holds a
+#       permission the application code never uses. Every replica carries it, an attacker who
+#       reaches any worker pod inherits it, and it will still be there long after anyone
+#       remembers it was granted for the autoscaler's benefit.
+#
+#   identityOwner: operator  (this file)
+#       KEDA uses the KEDA OPERATOR's own IRSA role. The permission lives on the one workload
+#       that actually makes the API call, in the keda namespace, where a reviewer looking at
+#       "who can read this queue" finds the autoscaler rather than the application.
+#
+# The principle generalises past SQS: a credential belongs to the thing that makes the call, not
+# to the thing the call is about. The scale target is the SUBJECT of the query, not its author,
+# and conflating the two is how application pods accumulate permissions nobody can justify.
+#
+# Base/13 needs no TriggerAuthentication at all, because the dev Kafka broker is PLAINTEXT. That
+# is not the discipline being skipped - it is the discipline not applying. Inventing a credential
+# there to demonstrate the shape would have taught the YAML while hiding the decision.
+#
+# ---------------------------------------------------------------------------------------------
+# queueLength IS THE SAME CEIL MATH AS lagThreshold
+# ---------------------------------------------------------------------------------------------
+# queueLength: "10" means 10 messages per pod, so 73 messages scales to ceil(73/10) = 8 pods -
+# identical arithmetic to base/13's lagThreshold: "10". The two files are worth reading side by
+# side precisely because only the SIGNAL changes; the scaling behaviour does not.
+#
+# One real difference: SQS's ApproximateNumberOfMessages does NOT include in-flight messages
+# (those delivered but not yet deleted) unless ApproximateNumberOfMessagesNotVisible is added via
+# `scaleOnInFlight`. Left at its default of true here, because a message being processed is still
+# work the fleet is committed to, and excluding it makes the queue look empty the moment
+# consumers pick it up - which scales the fleet down on top of work still in progress.
+---
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: taxcalc-aws-auth
+  namespace: taxcalc-dev
+spec:
+  podIdentity:
+    provider: aws
+    # The line this whole file exists to explain. See above.
+    identityOwner: operator
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: taxcalc-worker-scaledobject-sqs
+  namespace: taxcalc-dev
+spec:
+  scaleTargetRef:
+    name: taxcalc-api-worker
+  minReplicaCount: 0
+  maxReplicaCount: 20
+  pollingInterval: 15
+  cooldownPeriod:  300
+  triggers:
+    - type: aws-sqs-queue
+      metadata:
+        queueURL:    https://sqs.us-east-1.amazonaws.com/${AWS_ACCOUNT_ID}/taxcalc-calc-jobs-dev
+        queueLength: "10"
+        awsRegion:   us-east-1
+        # Repeated on the trigger as well as on the TriggerAuthentication. KEDA reads it from
+        # both places depending on the code path, and setting it in only one of them is a silent
+        # fall back to `workload` - which is the exact mistake this file is about, and it does
+        # not fail: it works, using the wrong role.
+        identityOwner: operator
+      authenticationRef:
+        name: taxcalc-aws-auth

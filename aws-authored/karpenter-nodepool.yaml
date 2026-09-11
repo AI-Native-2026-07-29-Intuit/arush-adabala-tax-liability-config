@@ -1,0 +1,108 @@
+# aws-authored/karpenter-nodepool.yaml
+#
+# AUTHOR-AND-DEFEND. NEVER `kubectl apply` THIS TO k3d.
+#
+# Karpenter provisions EC2 instances by calling the EC2 API. There is no equivalent on k3d - the
+# cluster's nodes are Docker containers created by k3d, not instances anything can launch - so
+# applying this would install a CRD for a controller that is not running, and the NodePool would
+# sit there Unknown forever. Every other file in this directory is author-only for the same class
+# of reason: it names an AWS service.
+#
+# WHAT THIS IS FOR
+#
+# Tasks 1 and 2 make this cluster's workloads elastic: KEDA scales the worker 0 -> 20 on Kafka
+# lag, and the HPA scales the api 2 -> 20 on in-flight requests. On k3d that elasticity stops at
+# the edge of one node. On EKS it does not: forty new pods need nodes, and Karpenter is what
+# turns "pending pods" into "instances" without a pre-declared node group per instance shape.
+#
+# ---------------------------------------------------------------------------------------------
+# THE SPOT / ON-DEMAND MIX
+# ---------------------------------------------------------------------------------------------
+# Both capacity types are listed. Karpenter's default allocation strategy for Spot is
+# price-capacity-optimized, so it prefers Spot where capacity is deep and falls back to On-Demand
+# when it is not - which is the behaviour worth having, rather than a fixed percentage split.
+#
+# The worker is the workload that makes Spot defensible here. It is a Kafka consumer with
+# at-least-once delivery and an idempotent projection: an interrupted pod's uncommitted records
+# are redelivered to another member of the group, and applying the same event twice produces the
+# same document. Interruption costs latency, not correctness.
+#
+# The api is the workload that makes On-Demand necessary. A Spot reclaim is an INVOLUNTARY
+# disruption, and the PodDisruptionBudget in base/55-taxcalc-api.pdb.yaml does not apply to it -
+# AWS sends a two-minute notice and takes the instance regardless of what any budget says. A
+# service whose floor is "two serving pods" cannot have that floor guaranteed by Spot alone.
+#
+# The honest consequence: this single NodePool spanning both capacity types does NOT by itself
+# keep the api off Spot. Doing that properly needs a second NodePool restricted to on-demand plus
+# a nodeSelector or taint on the api Deployment. One pool is the right starting point for a lab
+# and the wrong answer for the api's SLO, and that gap is stated here rather than discovered
+# during a capacity event.
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: taxcalc-mixed
+spec:
+  template:
+    spec:
+      requirements:
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["spot", "on-demand"]
+        # Several instance types, not one. Karpenter chooses per batch of pending pods, and a
+        # single permitted type turns a Spot capacity shortfall in one pool into unschedulable
+        # pods rather than a slightly different instance.
+        - key: node.kubernetes.io/instance-type
+          operator: In
+          values: ["m5.large", "m5.xlarge", "m6i.large", "m6i.xlarge"]
+        # Three AZs. Spot capacity and price are per-AZ, so a single-AZ pool is both more
+        # expensive on average and far more likely to fail to provision. The cost of spreading is
+        # cross-AZ data transfer between pods, which for this application is the api talking to
+        # Postgres and Kafka - real money, and the reason this is a decision rather than a
+        # default.
+        - key: topology.kubernetes.io/zone
+          operator: In
+          values: ["us-east-1a", "us-east-1b", "us-east-1c"]
+      nodeClassRef:
+        group: karpenter.k8s.aws
+        kind:  EC2NodeClass
+        name:  default
+
+  disruption:
+    # WhenEmptyOrUnderutilized: reclaim nodes that are empty AND repack nodes that are running
+    # well below capacity. The second half is what actually recovers the money after a scale-down
+    # - without it a cluster that scaled to twenty nodes and back to four keeps paying for twenty
+    # half-empty ones.
+    #
+    # Repacking is a VOLUNTARY disruption, so it goes through the Eviction API and the api's PDB
+    # is consulted. That is exactly the interaction base/55-taxcalc-api.pdb.yaml exists for: this
+    # policy is the routine, automated, every-few-minutes source of drains in a production
+    # cluster, and without the PDB it would happily take the api to one replica mid-repack.
+    consolidationPolicy: WhenEmptyOrUnderutilized
+    # 600s, in lockstep with the HPA's scaleDown.stabilizationWindowSeconds in
+    # base/50-taxcalc-api.hpa.yaml.
+    #
+    # These two numbers are a pair and the failure when they disagree is expensive in both
+    # directions. Shorter here than the HPA window: Karpenter removes a node during the HPA's
+    # anti-flap hold, the load returns, the HPA scales up, and the pods have nowhere to go - so
+    # the cluster pays a node launch (~60s) on top of a pod start. Much longer: nodes linger
+    # after the workload has genuinely gone and the consolidation never pays for itself.
+    consolidateAfter: 600s
+
+  # The blast-radius cap, and the reason it exists is upstream of Karpenter.
+  #
+  # KEDA's maxReplicaCount is 20 and the HPA's maxReplicas is 20. A runaway - a poison-pill loop
+  # that never commits, a metric stuck high because the Adapter is returning a stale value - asks
+  # for forty pods and Karpenter will faithfully launch whatever that needs, because unbounded
+  # provisioning is its job. `limits` is the only thing in the chain that says no.
+  #
+  # Sized from the manifests: 20 api pods at 250m/512Mi plus 20 workers at 150m/320Mi is 8 CPU
+  # and 17Gi of requests. 200 CPU / 400Gi is roughly 20x that - generous enough never to throttle
+  # legitimate scaling, small enough that a runaway stops at a number someone can pay.
+  limits:
+    cpu:    "200"
+    memory: 400Gi
+
+  # Higher weight wins when several NodePools could satisfy a pod. Stated explicitly because the
+  # default is 0 and a second pool added later (the on-demand-only one for the api, discussed
+  # above) would tie with this one and be chosen arbitrarily.
+  weight: 10

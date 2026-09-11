@@ -1,0 +1,89 @@
+# aws-authored/cfn/taxcalc-observability-dev.yaml
+#
+# AUTHOR-AND-DEFEND. NEVER deployed from this branch - AWS::XRay::SamplingRule is an AWS
+# resource and there is no X-Ray on k3d. It is written in the same raw-YAML CloudFormation style
+# as cfn/, and it would deploy through the same OIDC role and the same cfn-lint / cfn-nag gate.
+#
+# ---------------------------------------------------------------------------------------------
+# WHY A SAMPLING RULE AT ALL
+# ---------------------------------------------------------------------------------------------
+# The W5 D5 local stack runs `otel.traces.sampler: always_on` - every span, kept. That is correct
+# for a laptop and ruinous on a managed service that bills per trace recorded. A rule is how the
+# same application gets a defensible trace bill without an application change.
+#
+# ---------------------------------------------------------------------------------------------
+# ReservoirSize: 10 + FixedRate: 0.05, AND WHY FixedRate: 0 IS THE TRAP
+# ---------------------------------------------------------------------------------------------
+# X-Ray applies the two in order, per second:
+#
+#   1. The RESERVOIR is a fixed floor: the first 10 matching requests each second are recorded,
+#      whatever the rate. It is a guaranteed absolute number, not a percentage.
+#   2. FixedRate then samples 5% of everything ABOVE that floor.
+#
+# The floor is the half that matters during an incident, and it is the half people delete.
+# `FixedRate: 0` with a reservoir looks disciplined - "sample nothing beyond the floor, keep the
+# bill flat" - and it holds up under load. It fails in the quiet window, which is precisely when
+# an error spike is most diagnosable: at 3 requests/second a 5% rate records essentially nothing,
+# and without the reservoir the first traces of an incident are simply absent. You discover this
+# while looking for them.
+#
+# Sized for this service: taxcalc-api's steady-state dev traffic is single-digit requests/second,
+# so 10/sec means effectively every request is traced when it is quiet, and the 5% tail is what
+# bounds the bill when the HPA has scaled to twenty replicas. The cost ceiling is therefore
+# roughly (10/sec x 86400) + 5% of the overflow - a number that can be estimated before it is
+# spent, which a pure percentage cannot.
+#
+# ---------------------------------------------------------------------------------------------
+# Priority: 1000
+# ---------------------------------------------------------------------------------------------
+# LOWER priority wins in X-Ray, and rules are evaluated in ascending order until one matches.
+# 1000 leaves deliberate room below it for narrower rules added later - a "trace every
+# /v1/completions call" rule at priority 100, say, which must be evaluated BEFORE this catch-all
+# or it never matches anything. Starting at 1 would mean renumbering this rule to add the first
+# specific one.
+AWSTemplateFormatVersion: "2010-09-09"
+Description: taxcalc observability - X-Ray sampling rule (W6 D5 Task 4, author-and-defend).
+
+Parameters:
+  ServiceName:
+    Type: String
+    Default: taxcalc-api
+    Description: The service name spans are reported under; must match the OTel service.name resource attribute.
+
+Resources:
+  TaxcalcSamplingRule:
+    Type: AWS::XRay::SamplingRule
+    # Retained on stack delete. A sampling rule is cheap to keep and disruptive to lose: deleting
+    # it silently reverts the service to the DEFAULT rule (1 req/sec reservoir + 5%), which is a
+    # different and quieter trace volume than this one. Nothing alarms on it, and the gap is only
+    # visible as traces that should exist and do not.
+    DeletionPolicy: Retain
+    # Paired with DeletionPolicy per the cfn-author non-negotiable: Retain covers `delete-stack`,
+    # UpdateReplace covers an update that changes an immutable property and would replace the
+    # resource. RuleName is immutable, so this is not theoretical.
+    UpdateReplacePolicy: Retain
+    Properties:
+      SamplingRule:
+        RuleName: taxcalc-api-default
+        Priority: 1000
+        # The floor. See the header - never 0.
+        ReservoirSize: 10
+        FixedRate: 0.05
+        ServiceName: !Ref ServiceName
+        # The four wildcards below are the catch-all half of this rule, and they are wildcards on
+        # purpose: this is the rule that must match anything not matched by a narrower rule. A
+        # catch-all that accidentally matches nothing produces zero traces with no error - the
+        # same visible result as a service that is not instrumented.
+        ServiceType: "*"
+        Host: "*"
+        HTTPMethod: "*"
+        URLPath: "*"
+        ResourceARN: "*"
+        Version: 1
+
+Outputs:
+  SamplingRuleName:
+    Description: Name of the sampling rule, for cross-stack reference and for the runbook.
+    Value: taxcalc-api-default
+    Export:
+      Name: !Sub "${AWS::StackName}-SamplingRuleName"
