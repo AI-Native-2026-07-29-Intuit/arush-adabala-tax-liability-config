@@ -42,7 +42,22 @@ spec:
     spec:
       containers:
         - name: postgres
-          image: postgres:16
+          # pgvector/pgvector:pg16, not postgres:16 - same PostgreSQL 16 plus the
+          # `vector` extension. W6 D4's V5__create_taxpayer_embeddings.sql opens
+          # with `CREATE EXTENSION IF NOT EXISTS vector`, and Flyway runs the full
+          # migration set on every application start, so a stock image fails the
+          # taxcalc-api pod at startup with `extension "vector" is not available`.
+          # IF NOT EXISTS does not help: it covers "already created", not "not
+          # installed on the server".
+          #
+          # This is the Kustomize base Argo CD actually syncs, so it is the copy
+          # that decides whether the real cluster comes up - and it was the LAST
+          # of four to be found. The others: the Testcontainers images, the app
+          # repo's compose.yaml, and docker.yml's CI smoke-test service. The
+          # migration set runs everywhere the application starts, so a database
+          # image is never a one-file change; grep BOTH repositories rather than
+          # fixing whichever copy happens to be red.
+          image: pgvector/pgvector:pg16
           ports: [{ name: postgres, containerPort: 5432 }]
           env:
             - { name: POSTGRES_DB,       value: taxcalc_dev }
