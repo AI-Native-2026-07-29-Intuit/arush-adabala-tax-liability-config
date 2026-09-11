@@ -115,10 +115,11 @@ Resources:
           - Sid: DenyNonTLS
             Effect: Deny
             Principal: "*"
-            Action:
-              - s3:GetObject
-              - s3:PutObject
-              - s3:ListBucket
+            # s3:*, not an enumeration - an enumerated Deny is only as
+            # complete as the list, and DeleteObject / GetObjectVersion /
+            # PutBucketPolicy over plain HTTP slip past a Get/Put/List triple.
+            # Widening a condition-guarded Deny blocks nothing legitimate.
+            Action: "s3:*"
             Resource:
               - !GetAtt TaxcalcArtifactsBucket.Arn
               - !Sub "${TaxcalcArtifactsBucket.Arn}/*"

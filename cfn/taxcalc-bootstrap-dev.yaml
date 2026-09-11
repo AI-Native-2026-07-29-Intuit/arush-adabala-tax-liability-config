@@ -152,14 +152,18 @@ Resources:
           - Sid: DenyNonTLS
             Effect: Deny
             Principal: "*"
-            Action:
-              - s3:GetObject
-              - s3:PutObject
-              - s3:ListBucket
+            # s3:*, not an enumeration. An enumerated Deny is only as complete
+            # as the list, and the list is never complete: DeleteObject,
+            # GetObjectVersion and PutBucketPolicy over plain HTTP all slip
+            # past a Get/Put/List triple. A Deny guarded by a condition costs
+            # nothing to widen - it fires only on the non-TLS request it is
+            # written to stop, so there is no legitimate call to over-block.
+            Action: "s3:*"
             Resource:
-              # Both ARNs: the bucket ARN is what ListBucket is authorised
-              # against, the /* form is what object actions are authorised
-              # against. One without the other leaves half the API uncovered.
+              # Both ARNs: the bucket ARN is what bucket-level actions are
+              # authorised against, the /* form is what object actions are
+              # authorised against. One without the other leaves half the API
+              # uncovered.
               - !GetAtt BootstrapBucket.Arn
               - !Sub "${BootstrapBucket.Arn}/*"
             Condition:
