@@ -1,4 +1,7 @@
-# manifests/observability/taxcalc-api-servicemonitor.yaml
+# k8s/taxcalc-api/taxcalc-api.servicemonitor.yaml
+#
+# Authored on W5 D5 as manifests/observability/taxcalc-api-servicemonitor.yaml in the application
+# repo, which is still where that copy lives; this is the one Argo CD syncs.
 #
 # A ServiceMonitor is the Prometheus Operator's way of saying "scrape every Pod behind this
 # Service, at this path, this often". The Operator watches these objects and rewrites the
@@ -20,15 +23,43 @@ metadata:
 spec:
   selector:
     matchLabels:
-      # Matches the Service authored on W5 D3 (manifests/20-taxcalc-api.service.yaml).
+      # Matches the Service authored on W5 D3 (k8s/taxcalc-api/taxcalc-api.service.yaml).
       app.kubernetes.io/name: taxcalc-api
   namespaceSelector:
     matchNames: [taxcalc-dev]
   endpoints:
     - port: http                  # the Service port's NAME, never its number
       path: /actuator/prometheus
-      interval: 15s               # matches the stack's default scrape interval
-      scrapeTimeout: 10s
+      # 5s, NOT the stack's default 15s - and this is an autoscaling decision,
+      # not an observability one.
+      #
+      # This endpoint feeds taxcalc_inflight_requests into the Prometheus
+      # Adapter and from there into the HPA. Three lags stack before the
+      # autoscaler can act on a load change: this scrape interval, the
+      # adapter's avg_over_time window, and the HPA's own 15s control loop.
+      # At 15s/[1m] the measured scale-up took 42s, against a W6 D5 Task 2
+      # target of ~30s.
+      #
+      # The naive fix is to shorten the adapter's averaging window alone, and
+      # it is the wrong one: scaleUp.stabilizationWindowSeconds is 0 by design
+      # (capacity is added the moment the metric says to), so that window is
+      # the ONLY thing standing between one unlucky scrape and a scale-up.
+      # Halving it to [30s] at a 15s interval would average just two samples.
+      #
+      # Raising the sample RATE instead buys the latency back without giving
+      # up the statistics: 5s scrapes over a [30s] window average SIX samples,
+      # where 15s scrapes over [1m] averaged four. The signal is both faster
+      # and smoother than it was.
+      #
+      # The cost is real but small and bounded: this is one endpoint on a
+      # 2-20 replica Deployment, tripling its scrape rate. It is deliberately
+      # NOT the stack-wide default - nothing else here needs sub-15s
+      # resolution, and applying this interval broadly would multiply series
+      # churn across every target for no benefit.
+      interval: 5s
+      # Must stay below the interval, or a slow scrape overlaps the next one
+      # and Prometheus marks the target down.
+      scrapeTimeout: 4s
       metricRelabelings:
         # Spring Boot tags http_server_requests with the thrown exception's class name on error
         # responses. That is a per-bug label value that multiplies the series count for exactly

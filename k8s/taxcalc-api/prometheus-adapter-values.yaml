@@ -1,0 +1,144 @@
+# k8s/taxcalc-api/prometheus-adapter-values.yaml - Helm values for prometheus-adapter (W6 D5 Task 2).
+#
+# NOT a Kubernetes manifest and deliberately NOT in k8s/taxcalc-api/kustomization.yaml's `resources`. This
+# is a Helm values file for a CLUSTER-INFRASTRUCTURE component, installed once per cluster
+# alongside kube-prometheus-stack:
+#
+#   helm upgrade --install prom-adapter prometheus-community/prometheus-adapter \
+#     --version 5.3.0 --namespace monitoring \
+#     -f k8s/taxcalc-api/prometheus-adapter-values.yaml
+#
+# It lives in this repo, next to the HPA that depends on it, because the RULE below is
+# application-specific even though the component is not: nothing else in the cluster knows or
+# cares about taxcalc_inflight_requests, and separating the rule from the HPA that reads it is
+# how the two drift into naming different metrics.
+#
+# WHAT THE ADAPTER ACTUALLY DOES
+#
+# An HPA cannot query Prometheus. It reads the Kubernetes custom-metrics API
+# (custom.metrics.k8s.io/v1beta1), which is an APIService that must be BACKED by something. The
+# adapter registers itself as that backend and translates each request into a PromQL query. So
+# the chain is:
+#
+#   InflightRequestsGauge -> /actuator/prometheus -> ServiceMonitor -> Prometheus
+#     -> [this rule] -> custom.metrics.k8s.io -> HPA
+#
+# Every link is silent when it breaks. The HPA's only symptom for a failure ANYWHERE in that
+# chain is `<unknown>` in the TARGETS column, with no indication of which link is at fault.
+# `kubectl get --raw /apis/custom.metrics.k8s.io/v1beta1/namespaces/taxcalc-dev/pods/*/taxcalc_inflight_requests`
+# is what splits the chain in half: a value there means the fault is between the adapter and the
+# HPA, an error means it is between Prometheus and the adapter.
+prometheus:
+  # The kube-prometheus-stack Prometheus Service. This must be the Service, not a pod IP, and the
+  # port must be the Service port (9090). A wrong value here does not fail at install time - the
+  # adapter starts happily and every metric it is asked for simply does not exist.
+  url:  http://kube-prometheus-stack-prometheus.monitoring.svc
+  port: 9090
+
+rules:
+  # `custom` REPLACES the chart's default rule set rather than adding to it. That default set
+  # exposes a broad sweep of container metrics and is not wanted here: it costs a series-discovery
+  # query against Prometheus every discovery interval, and it makes the metric list long enough
+  # that a typo in the HPA's metric name is hard to spot by eye.
+  custom:
+    - # seriesQuery selects WHICH series the adapter will serve. The two label filters are not
+      # cosmetic: `namespace!="",pod!=""` excludes any copy of this series that arrived without
+      # Kubernetes attribution - for example a scrape of a port-forwarded pod during debugging.
+      # A series with an empty pod label cannot be associated with a pod, and the adapter's
+      # association step fails for the whole rule rather than for that one series.
+      seriesQuery: 'taxcalc_inflight_requests{namespace!="",pod!=""}'
+      resources:
+        # Tells the adapter which label is the namespace and which is the pod, so it can answer
+        # "the value for THIS pod". Micrometer does not set these; the ServiceMonitor's scrape
+        # adds them, which is why the W5 D5 ServiceMonitor is a prerequisite for this rule rather
+        # than an unrelated observability object.
+        overrides:
+          namespace: { resource: namespace }
+          pod:       { resource: pod }
+      name:
+        matches: "taxcalc_inflight_requests"
+        # The name the HPA asks for. Kept identical to the Prometheus name on purpose - the
+        # adapter's `as:` is free to rename, and renaming here is how an HPA ends up asking for a
+        # metric that exists under a different name. All three spellings (Micrometer's
+        # taxcalc.inflight.requests, Prometheus's taxcalc_inflight_requests, and the HPA's
+        # metric.name) have to line up, and this is the one place a mismatch could be introduced
+        # for no benefit.
+        as: "taxcalc_inflight_requests"
+      # avg_over_time, NOT the instantaneous value.
+      #
+      # In-flight count is spiky by nature - it is 0 between requests and jumps with each one.
+      # Feeding raw samples to an HPA means the scaling decision depends on whether the last
+      # scrape happened to land during a burst or a gap, which produces scale-ups from a single
+      # unlucky sample and scale-downs from a single lucky one. Averaging is what makes this a
+      # saturation measure rather than a coin flip.
+      #
+      # WHY [30s] AND NOT [1m], AND WHY THAT IS NOT A WEAKENING
+      #
+      # This window is one of three stacked lags between a load change and a scaling decision:
+      # the ServiceMonitor scrape, this average, and the HPA's own 15s control loop. At a 15s
+      # scrape and a [1m] window the measured scale-up took 42s against Task 2's ~30s target.
+      #
+      # What matters for noise rejection is the NUMBER OF SAMPLES averaged, not the wall-clock
+      # width of the window. The ServiceMonitor now scrapes every 5s, so:
+      #
+      #     old:  15s interval, [1m] window  ->  4 samples
+      #     new:   5s interval, [30s] window ->  6 samples
+      #
+      # Six samples is strictly more smoothing than four, delivered in half the time. Shortening
+      # this window WITHOUT raising the scrape rate would have been the weakening - it would have
+      # left two samples, and with scaleUp.stabilizationWindowSeconds at 0 this average is the
+      # only thing between one unlucky scrape and a scale-up.
+      #
+      # Still deliberately far SHORTER than the HPA's 600s scaleDown stabilisation window.
+      # Smoothing belongs in one place; doing it heavily here as well would compound into an
+      # autoscaler that reacts minutes after the load it is reacting to.
+      #
+      # THIS WINDOW AND THE SCRAPE INTERVAL ARE NOW COUPLED. Raising the ServiceMonitor's
+      # interval without widening this window drops the sample count and makes the HPA jumpy;
+      # they move together or not at all.
+      metricsQuery: 'avg_over_time(taxcalc_inflight_requests{<<.LabelMatchers>>}[30s])'
+
+# Single replica: this is a dev cluster, and the adapter is stateless. In production this wants
+# two, because while it is down every HPA reading a custom metric reports <unknown> and holds its
+# current replica count - a silent freeze of autoscaling rather than an outage.
+replicas: 1
+
+# MEMORY: 256Mi WAS TOO LOW, AND THE SYMPTOM WAS INVISIBLE FROM THE HPA
+#
+# The first W6 D5 pass set `limits.memory: 256Mi` by eye, reasoning that a
+# component serving ONE rule over two time series cannot need much. That
+# reasoning is wrong about what the adapter holds in memory, and it cost 24
+# OOMKills in the first three hours on this cluster:
+#
+#   $ kubectl -n monitoring top pod -l app.kubernetes.io/name=prometheus-adapter
+#   NAME                                CPU(cores)   MEMORY(bytes)
+#   prom-adapter-prometheus-adapter-…   7m           240Mi          # at IDLE
+#   $ kubectl -n monitoring describe pod … | grep -A2 'Last State'
+#   Last State:  Terminated
+#     Reason:    OOMKilled
+#     Exit Code: 137
+#
+# The rule count is not what sizes this. The adapter runs Kubernetes INFORMERS
+# over every Pod and Namespace in the cluster, so it can answer "which pod is
+# this series" without an API call per request, and that cache is sized by the
+# CLUSTER, not by the rule. On top of it sits the cached Prometheus series-
+# discovery result. One rule, all the pods.
+#
+# WHY THE HPA NEVER REPORTED IT, WHICH IS THE PART WORTH REMEMBERING
+#
+# A restart loop here is the quietest failure in the chain. While the adapter
+# is down custom.metrics.k8s.io has no backend, every HPA reading a custom
+# metric reports `<unknown>`, and an HPA whose metric is unreadable does not
+# fail, retry loudly or alert - it HOLDS its current replica count. So a
+# service under rising load silently stops scaling on a 5-8 minute cycle, and
+# the only evidence is a RESTARTS column in a namespace nobody is watching.
+# A `kubectl get hpa` that shows a healthy `0/6` is a sample taken between
+# OOMKills; the reading being correct proves nothing about the next one.
+#
+# 768Mi is ~3x the observed idle figure rather than a snug fit, because the
+# floor rises with the number of pods in the cluster and the cost of being
+# slightly wrong is a silent autoscaling freeze. requests.memory is raised to
+# the measured idle usage so the scheduler accounts for what this really holds.
+resources:
+  requests: { cpu: 50m, memory: 256Mi }
+  limits:   { memory: 768Mi }

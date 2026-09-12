@@ -1,7 +1,7 @@
 # platform/00-namespaces.yaml - the three destination namespaces, plus the
 # quota knobs that bound them.
 #
-# NOT part of base/ and NOT synced by Argo CD, deliberately. The AppProject
+# NOT part of k8s/taxcalc-api/ and NOT synced by Argo CD, deliberately. The AppProject
 # (argocd/projects/taxcalc.yaml) denies all three kinds to the taxcalc team:
 #
 #   Namespace      cluster-scoped, and `clusterResourceWhitelist: []` is a
@@ -65,6 +65,49 @@ metadata:
 # quota a real constraint rather than decoration: prod runs 3 api replicas
 # plus the three dev-dependency Deployments against the same 4-CPU / 8Gi
 # request budget dev gets for 1.
+#
+# W6 D5: limits.cpu RAISED 8 -> 16, pods 20 -> 40, IN dev ONLY
+#
+# Task 2's HPA has maxReplicas: 20. Under a 50-VU load test it asked for 5
+# replicas and got 2, with the rest refused outright:
+#
+#   Warning FailedCreate  replicaset-controller  Error creating: pods
+#     "taxcalc-api-…" is forbidden: exceeded quota: taxcalc-dev-quota,
+#     requested: limits.cpu=500m, used: limits.cpu=8, limited: limits.cpu=8
+#
+# NO CONTAINER IN EITHER REPOSITORY DECLARES limits.cpu. The api asks for
+# requests.cpu: 250m and declares no CPU limit at all - W5 D3 omitted it
+# deliberately, to avoid CFS-throttling a latency-sensitive service. That 500m
+# is the LimitRange's `default: {cpu: 500m}` stamped on at admission.
+#
+# So every pod was charged DOUBLE its real request against a quota key nobody
+# was managing, and the namespace's true ceiling was ~16 pods across ALL
+# workloads - an artefact of two defaults multiplying, not a capacity choice.
+# It bound long before the deliberate, node-sized `requests.cpu: 4` did.
+#
+# It also did more than cap autoscaling: at 8/8 a routine rolling update of
+# taxcalc-api stalled at 3 pods, unable to create the replacement. And the two
+# autoscalers CONTEND for this one budget - the k6 mix is 55% writes, so the
+# load test that exercises the api's HPA also drives KEDA's worker 0 -> 12,
+# and those pods claim the limits.cpu the api's new replicas need.
+#
+# Raising limits.cpu grants no capacity. It removes the ACCIDENTAL ceiling so
+# the INTENTIONAL one binds: requests.cpu: 4 and requests.memory: 8Gi, both
+# sized to the node, both left untouched here. `pods` goes to 40 for the same
+# reason - at 20 it was the next accidental ceiling, inherited from the
+# single-replica W5 D3 layout rather than chosen for a namespace running two
+# autoscalers.
+#
+# WHAT THIS DOES NOT FIX. maxReplicas: 20 is still unreachable on a
+# single-node 4-CPU cluster: 20 api pods at requests.cpu 250m is 5000m against
+# 4000m allocatable, so the surplus sits Pending instead of being refused. The
+# failure mode moves from a ReplicaSet event to unschedulable pods; the
+# capacity does not change. An autoscaler's maximum is a request, not a
+# guarantee - the quota was merely the first thing to say no.
+#
+# staging and prod are deliberately NOT raised. Neither runs on this cluster,
+# neither has hit the ceiling, and a quota is only a real constraint while
+# nobody widens it reflexively.
 # ---------------------------------------------------------------------------
 ---
 apiVersion: v1
@@ -78,12 +121,18 @@ metadata:
     app.kubernetes.io/part-of:    taxcalc
     app.kubernetes.io/managed-by: platform-team
 spec:
+  # W6 D5: limits.cpu 8 -> 16 and pods 20 -> 40. See the block above the first
+  # ResourceQuota for the full reasoning. In short: `limits.cpu: 8` was never a
+  # capacity decision, it was a LimitRange default (500m) multiplied by
+  # containers that declare no CPU limit, and it bound long before the
+  # deliberate, node-sized `requests.cpu: 4` ever did. Raising it does not add
+  # capacity - it moves the refusal to the constraint someone actually chose.
   hard:
     requests.cpu:    "4"
     requests.memory: 8Gi
-    limits.cpu:      "8"
+    limits.cpu:      "16"
     limits.memory:   16Gi
-    pods:            "20"
+    pods:            "40"
 
 ---
 apiVersion: v1

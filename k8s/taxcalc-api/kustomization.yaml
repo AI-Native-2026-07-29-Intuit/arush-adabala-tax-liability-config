@@ -1,10 +1,27 @@
-# base/kustomization.yaml
+# k8s/taxcalc-api/kustomization.yaml
 #
 # The W5 D3 manifest set, copied verbatim out of the application repo
 # (arush-adabala-tax-liability/manifests/) and kept identical across every
-# environment. Everything that differs per environment - namespace, replica
-# count, image tag, Spring profile, log level, Ingress host - is a patch in
-# overlays/{dev,staging,prod}/, never an edit here.
+# environment, plus what W6 D5 added to it. Everything that differs per
+# environment - namespace, replica count, image tag, Spring profile, log level,
+# Ingress host - is a patch in overlays/{dev,staging,prod}/, never an edit here.
+#
+# WHY THE FILENAMES CARRY NO ORDERING PREFIXES
+#
+# This directory was `base/`, and its files were named `05-`, `10-`, `12-` and
+# so on. The prefixes read as apply order and were described that way, but they
+# never were: order comes from the `sync-wave` patches at the bottom of this
+# file, and from the `resources:` list below, both of which NAME files rather
+# than infer an order from them. Nothing in either repository applies this
+# directory with `kubectl apply -f`, which is the one mechanism that would have
+# sorted by filename. Two files a reader would expect to be adjacent - the
+# broker and the bootstrap Job that seeds its consumer group - were `06-` and
+# `07-` purely because someone chose those numbers.
+#
+# So the prefixes encoded an ordering guarantee they did not provide, which is
+# worse than no hint at all: it invites a change to the numbers in the belief
+# that something will follow them. The waves are declared explicitly instead,
+# and the directory is named for the paths the W6 D5 deliverable asks for.
 #
 # FOUR W5 D3 OBJECTS ARE DELIBERATELY ABSENT:
 #
@@ -37,7 +54,7 @@
 #                     continuous reconciliation: the first sync wrote the
 #                     placeholder over the real password and every api pod
 #                     started failing Postgres auth. See
-#                     platform/40-taxcalc-api.secret.yaml for the full
+#                     platform/secret/40-taxcalc-api.secret.yaml for the full
 #                     write-up and the out-of-band procedure.
 #
 # All four live under platform/ and are applied out-of-band. See those files'
@@ -46,13 +63,18 @@ apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
 resources:
-  - 05-dev-dependencies.yaml
-  - 10-taxcalc-api.deployment.yaml
-  - 20-taxcalc-api.service.yaml
-  - 30-taxcalc-api.configmap.yaml
-  - 50-taxcalc-api.hpa.yaml
-  - 60-taxcalc-api.ingress.yaml
-  - 70-taxcalc-api.servicemonitor.yaml
+  - dev-dependencies.yaml
+  - kafka.yaml                          # W6 D5 Task 1: a real broker, at last
+  - kafka-bootstrap.job.yaml            # W6 D5 Task 1: seeds the group offset so a FRESH deploy rests at 0/0
+  - taxcalc-api.deployment.yaml
+  - taxcalc-worker.deployment.yaml      # W6 D5 Task 1: the KEDA scale target
+  - taxcalc-worker-scaledobject.yaml    # W6 D5 Task 1: KEDA on Kafka lag
+  - taxcalc-api.service.yaml
+  - taxcalc-api.configmap.yaml
+  - hpa.yaml                            # W6 D5 Task 2: renamed from taxcalc-api.hpa.yaml, and the object inside it is now taxcalc-api-hpa
+  - pdb.yaml                            # W6 D5 Task 2: the availability floor
+  - taxcalc-api.ingress.yaml
+  - taxcalc-api.servicemonitor.yaml
 
 # ---------------------------------------------------------------------------
 # Sync waves - INTRA-Application ordering, applied here rather than in each
@@ -116,3 +138,30 @@ patches:
         name: mongo
         annotations:
           argocd.argoproj.io/sync-wave: "-1"
+
+  # W6 D5 Task 1: the broker joins wave -1 with the other backing stores.
+  # It is a store the workloads dial, and the worker in particular has no
+  # readiness probe to hold it out of service while the broker forms its KRaft
+  # quorum - it would simply log connection failures until the broker arrived.
+  - target: { kind: Deployment, name: kafka }
+    patch: |
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: kafka
+        annotations:
+          argocd.argoproj.io/sync-wave: "-1"
+
+  # W6 D5 Task 1: the ScaledObject must land AFTER its scale target exists.
+  # KEDA reconciles a ScaledObject whose scaleTargetRef points at nothing into
+  # READY=False with "scaletarget not found" and does NOT retry on a schedule
+  # tight enough to look self-healing - it waits for the next resync. Wave 1
+  # makes the ordering explicit instead of relying on alphabetical luck.
+  - target: { kind: ScaledObject, name: taxcalc-worker-scaledobject }
+    patch: |
+      apiVersion: keda.sh/v1alpha1
+      kind: ScaledObject
+      metadata:
+        name: taxcalc-worker-scaledobject
+        annotations:
+          argocd.argoproj.io/sync-wave: "1"

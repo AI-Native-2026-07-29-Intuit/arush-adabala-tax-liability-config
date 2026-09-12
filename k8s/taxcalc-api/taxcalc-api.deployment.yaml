@@ -1,4 +1,4 @@
-# manifests/10-taxcalc-api.deployment.yaml - the workload.
+# k8s/taxcalc-api/taxcalc-api.deployment.yaml - the workload.
 # Pin the image by tag (NOT a moving label); set zero-downtime rollout
 # defaults; use the three-probe pattern from Topic 7; surface the
 # non-root UID from the W5 D1 distroless image; wire envFrom both the
@@ -51,6 +51,27 @@ spec:
             - configMapRef: { name: taxcalc-api-config }
             - secretRef:    { name: taxcalc-api-secrets }
           env:
+            # W6 D5 Task 1. The api must NOT consume taxpayers.events.
+            #
+            # This image carries TaxpayerUpdatedListener, so without this flag
+            # every api replica joins consumer group taxcalc-read-model-builder
+            # - the same group KEDA scales taxcalc-api-worker on. Lag is a
+            # property of the GROUP, not of a Deployment, so two or three api
+            # pods comfortably keep a dev-rate topic drained and the lag KEDA
+            # polls sits near zero however much is produced. The worker then
+            # never leaves minReplicaCount: 0.
+            #
+            # Nothing about that looks like a failure: the ScaledObject is
+            # READY=True, the trigger is valid, the broker is reachable, and
+            # the read model IS being updated - by the wrong pods. It reads as
+            # "KEDA isn't working" and sends you to operator logs that are
+            # clean.
+            #
+            # Until W6 D5 this was harmless because W5 D3 deployed no broker at
+            # all. k8s/taxcalc-api/kafka.yaml changes that, which is what makes this
+            # line load-bearing from today.
+            - name:  TAXCALC_READ_MODEL_LISTENER_ENABLED
+              value: "false"
             # Make the JVM respect the cgroup memory limit, not host RAM.
             - name: JAVA_TOOL_OPTIONS
               value: "-XX:MaxRAMPercentage=75.0 -XX:+ExitOnOutOfMemoryError"

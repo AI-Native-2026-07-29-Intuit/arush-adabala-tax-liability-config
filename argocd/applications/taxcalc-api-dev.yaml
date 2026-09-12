@@ -75,7 +75,7 @@ spec:
 
   # THE ONE FIELD WHERE "GIT IS THE SOURCE OF TRUTH" IS WRONG.
   #
-  # base/50-taxcalc-api.hpa.yaml sets minReplicas: 2; overlays/dev sets
+  # k8s/taxcalc-api/hpa.yaml sets minReplicas: 2; overlays/dev sets
   # replicas: 1. Both are correct - Git holds the value the Deployment is
   # CREATED with, and the HorizontalPodAutoscaler owns it from then on. Without
   # this block the two controllers fight forever: the HPA scales to 2, Argo CD
@@ -83,11 +83,24 @@ spec:
   # Application never settles on Synced and the notifications wired up in
   # Task 4 alert on a fight that is working as designed.
   #
-  # Scoped to the one field on the one kind, not a blanket ignore - anything
+  # Scoped to the one field on NAMED kinds, not a blanket ignore - anything
   # broader would also hide a real, unexplained edit to the Deployment spec.
+  # That narrowness is why the worker needs its own entry rather than
+  # inheriting this one; see k8s/taxcalc-api/taxcalc-worker.deployment.yaml, which
+  # wrongly assumed for a while that it already did.
   ignoreDifferences:
     - group: apps
       kind:  Deployment
       name:  taxcalc-api
+      jsonPointers:
+        - /spec/replicas
+    # W6 D5 Task 1: the KEDA scale target. Same conflict, different controller
+    # writing the field - the HorizontalPodAutoscaler KEDA generates
+    # (keda-hpa-taxcalc-worker-scaledobject) rather than the api's own HPA.
+    # taxcalc-worker.deployment.yaml declares `replicas: 0` as the created-with value; every value
+    # after that is KEDA's, including the drop back to 0 after cooldownPeriod.
+    - group: apps
+      kind:  Deployment
+      name:  taxcalc-api-worker
       jsonPointers:
         - /spec/replicas

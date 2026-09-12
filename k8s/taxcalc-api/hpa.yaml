@@ -1,0 +1,121 @@
+# k8s/taxcalc-api/hpa.yaml - SLO-derived HPA on a custom metric (W6 D5 Task 2, RUNNABLE).
+#
+# THE FILENAME AND THE OBJECT NAME BOTH CHANGED, AND NEITHER WAS COSMETIC
+#
+# This file was `taxcalc-api.hpa.yaml` and held an HPA named `taxcalc-api`.
+# Both are now the names the W6 D5 deliverable states: the file is hpa.yaml
+# (pdb.yaml alongside it) and the object is `taxcalc-api-hpa`.
+#
+# The object name is the one that actually mattered. The deliverable's check is
+# `kubectl -n taxcalc-dev get hpa taxcalc-api-hpa`, and against an HPA named
+# `taxcalc-api` that command returns NotFound - not a wrong value, not an
+# `<unknown>` target, but the same output an operator would get if this
+# autoscaler did not exist. Every scaling property below was already correct
+# and none of it was reachable by the name anyone would type. A resource whose
+# documented name does not resolve is indistinguishable from a missing
+# resource, which is the worst failure mode for a verification step.
+#
+# The `-hpa` suffix also matches taxcalc-api-pdb, which was already suffixed;
+# the two objects of this task now read as a pair on `kubectl get` output
+# instead of one bare name and one suffixed one.
+#
+# WHAT CHANGED TODAY, AND WHY THE OLD VERSION WAS WORSE THAN IT LOOKED
+#
+# W5 D3 scaled this Deployment on `type: Resource` CPU at 70% utilisation.
+# That is the wrong signal for this service, and wrong in the direction that
+# never fires.
+#
+# taxcalc-api's slowest path is an outbound call to the Anthropic API. A pod
+# serving one is parked in a socket read: it holds a request, a thread and a
+# connection, and burns almost no CPU doing it. Under LLM-bound load p99 climbs
+# straight through the 500ms W5 D5 objective while CPU utilisation sits in the
+# teens, so a CPU-target HPA never scales. It is not misconfigured - it is
+# measuring the wrong resource, which is the worse failure, because every
+# surface reports the autoscaler as healthy while the SLO burns.
+#
+# In-flight request count tracks saturation here because it counts exactly the
+# thing that runs out. The gauge is published by InflightRequestsGauge in the
+# application and reaches the custom-metrics API through the Prometheus Adapter
+# rule in prometheus-adapter-values.yaml.
+#
+# WHERE averageValue: 6 COMES FROM
+#
+# A single-replica saturation ramp: one pod holds p99 under 500ms up to roughly
+# six concurrent requests and breaks above it. The target is therefore the
+# concurrency at which this service stops meeting its objective - SLO-derived
+# and measured, not a round number that looked reasonable. If the SLO moves, or
+# the code gets faster or slower, this is re-measured. It is not tuned until
+# the graph looks nice.
+#
+# type: AverageValue, NOT Utilization. Utilization is a percentage of a
+# resource REQUEST and exists only for `type: Resource` metrics; a Pods metric
+# has no request to be a percentage of, and asking for Utilization here is a
+# validation error. AverageValue means "sum the metric across pods, divide by
+# the replica count, compare to this" - which is the per-pod concurrency the
+# ramp above measured.
+#
+# THE TWO STABILISATION WINDOWS ARE DELIBERATELY ASYMMETRIC
+#
+#   scaleUp   0s   Add capacity the moment the metric says to. The cost of
+#                  being wrong is a few extra pods for a minute; the cost of
+#                  waiting is SLO burn, which cannot be recovered later.
+#   scaleDown 600s Ten minutes of sustained low concurrency before removing a
+#                  pod - the W5 D3 anti-flap callback, lengthened. Removing a
+#                  pod during a lull that is about to end costs a JVM cold
+#                  start ON TOP of the load that ended the lull.
+#
+# DO NOT ALSO SET spec.replicas ON THE DEPLOYMENT
+#
+# Deployment.spec.replicas is in ignoreDifferences on every generated
+# Application precisely so this HPA can own the field without Argo CD calling
+# it drift. Setting it in an overlay AND running this HPA is a three-way fight
+# between Git, the HPA and selfHeal.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  # `taxcalc-api-hpa`, NOT `taxcalc-api`. The name is what the deliverable's
+  # verification command addresses; see the header. It is deliberately
+  # different from scaleTargetRef.name below - they are two objects, and
+  # sharing one name here only ever hid which of the two an error was about.
+  name: taxcalc-api-hpa
+  namespace: taxcalc-dev
+  labels:
+    app.kubernetes.io/name:       taxcalc-api
+    app.kubernetes.io/component:  api
+    app.kubernetes.io/part-of:    taxcalc
+    app.kubernetes.io/managed-by: argocd
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind:       Deployment
+    name:       taxcalc-api
+  # Paired with the PodDisruptionBudget's minAvailable in
+  # pdb.yaml. The two numbers move together: a PDB floor ABOVE
+  # the HPA floor can never be satisfied once the HPA scales to its minimum
+  # (allowed disruptions pins at 0 and node drains hang forever), and a PDB
+  # floor BELOW it does not protect the availability the HPA floor exists for.
+  minReplicas: 2
+  maxReplicas: 20
+  metrics:
+    - type: Pods
+      pods:
+        metric:
+          # Micrometer publishes `taxcalc.inflight.requests`; the Prometheus
+          # registry renders dots as underscores and the Adapter's `as:` keeps
+          # that spelling. All three names must agree - when they do not, the
+          # HPA reports the metric as `<unknown>` and nothing anywhere says
+          # which of the three is the odd one out.
+          name: taxcalc_inflight_requests
+        target:
+          type:         AverageValue
+          averageValue: "6"
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 600
+      policies:
+        - { type: Percent, value: 25, periodSeconds: 60 }
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+        - { type: Percent, value: 100, periodSeconds: 60 }
+      selectPolicy: Max

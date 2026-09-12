@@ -1,4 +1,4 @@
-# manifests/05-dev-dependencies.yaml - NOT part of the graded W5 D3 task
+# k8s/taxcalc-api/dev-dependencies.yaml - NOT part of the graded W5 D3 task
 # list (Tasks 1-4 only cover taxcalc-api's own Deployment/Service/
 # ConfigMap/Secret/HPA/Ingress). Deliberate gap, same reasoning as W5 D2's
 # Mongo addition: taxcalc-api's Flyway migration + JPA schema validation
@@ -158,8 +158,16 @@ spec:
   ports: [{ name: mongo, port: 27017, targetPort: mongo }]
 
 ---
-# DNS placeholder only - no Deployment/pods behind this Service, no real
-# broker. See the file header comment above for why it still has to exist.
+# W6 D5 Task 1: this Service now has a REAL broker behind it (k8s/taxcalc-api/kafka.yaml).
+#
+# Until today the selector was `kafka-broker-not-deployed-in-this-lab` - a
+# deliberate no-match, so the Service existed for DNS resolution only. KEDA
+# cannot read consumer-group lag from a hostname, so Task 1 stood the broker
+# up and this selector now points at it.
+#
+# The file header above still explains why the DNS name alone mattered; that
+# reasoning is unchanged and is why the Service is still declared here rather
+# than beside the Deployment in kafka.yaml.
 apiVersion: v1
 kind: Service
 metadata:
@@ -167,5 +175,5 @@ metadata:
   namespace: taxcalc-dev
   labels: { app.kubernetes.io/name: kafka }
 spec:
-  selector: { app.kubernetes.io/name: kafka-broker-not-deployed-in-this-lab }
-  ports: [{ name: kafka, port: 9092, targetPort: 9092 }]
+  selector: { app.kubernetes.io/name: kafka }
+  ports: [{ name: kafka, port: 9092, targetPort: kafka }]

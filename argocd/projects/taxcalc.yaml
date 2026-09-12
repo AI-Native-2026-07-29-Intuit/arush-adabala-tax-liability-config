@@ -56,7 +56,7 @@ spec:
   # whitelist is a full deny, and it is what stops a compromised config repo
   # from smuggling in a privileged DaemonSet or a cluster-admin binding.
   #
-  # This is also why base/ carries no Namespace object: Namespace is
+  # This is also why k8s/taxcalc-api/ carries no Namespace object: Namespace is
   # cluster-scoped, so it is governed by THIS list and not by the
   # namespaceResourceWhitelist below.
   #
@@ -81,7 +81,7 @@ spec:
   # use. Anything else is denied.
   #
   # Ingress is on this list and is NOT in the reference layout's: the W5 D3
-  # manifest set contains one (manifests/60-taxcalc-api.ingress.yaml), so
+  # manifest set contains one (k8s/taxcalc-api/taxcalc-api.ingress.yaml), so
   # omitting it would deny a resource this project's own base ships. An
   # allow-list has to match the manifests it governs or the first sync fails.
   #
@@ -90,6 +90,31 @@ spec:
   # that moving them here later is a file move rather than a project change,
   # and it costs nothing: the taxcalc namespaces are the only place this
   # project can write at all.
+  #
+  # W6 D5: Job AND ScaledObject WERE MISSING, AND THE FIRST REAL SYNC FOUND IT
+  #
+  # Task 1 added two kinds to k8s/taxcalc-api/ - the kafka-bootstrap Job and
+  # the KEDA ScaledObject - and neither was added here. That is the exact
+  # mistake the Ingress note above warns about, made in the same week the note
+  # was written, and it survived because Argo CD was not running on the
+  # cluster: the manifests were applied with `kubectl`, which consults no
+  # AppProject. The first sync through an actual Argo CD said:
+  #
+  #   ScaledObject taxcalc-worker-scaledobject SyncFailed
+  #     resource keda.sh:ScaledObject is not permitted in project taxcalc
+  #   Job          kafka-bootstrap             SyncFailed
+  #     resource batch:Job is not permitted in project taxcalc
+  #
+  # AND IT TOOK THE WHOLE APPLICATION DOWN WITH IT. A denied resource fails the
+  # sync OPERATION, not just its own task, so the Application sat at
+  # `OutOfSync / Progressing` with "one or more synchronization tasks are not
+  # valid" and retried on backoff forever. The Deployment, the HPA and the PDB
+  # were all perfectly legal and none of them converged either - the blast
+  # radius of one missing whitelist line is every resource in the Application.
+  #
+  # The lesson is the one already written above, now paid for: an allow-list
+  # has to match the manifests it governs, and the only thing that proves it
+  # does is a sync. `kubectl apply` will never tell you.
   namespaceResourceWhitelist:
     - { group: "",                     kind: Service }
     - { group: "",                     kind: ConfigMap }
@@ -102,6 +127,12 @@ spec:
     - { group: networking.k8s.io,      kind: Ingress }
     - { group: monitoring.coreos.com,  kind: ServiceMonitor }
     - { group: monitoring.coreos.com,  kind: PrometheusRule }
+    # W6 D5 Task 1. The Job is the wave-0 sync hook that creates the topic and
+    # seeds the consumer group's offset; the ScaledObject is KEDA's scaler on
+    # that group's lag. Both are namespaced and both are in this project's own
+    # base, so both have to be here.
+    - { group: batch,                  kind: Job }
+    - { group: keda.sh,                kind: ScaledObject }
 
   # Explicitly block the quota knobs even though they are namespaced and would
   # otherwise be reachable. The blacklist wins over the whitelist. A team that

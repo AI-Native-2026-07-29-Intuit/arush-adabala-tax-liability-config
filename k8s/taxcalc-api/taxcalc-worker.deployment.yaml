@@ -1,0 +1,156 @@
+# k8s/taxcalc-api/taxcalc-worker.deployment.yaml - the KEDA scale target (W6 D5 Task 1).
+#
+# The SAME image as taxcalc-api, run with SPRING_PROFILES_ACTIVE=k8s,worker:
+# no HTTP server, consumes taxpayers.events on consumer group
+# taxcalc-read-model-builder, re-projects the Mongo read model. One image and
+# two run modes, so the worker is provably the same bytes as the api rather
+# than a second build that drifts from it.
+#
+# `replicas: 0` IS STATED, AND THE IGNORE THAT MAKES IT SAFE IS NAMED BELOW
+#
+# KEDA owns the replica count from the moment the ScaledObject is created. It
+# does not set the count itself - it creates a HorizontalPodAutoscaler behind
+# the scenes and that HPA drives spec.replicas. So the danger of declaring the
+# field is the classic sync war: Argo CD's selfHeal reconciles it back to the
+# manifest value, the HPA writes it again from lag, and the two fight on every
+# reconcile interval.
+#
+# This file previously omitted `replicas` for that reason, and justified it by
+# saying Deployment.spec.replicas was already in ignoreDifferences "on every
+# generated Application". That was not true: both
+# argocd/applications/taxcalc-api-dev.yaml and
+# argocd/applicationsets/taxcalc-api-envs.yaml scope the ignore to
+# `name: taxcalc-api` - deliberately, so a blanket ignore could not hide a real
+# edit to some other Deployment's spec. taxcalc-api-worker was not covered by
+# it, so the omission was load-bearing rather than belt-and-braces, and the
+# comment asserting otherwise was the dangerous part: the next person to add
+# `replicas` on the strength of it would have got the sync war.
+#
+# Both Applications now carry a second, equally narrow ignoreDifferences entry
+# for `name: taxcalc-api-worker` on /spec/replicas. With the ignore actually in
+# place, stating `replicas: 0` is strictly better than omitting it:
+#
+#   - It is what the deliverable asks for, and it says out loud that this
+#     Deployment starts at zero rather than leaving a reader to know that
+#     Kubernetes defaults an absent replicas to 1. An omitted field here reads
+#     as "starts at one" to anyone who has not memorised that default, which is
+#     the opposite of the intent.
+#   - Scale-to-zero is the point of the ScaledObject, so zero is the honest
+#     declared starting state - and Argo CD's diff view showing `0` against a
+#     live `7` under load is informative, not drift.
+#
+# Git owns the value this Deployment is CREATED with. KEDA's HPA owns it from
+# then on, and the ignore is what lets both statements be true at once.
+#
+# NO PROBES, DELIBERATELY
+#
+# The worker profile sets spring.main.web-application-type=none, so there is no
+# servlet container, no port bound and no /actuator/health to probe. An
+# httpGet probe here would fail closed and CrashLoopBackOff a perfectly healthy
+# consumer; an exec probe would need a shell the distroless image does not
+# have. Liveness for a Kafka consumer is "is it committing offsets", which is
+# what the KEDA lag metric already answers from outside the pod - and answers
+# better, because a pod can be alive and still not consuming.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: taxcalc-api-worker
+  namespace: taxcalc-dev
+  labels:
+    app.kubernetes.io/name:       taxcalc-api-worker
+    app.kubernetes.io/component:  worker
+    app.kubernetes.io/part-of:    taxcalc
+    app.kubernetes.io/managed-by: argocd
+spec:
+  # Zero, and KEDA owns it from here. Safe to declare only because
+  # /spec/replicas on this exact name is in ignoreDifferences on both
+  # Applications - see the header.
+  replicas: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: taxcalc-api-worker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name:       taxcalc-api-worker
+        app.kubernetes.io/component:  worker
+        app.kubernetes.io/part-of:    taxcalc
+        app.kubernetes.io/managed-by: argocd
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser:    65532   # the distroless UID from W5 D1
+        fsGroup:      65532
+      # Scale-to-zero means pods are created and destroyed constantly. 20s
+      # rather than the 30s default: the only thing this pod has to finish on
+      # SIGTERM is the in-flight record batch and its offset commit, and a long
+      # grace period on a scale-down of fifteen pods is fifteen pods' worth of
+      # cost doing nothing but waiting to be killed.
+      terminationGracePeriodSeconds: 20
+      containers:
+        - name:  worker
+          image: uptimecrew/taxcalc-api:0.1.3
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            # The SAME ConfigMap and Secret the api reads, so broker address,
+            # datasource and Mongo URI cannot drift between the two run modes.
+            - configMapRef: { name: taxcalc-api-config }
+            - secretRef:    { name: taxcalc-api-secrets }
+          env:
+            # Overrides the ConfigMap's SPRING_PROFILES_ACTIVE. `k8s` is
+            # layered under `worker`, never replaced by it: every in-cluster
+            # hostname lives in the k8s profile, and `worker` alone would
+            # leave this pod dialling localhost.
+            - name:  SPRING_PROFILES_ACTIVE
+              value: "k8s,worker"
+            # Explicitly TRUE here, even though true is the default. This is
+            # the flag the api Deployment sets to false so api pods do not
+            # drain the lag KEDA scales this Deployment on; stating it on both
+            # sides means a reader comparing the two env blocks sees the
+            # difference is intentional rather than an omission. TaxcalcWorker
+            # refuses to start if this is ever false.
+            - name:  TAXCALC_READ_MODEL_LISTENER_ENABLED
+              value: "true"
+            - name: JAVA_TOOL_OPTIONS
+              value: "-XX:MaxRAMPercentage=75.0 -XX:+ExitOnOutOfMemoryError"
+          # Smaller than the api's: no servlet container, no connection pool
+          # sized for HTTP concurrency. The request matters more than usual
+          # here because it is multiplied by up to maxReplicaCount - at 20
+          # pods this Deployment's requests alone are 2 CPU and 8.75Gi, which
+          # is what the Karpenter NodePool's `limits` in Task 4 exists to cap.
+          #
+          # BOTH NUMBERS ARE MEASURED, AND THE MEMORY ONE WAS WRONG IN THE
+          # DIRECTION THAT DOES NOT ANNOUNCE ITSELF.
+          #
+          # Three settled workers, `kubectl top`, idle on a drained topic:
+          #   cpu     24m, 24m, 26m      <- against a 150m request
+          #   memory  400Mi, 403Mi, 408Mi <- against a 320Mi request
+          #
+          # CPU was over-requested by ~6x, and that is the ordinary kind of
+          # wrong: it wastes schedulable room and nothing breaks. 100m still
+          # leaves 4x headroom over measured idle.
+          #
+          # Memory was UNDER-requested, which is the kind that does break. A
+          # request is the promise the scheduler packs the node against, so a
+          # pod whose steady-state RSS exceeds its own request means the node
+          # is systematically oversubscribed by (actual - request) per replica
+          # - 80Mi here, multiplied by however many KEDA starts. Nothing
+          # reports this. The pods are not OOMKilled (the 768Mi LIMIT is
+          # honest), the Deployment is Ready, and the only symptom arrives as
+          # node MemoryPressure and evicted pods somewhere else in the
+          # namespace, at whatever replica count finally crosses the line.
+          # 448Mi is measured-idle + ~10%.
+          #
+          # Raising a request to fit reality LOWERS how many replicas the node
+          # can take, and that is the point: the previous number bought a
+          # higher replica count by under-declaring, which is not capacity.
+          # See SRE-CAPSTONE.md for the arithmetic on why ~15 workers does not
+          # fit this node once the real figure is used.
+          #
+          # The LIMIT deliberately does not move. JAVA_TOOL_OPTIONS above sets
+          # MaxRAMPercentage=75 with ExitOnOutOfMemoryError, so a 512Mi limit
+          # would put the heap ceiling at 384Mi under a 400Mi resident
+          # footprint - the pod would not get smaller, it would exit.
+          resources:
+            requests: { cpu: 100m, memory: 448Mi }
+            limits:   {            memory: 768Mi }

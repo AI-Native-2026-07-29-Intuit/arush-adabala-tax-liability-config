@@ -1,0 +1,88 @@
+# overlays/loadtest/kustomization.yaml
+#
+# The dev overlay, plus the two changes a k6 run needs (W6 D5 Task 3). Applied by hand for the
+# duration of a load test and reverted afterwards - it is NOT wired into the ApplicationSet and
+# no Argo CD Application points at it, deliberately. An environment that Argo CD reconciles is an
+# environment that can be left switched on by accident.
+#
+# THE TWO CHANGES, AND WHY EACH IS UNAVOIDABLE
+#
+#  1. SPRING_PROFILES_ACTIVE gains `loadtest`, which does two things (see application.yml):
+#     validates JWTs against a mounted public key instead of the placeholder issuer-uri, and
+#     replaces AnthropicChatUpstream with SyntheticChatUpstream.
+#
+#     Without the first, every request in the load test is a 401. That does not fail the latency
+#     threshold - 401s are fast, so p99 looks excellent - it pins http_req_failed at 1.0 and
+#     leaves the cost Trend empty. The nicest-looking graph this repo can produce is the one
+#     where nothing worked.
+#
+#     Without the second, a 200-VU six-minute run is ~100k paid Anthropic completions per pull
+#     request, and a real completion's 1-3s latency makes the p99 <= 500ms objective unreachable
+#     for reasons that say nothing about how well taxcalc-api scales.
+#
+#  2. The taxcalc-loadtest-jwt Secret is mounted at /etc/taxcalc/loadtest. Created out of band by
+#     scripts/loadtest-token.sh, exactly like the api's own Secret - it holds a PUBLIC key, but
+#     it lives beside credential material and consistency is cheaper than an exception.
+#
+# minReplicas STAYS AT THE BASE VALUE OF 2
+#
+# The dev overlay patches the HPA floor down to 1 to match its single replica. This overlay does
+# not, because the PodDisruptionBudget's minAvailable is 2 and the load test is the one scenario
+# where the HPA is actually expected to move: starting below the PDB floor means allowed
+# disruptions is 0 for the whole run, so the PDB evidence the deliverable asks for would be
+# collected from a Deployment that could never have satisfied it.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../k8s/taxcalc-api
+
+namespace: taxcalc-dev
+
+images:
+  - name:    uptimecrew/taxcalc-api
+    newName: ghcr.io/ai-native-2026-07-29-intuit/taxcalc-api
+    # W6 D5: see overlays/dev/kustomization.yaml for why this is a hand-pushed
+    # `-local-` tag rather than a CI artefact. It is the only published image
+    # containing InflightRequestsGauge until the application branch merges.
+    newTag:  "w6d5-local-acef557"
+
+patches:
+  - target: { kind: ConfigMap, name: taxcalc-api-config }
+    patch: |
+      - op: replace
+        path: /data/SPRING_PROFILES_ACTIVE
+        value: "k8s,loadtest"
+      # INFO, not the dev overlay's DEBUG. At 200 VUs, DEBUG logging on the api is itself a
+      # measurable load: it serialises a JSON log line per Kafka fetch and per request, which
+      # shows up in p99 and would be attributed to the service rather than to the logger.
+      - op: replace
+        path: /data/LOGGING_LEVEL_ROOT
+        value: "INFO"
+
+  # Mount the public key the loadtest profile validates tokens with.
+  - target: { kind: Deployment, name: taxcalc-api }
+    patch: |
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: taxcalc-api
+      spec:
+        template:
+          spec:
+            volumes:
+              - name: loadtest-jwt
+                secret:
+                  secretName: taxcalc-loadtest-jwt
+            containers:
+              - name: taxcalc-api
+                volumeMounts:
+                  - name: loadtest-jwt
+                    mountPath: /etc/taxcalc/loadtest
+                    readOnly: true
+
+  - target: { kind: Ingress, name: taxcalc-api }
+    patch: |
+      - op: replace
+        path: /spec/rules/0/host
+        value: taxcalc.dev.uptimecrew.internal

@@ -1,4 +1,4 @@
-# manifests/20-taxcalc-api.service.yaml - stable in-cluster name.
+# k8s/taxcalc-api/taxcalc-api.service.yaml - stable in-cluster name.
 # ClusterIP only; external traffic comes through the Ingress (Topic 4).
 # Selector MUST match the Deployment's pod labels.
 
