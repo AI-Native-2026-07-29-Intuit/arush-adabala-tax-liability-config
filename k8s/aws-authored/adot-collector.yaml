@@ -1,11 +1,11 @@
-# aws-authored/adot-collector.yaml
+# k8s/aws-authored/adot-collector.yaml
 #
 # AUTHOR-AND-DEFEND. NEVER `kubectl apply` THIS TO k3d.
 #
 # It needs the OpenTelemetry Operator's OpenTelemetryCollector CRD (not installed here) and the
 # awsxray exporter needs real AWS credentials and a real X-Ray endpoint. The Tempo half WOULD run
 # locally - that is the W5 D5 endpoint this cluster already has - which makes this the one file
-# in aws-authored/ that is half-runnable, and worth being precise about.
+# in k8s/aws-authored/ that is half-runnable, and worth being precise about.
 #
 # ---------------------------------------------------------------------------------------------
 # ONE RECEIVER, TWO EXPORTERS - AND WHY THE APPLICATION NEVER LEARNS ABOUT X-RAY

@@ -29,16 +29,16 @@ k8s/taxcalc-api/                   the manifest set every environment shares. Na
   taxcalc-api.ingress.yaml
   taxcalc-api.servicemonitor.yaml
   prometheus-adapter-values.yaml   W6 D5 - Helm VALUES, not a manifest; the rule the HPA reads
+k8s/aws-authored/                  W6 D5 - AUTHOR-AND-DEFEND. Never applied to k3d; each file
+  karpenter-nodepool.yaml          opens by saying why it cannot run here. A SIBLING of
+  adot-collector.yaml              k8s/taxcalc-api/, deliberately not a child: no kustomization.yaml
+  taxcalc-worker-scaledobject.sqs.yaml   lists these, and nothing under k8s/ is applied by
+  cfn/taxcalc-observability-dev.yaml     directory - the overlays name k8s/taxcalc-api explicitly
 overlays/
   dev/kustomization.yaml           namespace + replicas + image tag + Spring profile + log level + host
   loadtest/kustomization.yaml      W6 D5 - applied by hand for a k6 run; NOT in the ApplicationSet
   staging/kustomization.yaml
   prod/kustomization.yaml
-aws-authored/                      W6 D5 - AUTHOR-AND-DEFEND. Never applied to k3d; each file
-  karpenter-nodepool.yaml          says why it cannot run here.
-  adot-collector.yaml
-  taxcalc-worker-scaledobject.sqs.yaml
-  cfn/taxcalc-observability-dev.yaml
 argocd/
   projects/taxcalc.yaml            AppProject: the four allow-lists, syncWindows, two RBAC roles
   applications/taxcalc-api-dev.yaml        the dev anchor Application (documentation once the
@@ -92,7 +92,7 @@ naming different metrics.
 into the ApplicationSet: an environment Argo CD reconciles is one that can be left switched on by
 accident.
 
-`aws-authored/` is written and reviewed, never deployed. The full defence is in the application
+`k8s/aws-authored/` is written and reviewed, never deployed. The full defence is in the application
 repo's [`SRE-CAPSTONE.md`](https://github.com/AI-Native-2026-07-29-Intuit/arush-adabala-tax-liability/blob/main/SRE-CAPSTONE.md).
 
 ## The reconcile loop

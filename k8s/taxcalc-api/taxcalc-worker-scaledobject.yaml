@@ -17,7 +17,7 @@
 # The credential-placement discipline - operator IRSA via
 # `identityOwner: operator`, so the permission lives on the KEDA operator's
 # role and never on the workload pod - is taught in
-# aws-authored/taxcalc-worker-scaledobject.sqs.yaml, where it actually applies.
+# k8s/aws-authored/taxcalc-worker-scaledobject.sqs.yaml, where it actually applies.
 # Putting a fake TriggerAuthentication here would teach the shape while hiding
 # the one decision that matters.
 #

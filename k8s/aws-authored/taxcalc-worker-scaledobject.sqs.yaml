@@ -1,4 +1,4 @@
-# aws-authored/taxcalc-worker-scaledobject.sqs.yaml
+# k8s/aws-authored/taxcalc-worker-scaledobject.sqs.yaml
 #
 # AUTHOR-AND-DEFEND. NEVER `kubectl apply` THIS TO k3d.
 #

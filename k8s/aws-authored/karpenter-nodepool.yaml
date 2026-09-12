@@ -1,4 +1,4 @@
-# aws-authored/karpenter-nodepool.yaml
+# k8s/aws-authored/karpenter-nodepool.yaml
 #
 # AUTHOR-AND-DEFEND. NEVER `kubectl apply` THIS TO k3d.
 #

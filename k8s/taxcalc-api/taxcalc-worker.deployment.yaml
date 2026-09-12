@@ -116,8 +116,41 @@ spec:
           # Smaller than the api's: no servlet container, no connection pool
           # sized for HTTP concurrency. The request matters more than usual
           # here because it is multiplied by up to maxReplicaCount - at 20
-          # pods this Deployment's requests alone are 3 CPU and 6Gi, which is
-          # what the Karpenter NodePool's `limits` in Task 4 exists to cap.
+          # pods this Deployment's requests alone are 2 CPU and 8.75Gi, which
+          # is what the Karpenter NodePool's `limits` in Task 4 exists to cap.
+          #
+          # BOTH NUMBERS ARE MEASURED, AND THE MEMORY ONE WAS WRONG IN THE
+          # DIRECTION THAT DOES NOT ANNOUNCE ITSELF.
+          #
+          # Three settled workers, `kubectl top`, idle on a drained topic:
+          #   cpu     24m, 24m, 26m      <- against a 150m request
+          #   memory  400Mi, 403Mi, 408Mi <- against a 320Mi request
+          #
+          # CPU was over-requested by ~6x, and that is the ordinary kind of
+          # wrong: it wastes schedulable room and nothing breaks. 100m still
+          # leaves 4x headroom over measured idle.
+          #
+          # Memory was UNDER-requested, which is the kind that does break. A
+          # request is the promise the scheduler packs the node against, so a
+          # pod whose steady-state RSS exceeds its own request means the node
+          # is systematically oversubscribed by (actual - request) per replica
+          # - 80Mi here, multiplied by however many KEDA starts. Nothing
+          # reports this. The pods are not OOMKilled (the 768Mi LIMIT is
+          # honest), the Deployment is Ready, and the only symptom arrives as
+          # node MemoryPressure and evicted pods somewhere else in the
+          # namespace, at whatever replica count finally crosses the line.
+          # 448Mi is measured-idle + ~10%.
+          #
+          # Raising a request to fit reality LOWERS how many replicas the node
+          # can take, and that is the point: the previous number bought a
+          # higher replica count by under-declaring, which is not capacity.
+          # See SRE-CAPSTONE.md for the arithmetic on why ~15 workers does not
+          # fit this node once the real figure is used.
+          #
+          # The LIMIT deliberately does not move. JAVA_TOOL_OPTIONS above sets
+          # MaxRAMPercentage=75 with ExitOnOutOfMemoryError, so a 512Mi limit
+          # would put the heap ceiling at 384Mi under a 400Mi resident
+          # footprint - the pod would not get smaller, it would exit.
           resources:
-            requests: { cpu: 150m, memory: 320Mi }
+            requests: { cpu: 100m, memory: 448Mi }
             limits:   {            memory: 768Mi }

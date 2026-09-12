@@ -2,7 +2,14 @@
 #
 # AUTHOR-AND-DEFEND. NEVER deployed from this branch - AWS::XRay::SamplingRule is an AWS
 # resource and there is no X-Ray on k3d. It is written in the same raw-YAML CloudFormation style
-# as cfn/, and it would deploy through the same OIDC role and the same cfn-lint / cfn-nag gate.
+# as cfn/, and it would deploy through the same OIDC role.
+#
+# It is also GATED by the same cfn-lint / cfn-nag checks, and that took a workflow change rather
+# than being free: .github/workflows/cfn-validate.yml globbed `cfn/*.yaml` only, so this file was
+# unlinted and unscanned while its own header asserted the opposite. An author-only artefact that
+# claims a gate it does not have is the worst of both - it reads as reviewed and is not - so the
+# workflow now lints both roots. Verified clean on the pinned versions: cfn-lint 1.56.1 with the
+# serverless rule pack, and cfn-nag 0.8.x, 0 failures / 0 warnings.
 #
 # ---------------------------------------------------------------------------------------------
 # WHY A SAMPLING RULE AT ALL
