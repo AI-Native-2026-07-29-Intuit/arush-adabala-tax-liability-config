@@ -109,6 +109,123 @@ metadata:
 # neither has hit the ceiling, and a quota is only a real constraint while
 # nobody widens it reflexively.
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# W6 D5: TWO AUTOSCALERS, ONE QUOTA, AND THE WRONG ONE WON
+#
+# Measured, not theorised. During a 200-VU k6 run the api's HPA asked for five
+# replicas and got two:
+#
+#   Error creating: pods "taxcalc-api-..." is forbidden: exceeded quota:
+#   requested: requests.memory=512Mi, used: requests.memory=8128Mi, limited: 8Gi
+#
+# The api then served 200 VUs on two pods and burned its error budget
+# (http_req_failed 0.87%, then 5.62% on a second run) while taxcalc-api-worker
+# ran comfortably at four-plus replicas.
+#
+# The cause is that the load test's own workload feeds the competitor. 55% of
+# the k6 mix writes taxpayers.events; KEDA sees that lag within one 15s poll and
+# scales the worker at 448Mi a pod. The api's HPA wants pods at 512Mi at the
+# same moment, and both draw on the single `requests.memory: 8Gi` below. The
+# event-driven autoscaler always wins the race: lag exists the instant a write
+# lands, whereas in-flight concurrency has to climb through a 15s scrape and a
+# 1-minute averaging window - and the worker then holds its pods for a 300s
+# cooldownPeriod.
+#
+# So the autoscaler WITH an SLO lost to the autoscaler WITHOUT one, and nothing
+# in either object expressed that priority. Scaling the unrelated embeddings
+# Deployment to zero to free 2Gi did not help: KEDA absorbed it on the next poll
+# and the second run was worse than the first.
+#
+# THE FIX IS A CEILING ON THE BATCH TIER, NOT A BIGGER NAMESPACE QUOTA
+#
+# A bigger quota only moves the number at which this happens. What is missing is
+# a statement of which workload may be starved, so the two tiers get
+# PriorityClasses and the batch tier gets its own scoped quota.
+#
+# READ THIS BEFORE CHANGING THE NUMBERS - A SCOPED QUOTA CAPS, IT DOES NOT
+# RESERVE. There is no "reserve 3Gi for serving" primitive. `taxcalc-dev-batch`
+# below caps what the worker tier can ever consume; the api's share is whatever
+# the namespace total leaves after that cap and the un-prioritised
+# infrastructure pods. So the guarantee is arithmetic, and it has to be redone
+# whenever any of the three inputs move:
+#
+#   namespace total                                    8192Mi
+#   infra, no priorityClassName (pg/mongo/redis/kafka
+#     /embeddings - counted only by the total below)   ~3072Mi
+#   batch cap (this file)                               1792Mi  = 4 workers
+#   ------------------------------------------------------------------
+#   always available to serving                        ~3328Mi  = 6 api pods
+#
+# Six api pods is above the HPA's minReplicas of 2 and below its maxReplicas of
+# 20, which is honest: the autoscaler's ceiling remains a request, and the
+# platform's answer to it is now written down instead of discovered under load.
+#
+# The worker's KEDA maxReplicaCount stays 20 deliberately. It is not lowered to
+# match this cap, because the cap is a PLATFORM decision about who may starve
+# whom and the maxReplicaCount is an APPLICATION decision about how much
+# parallelism the work can use. Collapsing them would hide the tradeoff in the
+# ScaledObject, where a reviewer looking for capacity policy would not think to
+# look.
+#
+# Cluster-scoped, so these PriorityClasses are platform-applied out of band like
+# everything else in this file - the AppProject's `clusterResourceWhitelist: []`
+# denies them to the taxcalc project.
+# ---------------------------------------------------------------------------
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: taxcalc-serving
+  labels:
+    app.kubernetes.io/part-of:    taxcalc
+    app.kubernetes.io/managed-by: platform-team
+value: 1000
+globalDefault: false
+description: >-
+  Request-serving workloads with a latency SLO (taxcalc-api). Higher value than
+  taxcalc-batch so the scheduler preempts batch pods rather than serving pods
+  when a node fills - the complement to the quota split, which acts earlier, at
+  admission.
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: taxcalc-batch
+  labels:
+    app.kubernetes.io/part-of:    taxcalc
+    app.kubernetes.io/managed-by: platform-team
+value: 100
+globalDefault: false
+# preemptionPolicy is left at the default (PreemptLowerPriority). Never-preempt
+# would be wrong here: a worker pod that cannot be preempted is exactly the pod
+# that squeezed the api out in the measured run.
+description: >-
+  Event-driven batch workloads with no latency SLO (taxcalc-api-worker). Lag is
+  recoverable; a breached error budget is not.
+---
+# The batch CEILING. This is the object that actually fixes the contention.
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: taxcalc-dev-batch
+  namespace: taxcalc-dev
+  labels:
+    app.kubernetes.io/name:       taxcalc-dev-batch
+    app.kubernetes.io/component:  namespace
+    app.kubernetes.io/part-of:    taxcalc
+    app.kubernetes.io/managed-by: platform-team
+spec:
+  hard:
+    # 4 workers at the MEASURED 100m / 448Mi request (see the worker Deployment
+    # - those numbers were measured, not guessed).
+    requests.cpu:    "400m"
+    requests.memory: 1792Mi
+    pods:            "4"
+  scopeSelector:
+    matchExpressions:
+      - operator:         In
+        scopeName:        PriorityClass
+        values:           ["taxcalc-batch"]
 ---
 apiVersion: v1
 kind: ResourceQuota

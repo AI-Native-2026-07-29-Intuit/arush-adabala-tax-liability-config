@@ -37,6 +37,17 @@ spec:
         checksum/config: "replace-at-apply-time"
         checksum/secret: "replace-at-apply-time"
     spec:
+      # W6 D5: the serving tier. Pairs with platform/00-namespaces.yaml's
+      # taxcalc-dev-batch quota, which caps the worker tier so the HPA's
+      # replicas cannot be taken by KEDA's - measured: the api's HPA asked for
+      # 5 pods and got 2 while the worker ran at 4+, and the api burned its
+      # error budget while the worker, which has no SLO, did not.
+      #
+      # The PriorityClass does two separate jobs. At ADMISSION it selects which
+      # scoped ResourceQuota a pod counts against (that is the half that fixes
+      # the contention). At SCHEDULING its value: 1000 against the worker's 100
+      # means a full node preempts worker pods rather than api pods.
+      priorityClassName: taxcalc-serving
       securityContext:
         runAsNonRoot: true
         runAsUser:    65532   # the distroless UID from W5 D1
