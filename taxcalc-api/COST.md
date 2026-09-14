@@ -216,7 +216,7 @@ To find it in Cost Explorer: group by the `service` tag, then look for usage typ
 
 ### What it costs
 
-`explain-liability` calls `claude-haiku-4-5` — roughly a third of Sonnet's per-token price, and
+`explain-liability` calls `claude-haiku-4-5` — half of Sonnet 5's per-token price, and
 the right tool for the job: a bounded liability record in, a short paragraph out, so Sonnet's
 extra capability has nothing to act on. The model is named at the call site
 (`LiabilityExplanationService.MODEL`) rather than taken from the application default, precisely
@@ -325,11 +325,41 @@ correct, the log line is well-formed, the header is present, and the number simp
 invoice will say. Nothing in the process can detect it. Re-check it against Anthropic's published
 pricing whenever a model is added or a rate changes.
 
-It also uses one **blended** rate per model covering input and output together, while real
-pricing charges output several times more than input. That is an approximation, taken knowingly:
-it keeps the table auditable at a glance and is accurate in aggregate for a workload whose
-input:output ratio is stable, which `explain-liability`'s is. It would be the wrong simplification
-for a huge-prompt/one-word-answer workload, which would need input and output rates split.
+**It used one blended rate per model, and that was wrong in two ways — corrected in W6 D5.**
+
+The paragraph that stood here defended the blend: an approximation taken knowingly, auditable at
+a glance, accurate in aggregate for a workload whose input:output ratio is stable — which
+`explain-liability`'s is. The reasoning was sound and the precondition was stated correctly. It
+was then not met, twice.
+
+**The blend was struck at the wrong ratio.** The `claude-haiku-4-5` entry was `0.003`/1K, which is
+exactly `(0.001 + 0.005) / 2` — a 50/50 split of input and output tokens. A measured live call is
+144 input to 32 output, or **82/18**. At that ratio the call truly costs `$0.000304` and the blend
+charged `$0.000528`, so **every cost figure this service published was 1.74× too high**. Nothing
+detected it, because a blended rate cannot be wrong in a way the arithmetic notices — which is the
+same property this section already claimed about a stale price book, arriving from a direction
+nobody was watching.
+
+**And the precondition stopped holding anyway.** A stable input:output ratio is a property of a
+*workload*, not of a model — and W6 D4 added `POST /v1/completions`, a proxy route that accepts an
+arbitrary prompt from any caller. From the moment that route shipped there was no ratio to be
+stable: one caller sends a short prompt and asks for an essay, the next pastes a document and asks
+for a word. One number cannot price both, and the error is silent and unbounded in either
+direction.
+
+`PriceBook` now stores the two rates the provider actually bills and `CostMiddleware` multiplies
+each by its own token count, summing before a single HALF_UP rounding. More code, and it removes
+the entire class of quiet mispricing: the only remaining way to be wrong is to write down a rate
+that does not match the pricing page, which a reviewer can check in one look.
+
+| Model | Input $/1K | Output $/1K |
+|---|---|---|
+| `claude-haiku-4-5` | 0.001 | 0.005 |
+| `claude-sonnet-5`  | 0.002 | 0.010 |
+
+The Sonnet entry is `claude-sonnet-5`, replacing the superseded `claude-sonnet-4-5` — Sonnet 5 is
+both more capable and cheaper per token, and this table is in effect the menu the proxy route
+offers.
 
 ---
 
