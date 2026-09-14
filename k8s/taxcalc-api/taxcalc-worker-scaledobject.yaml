@@ -1,0 +1,81 @@
+# k8s/taxcalc-api/taxcalc-worker-scaledobject.yaml - KEDA on Kafka lag (W6 D5 Task 1, RUNNABLE on k3d).
+#
+# KEDA scales taxcalc-api-worker on the consumer-group lag of
+# taxcalc-read-model-builder against taxpayers.events - the W3 D3 group and the
+# W3 D3 topic, not new ones invented for a scaling demo.
+#
+# lagThreshold: "10" means the generated HPA targets 10 messages of lag per
+# pod, and the arithmetic is a ceiling: 73 messages of lag scales to
+# ceil(73/10) = 8 pods. The Task 4 SQS variant uses queueLength: "10" and the
+# identical ceil math, which is why the two files are worth reading side by
+# side.
+#
+# WHY THERE IS NO TriggerAuthentication HERE
+#
+# The in-cluster dev broker is PLAINTEXT with no SASL and no TLS, so the
+# trigger has no credential to present and inventing one would be theatre.
+# The credential-placement discipline - operator IRSA via
+# `identityOwner: operator`, so the permission lives on the KEDA operator's
+# role and never on the workload pod - is taught in
+# k8s/aws-authored/taxcalc-worker-scaledobject.sqs.yaml, where it actually applies.
+# Putting a fake TriggerAuthentication here would teach the shape while hiding
+# the one decision that matters.
+#
+# THE FOUR TIMINGS, AND WHAT EACH ONE COSTS IF IT IS WRONG
+#
+#   pollingInterval: 15   How often KEDA asks the broker for lag. This is the
+#                         floor on how fast a 0 -> N scale-up can begin; at the
+#                         default 30 a spike demo appears to hang for half a
+#                         minute. It is also one ListConsumerGroupOffsets call
+#                         per interval per ScaledObject, so it is not free on a
+#                         cluster with hundreds of them.
+#
+#   cooldownPeriod: 300   How long lag must stay at zero before scaling back to
+#                         zero. Applies ONLY to the last step, N -> 0; every
+#                         other step is the generated HPA's business. Five
+#                         minutes because a cold worker pays a JVM start plus a
+#                         consumer-group rebalance, and a group that loses and
+#                         regains its last member churns partition assignments
+#                         for the whole group.
+#
+#   minReplicaCount: 0    Opts into scale-to-zero. This is the setting that
+#                         makes KEDA worth having over a plain HPA, which
+#                         cannot go below 1.
+#
+#   maxReplicaCount: 20   The blast-radius cap. Note the REAL ceiling is lower:
+#                         a consumer group cannot have more useful members than
+#                         the topic has partitions, and k8s/taxcalc-api/kafka.yaml sets
+#                         12. KEDA will not exceed the partition count no
+#                         matter what this says, so an observed peak of ~12-15
+#                         is the system working, not the limit being missed.
+#
+# offsetResetPolicy: latest matches the application's own
+# spring.kafka.consumer.auto-offset-reset. They are two different clients
+# reading the same group, and if they disagree KEDA computes lag from a
+# different starting offset than the consumer actually reads from - which
+# produces a large phantom backlog on a brand-new group and scales the worker
+# to the ceiling to consume messages it will then skip.
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: taxcalc-worker-scaledobject
+  namespace: taxcalc-dev
+  labels:
+    app.kubernetes.io/name:      taxcalc-api-worker
+    app.kubernetes.io/component: worker
+    app.kubernetes.io/part-of:   taxcalc
+spec:
+  scaleTargetRef:
+    name: taxcalc-api-worker
+  minReplicaCount: 0        # scale-to-zero when the topic is drained
+  maxReplicaCount: 20
+  pollingInterval: 15
+  cooldownPeriod:  300
+  triggers:
+    - type: kafka
+      metadata:
+        bootstrapServers: kafka.taxcalc-dev.svc.cluster.local:9092
+        consumerGroup:    taxcalc-read-model-builder   # the W3 D3 consumer group
+        topic:            taxpayers.events             # the W3 D3 topic
+        lagThreshold:     "10"
+        offsetResetPolicy: latest

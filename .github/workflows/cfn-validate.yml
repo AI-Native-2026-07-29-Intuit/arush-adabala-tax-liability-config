@@ -19,10 +19,18 @@
 #
 # Running the same checks locally before pushing:
 #   pip install cfn-lint==1.56.1 cfn-lint-serverless==0.3.5
-#   cfn-lint cfn/*.yaml -a cfn_lint_serverless.rules
-#   gem install cfn-nag -v 0.8.10 && cfn_nag_scan --input-path cfn --fail-on-warnings
+#   cfn-lint cfn/*.yaml k8s/aws-authored/cfn/*.yaml -a cfn_lint_serverless.rules
+#   gem install cfn-nag -v 0.8.10
+#   for d in cfn k8s/aws-authored/cfn; do cfn_nag_scan --input-path "$d" --fail-on-warnings; done
 #   # ...or, on a host whose Ruby is 4.x and therefore cannot run cfn-nag at all:
-#   docker run --rm -v "$PWD/cfn:/cfn" stelligent/cfn_nag /cfn --fail-on-warnings
+#   for d in cfn k8s/aws-authored/cfn; do \
+#     docker run --rm --entrypoint cfn_nag_scan -v "$PWD/$d:/cfn" \
+#       stelligent/cfn_nag --input-path /cfn --fail-on-warnings; done
+#   # The --entrypoint override is required. The image's default entrypoint is
+#   # `cfn_nag`, which scans a single FILE; handed a directory it exits with
+#   # `Is a directory @ io_fillbuf (Errno::EISDIR)`, which reads like a broken
+#   # mount rather than the wrong binary. The previous version of this comment
+#   # had exactly that bug.
 #
 # W6 D4 note - this workflow needed NO new step for the cost stack, and that is
 # the design working rather than an omission. Every tool here is already
@@ -42,6 +50,14 @@ on:
   pull_request:
     paths:
       - "cfn/**"
+      # W6 D5 - k8s/aws-authored/cfn/ holds the X-Ray sampling stack. It is
+      # author-only and never deployed, and it is still a CloudFormation
+      # template, so it is linted and scanned exactly like cfn/. Its own header
+      # claims it "would deploy through the same OIDC role and the same
+      # cfn-lint / cfn-nag gate"; until this path was added that claim was
+      # aspirational, which is the failure mode author-only artefacts are most
+      # prone to - a file nothing checks, asserting that something checks it.
+      - "k8s/aws-authored/cfn/**"
       - "scripts/cfn-guardrails.sh"
       - "scripts/cfn-extract-s3.rb"
       - ".github/workflows/cfn-validate.yml"
@@ -103,14 +119,26 @@ jobs:
       # earning its place when W6 D4's LLM cost-monitoring Lambda stack lands
       # in cfn/, which is the point of wiring it before then rather than after.
       - name: cfn-lint (with cfn-lint-serverless rules)
-        run: cfn-lint cfn/*.yaml -a cfn_lint_serverless.rules
+        run: cfn-lint cfn/*.yaml k8s/aws-authored/cfn/*.yaml -a cfn_lint_serverless.rules
 
       # --fail-on-warnings, so a WARN is a red check rather than a line of log
       # nobody reads. Anything deliberately accepted is suppressed at the
       # resource with a Metadata.cfn_nag.rules_to_suppress reason, which puts
       # the justification in the diff where a reviewer argues with it.
+      # Looped because --input-path takes exactly one directory, and there are
+      # now two roots. Verified locally against the pinned image, both clean:
+      #   docker run --rm --entrypoint cfn_nag_scan -v "$PWD/<dir>:/cfn" \
+      #     stelligent/cfn_nag --input-path /cfn --fail-on-warnings
+      # (the entrypoint override matters - the image's default entrypoint is
+      # `cfn_nag`, which takes a single FILE and dies with EISDIR on a directory)
       - name: cfn-nag
-        run: cfn_nag_scan --input-path cfn --fail-on-warnings --output-format txt
+        run: |
+          set -euo pipefail
+          for dir in cfn k8s/aws-authored/cfn; do
+            echo "::group::cfn_nag_scan ${dir}"
+            cfn_nag_scan --input-path "${dir}" --fail-on-warnings --output-format txt
+            echo "::endgroup::"
+          done
 
       # Static half of scripts/cfn-guardrails.sh - no AWS call, no credentials,
       # so it gates every PR regardless of whether an account exists.
@@ -161,7 +189,7 @@ jobs:
         if: vars.AWS_ACCOUNT_ID != ''
         run: |
           set -euo pipefail
-          for tpl in cfn/*.yaml; do
+          for tpl in cfn/*.yaml k8s/aws-authored/cfn/*.yaml; do
             echo "::group::validate-template ${tpl}"
             aws cloudformation validate-template \
               --template-body "file://${tpl}" \

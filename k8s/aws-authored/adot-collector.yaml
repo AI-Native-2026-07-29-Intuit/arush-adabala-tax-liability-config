@@ -1,0 +1,96 @@
+# k8s/aws-authored/adot-collector.yaml
+#
+# AUTHOR-AND-DEFEND. NEVER `kubectl apply` THIS TO k3d.
+#
+# It needs the OpenTelemetry Operator's OpenTelemetryCollector CRD (not installed here) and the
+# awsxray exporter needs real AWS credentials and a real X-Ray endpoint. The Tempo half WOULD run
+# locally - that is the W5 D5 endpoint this cluster already has - which makes this the one file
+# in k8s/aws-authored/ that is half-runnable, and worth being precise about.
+#
+# ---------------------------------------------------------------------------------------------
+# ONE RECEIVER, TWO EXPORTERS - AND WHY THE APPLICATION NEVER LEARNS ABOUT X-RAY
+# ---------------------------------------------------------------------------------------------
+# taxcalc-api speaks OTLP and nothing else. It has no X-Ray SDK on its classpath, no AWS
+# propagator configured, and no idea that X-Ray exists. Adding a second trace destination is a
+# change to THIS FILE and a collector restart - not a dependency bump, a rebuild, an image push
+# and a rollout of the application.
+#
+# That is the entire argument for a collector as a hop rather than exporting from the app: the
+# sink is an operational decision with an operational change cost. An application that imports a
+# vendor SDK has made a vendor choice at compile time, and reversing it means touching code that
+# has nothing to do with tracing.
+#
+# ---------------------------------------------------------------------------------------------
+# SCOPE NOTE - WHAT X-RAY ACTUALLY ADDS HERE, AND IT IS NOT THE LLM CALL
+# ---------------------------------------------------------------------------------------------
+# The obvious assumption is that X-Ray is how you see the Anthropic call. It is not.
+#
+# The LLM call goes to the Anthropic API over ordinary HTTPS. It is an outbound HTTP span like
+# any other, the OTel instrumentation already captures it, and Tempo already shows it - X-Ray
+# adds nothing, because Anthropic is not an AWS service and emits no AWS-side segments.
+#
+# What X-Ray actually contributes is the segments AWS generates itself on managed-service calls
+# that Tempo cannot see: the SQS produce/consume pair that Task 4's SQS variant scales on, and
+# RDS. Those segments are created by AWS on the far side of the call, so they exist whether or
+# not the client is instrumented - and they are the half of a latency mystery that is invisible
+# from inside the pod. A slow SQS ReceiveMessage looks, from the application's spans alone, like
+# a fast application waiting.
+#
+# The defensible position, stated plainly: if this capstone's AWS footprint stays as it is today
+# (no SQS on the request path, Postgres in-cluster rather than RDS), the awsxray exporter should
+# be DROPPED. It would bill for traces that duplicate what Tempo already has. It earns its place
+# the moment the SQS variant in taxcalc-worker-scaledobject.sqs.yaml becomes the real trigger, or
+# the moment Postgres moves to RDS.
+apiVersion: opentelemetry.io/v1alpha1
+kind: OpenTelemetryCollector
+metadata:
+  name: adot-collector
+  namespace: observability
+spec:
+  image: public.ecr.aws/aws-observability/aws-otel-collector:latest
+  mode: deployment
+  config: |
+    receivers:
+      otlp:
+        protocols:
+          # Both, because the application's exporter protocol is configuration, not a constant:
+          # application.yml currently sets otel.exporter.otlp.protocol=http/protobuf, and a
+          # collector listening only on 4317 answers that with a connection refused the
+          # application logs once at startup and then swallows.
+          grpc: { endpoint: 0.0.0.0:4317 }
+          http: { endpoint: 0.0.0.0:4318 }
+
+    processors:
+      # Not present in the reference layout, and a collector without it is a collector that
+      # eventually OOMs. A trace backend being slow or unreachable makes spans queue in memory,
+      # and the pod is killed for the exporter's problem. batch bounds that, and is also what
+      # makes the X-Ray PutTraceSegments call economical - it is billed per request, so
+      # unbatched spans are both slower and more expensive.
+      batch:
+        timeout: 5s
+        send_batch_size: 512
+      memory_limiter:
+        check_interval: 1s
+        limit_percentage: 80
+        spike_limit_percentage: 20
+
+    exporters:
+      otlphttp/tempo:                 # runs locally - this is the W5 D5 Tempo
+        endpoint: http://tempo.observability.svc.cluster.local:4318
+        tls: { insecure: true }       # in-cluster, no mTLS in this lab
+      awsxray:                        # needs AWS: IRSA with xray:PutTraceSegments
+        region: us-east-1
+        # index_all_attributes is deliberately NOT set. It makes every span attribute a
+        # searchable annotation, which is convenient and is also how taxpayer ids and tenant
+        # names end up indexed in a managed service - the same bounded-label discipline
+        # manifests/observability/LABELS.md applies to Prometheus.
+
+    service:
+      pipelines:
+        traces:
+          receivers:  [otlp]
+          processors: [memory_limiter, batch]
+          # The dual export. Order is not significance: both run, and a failure in one does not
+          # stop the other - which is the property that makes switching sinks safe. Cut over by
+          # removing a name from this list, not by redeploying the application.
+          exporters:  [otlphttp/tempo, awsxray]

@@ -1,4 +1,4 @@
-# base/80-taxcalc-api.rollout.yaml.disabled
+# k8s/taxcalc-api/taxcalc-api.rollout.yaml.disabled
 #
 # W6 D5 lands this.
 #
@@ -11,7 +11,7 @@
 # is kept rather than discarded - "the CRD is missing" is an argument about
 # when to apply something, not about whether it is the right thing to apply.
 # It is commented out (and the file carries a .disabled suffix so Kustomize
-# cannot pick it up even if someone adds a glob to base/kustomization.yaml)
+# cannot pick it up even if someone adds a glob to k8s/taxcalc-api/kustomization.yaml)
 # because applying it today fails three separate ways:
 #
 #   1. No argoproj.io/Rollout CRD on this cluster - the API server rejects it.
@@ -21,8 +21,8 @@
 #      install, not before it.
 #   3. A Rollout and the existing Deployment both select
 #      app.kubernetes.io/name=taxcalc-api. Two controllers owning one pod set
-#      fight indefinitely. base/10-taxcalc-api.deployment.yaml must be removed
-#      from base/kustomization.yaml in the same commit that enables this.
+#      fight indefinitely. k8s/taxcalc-api/taxcalc-api.deployment.yaml must be removed
+#      from k8s/taxcalc-api/kustomization.yaml in the same commit that enables this.
 #
 # The AnalysisTemplate query is the W5 D5 success-rate SLI. W6 D5 gates the
 # canary on p99 latency, which needs the multi-arch build first: the dev image

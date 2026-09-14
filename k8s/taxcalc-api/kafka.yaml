@@ -1,0 +1,161 @@
+# k8s/taxcalc-api/kafka.yaml - a REAL single-node Kafka broker (W6 D5 Task 1).
+#
+# WHY THIS FILE DID NOT EXIST UNTIL TODAY, AND WHY IT HAS TO NOW
+#
+# W5 D3 deliberately shipped no broker. dev-dependencies.yaml carried a bare
+# `kafka` Service with a selector matching nothing, because the only thing the
+# application needed from Kafka at boot was for the bootstrap hostname to
+# RESOLVE - KafkaConsumer's constructor does a synchronous DNS lookup and kills
+# context startup if it fails, while the later TCP connect is asynchronous and
+# tolerated. A Service with no endpoints satisfied that and cost nothing.
+#
+# KEDA cannot scale on a hostname. The Task 1 trigger reads the committed
+# offset and the log-end offset of consumer group `taxcalc-read-model-builder`
+# by calling ListConsumerGroupOffsets and ListOffsets against a broker. With no
+# broker the ScaledObject reconciles to READY=False with a connection error,
+# which is at least honest - the failure mode to avoid is the one where a
+# broker exists but nothing produces to the topic, because then the trigger is
+# READY=True, ACTIVE=False, and "KEDA is working, there is simply no lag" is
+# indistinguishable from "KEDA is reading the wrong group".
+#
+# KRAFT, NOT ZOOKEEPER
+#
+# One process, no ZooKeeper ensemble, no second Service. Kafka 3.8's KRaft mode
+# is production-supported and this is a dev broker, so the combined
+# controller+broker role is the right trade - it halves the pod count and
+# removes an entire coordination failure mode from a lab cluster.
+#
+# TWO LISTENERS, AND THE SECOND ONE IS NOT OPTIONAL
+#
+# PLAINTEXT://:9092 is what clients dial; CONTROLLER://:9093 is what the KRaft
+# quorum uses to talk to itself. A single-node KRaft broker with only the
+# client listener does not start - it logs `Invalid value for
+# controller.listener.names` and exits, which reads like a typo rather than a
+# missing listener.
+#
+# `advertised.listeners` is the Service DNS name, NOT the pod IP. A broker
+# advertises the address clients should reconnect on after bootstrap; if that
+# is a pod IP, every client works until the pod is rescheduled and then fails
+# with "connection refused" against an address that no longer exists, long
+# after the manifest that caused it was last touched.
+#
+# EPHEMERAL STORAGE IS DELIBERATE
+#
+# emptyDir, so the log directory dies with the pod. This is a lab broker whose
+# entire content is synthetic events produced by scripts/w6d5-spike.sh. A PVC
+# would survive a restart and carry stale consumer-group offsets into the next
+# spike, which is precisely the state that makes a scaling demo lie: the group
+# would resume at a committed offset from a previous run and report no lag for
+# messages it never actually processed.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kafka
+  namespace: taxcalc-dev
+  labels:
+    app.kubernetes.io/name:      kafka
+    app.kubernetes.io/component: broker
+    app.kubernetes.io/part-of:   taxcalc
+spec:
+  replicas: 1
+  # Recreate, not RollingUpdate. Two brokers briefly sharing one node id and
+  # one emptyDir log directory is a corrupt metadata log, and the symptom is a
+  # broker that will not start again after an otherwise routine image change.
+  strategy: { type: Recreate }
+  selector:
+    matchLabels: { app.kubernetes.io/name: kafka }
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name:      kafka
+        app.kubernetes.io/component: broker
+        app.kubernetes.io/part-of:   taxcalc
+    spec:
+      containers:
+        - name: kafka
+          # 3.9.1, NOT 3.8.1, and the reason is a JVM bug rather than anything
+          # about Kafka.
+          #
+          # apache/kafka:3.8.1 ships JDK 21.0.4, which on an arm64 Lima/Rancher
+          # Desktop VM dies instantly with
+          #
+          #   SIGILL (0x4) ... Problematic frame:
+          #   j java.lang.System.registerNatives()V+0 java.base
+          #
+          # That frame is the JVM's very first native call, so the crash reads
+          # like a corrupt image or a wrong-architecture pull. It is neither:
+          # the JVM probes for SVE (the ARM vector extension), this VM's kernel
+          # cannot report an SVE vector length, and 21.0.4 executes an SVE
+          # instruction anyway. 21.0.7 in 3.9.1 detects the same condition and
+          # disables SVE with a warning instead of crashing.
+          #
+          # UseSVE=0 below states it explicitly rather than relying on that
+          # auto-detection, so the behaviour does not change under a future
+          # patch release - and so the next person to read this manifest does
+          # not have to rediscover the SIGILL.
+          image: apache/kafka:3.9.1
+          imagePullPolicy: IfNotPresent
+          ports:
+            - { name: kafka,      containerPort: 9092 }
+            - { name: controller, containerPort: 9093 }
+          env:
+            - { name: KAFKA_NODE_ID,                          value: "1" }
+            - { name: KAFKA_PROCESS_ROLES,                    value: "broker,controller" }
+            - { name: KAFKA_LISTENERS,                        value: "PLAINTEXT://:9092,CONTROLLER://:9093" }
+            - { name: KAFKA_ADVERTISED_LISTENERS,             value: "PLAINTEXT://kafka.taxcalc-dev.svc.cluster.local:9092" }
+            - { name: KAFKA_CONTROLLER_LISTENER_NAMES,        value: "CONTROLLER" }
+            - { name: KAFKA_CONTROLLER_QUORUM_VOTERS,         value: "1@localhost:9093" }
+            - { name: KAFKA_LISTENER_SECURITY_PROTOCOL_MAP,   value: "PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT" }
+            - { name: KAFKA_INTER_BROKER_LISTENER_NAME,       value: "PLAINTEXT" }
+            # Every replication factor and min-ISR must be 1 on a one-node
+            # broker. The defaults are 3, and a broker that cannot satisfy them
+            # does not fail at startup - it fails the FIRST TIME a client tries
+            # to create the internal __consumer_offsets topic, with
+            # NOT_ENOUGH_REPLICAS. That surfaces as a consumer that connects
+            # fine and then cannot commit, i.e. lag that never falls, i.e.
+            # exactly the symptom Task 1 is trying to demonstrate deliberately.
+            - { name: KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR,          value: "1" }
+            - { name: KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR,  value: "1" }
+            - { name: KAFKA_TRANSACTION_STATE_LOG_MIN_ISR,             value: "1" }
+            - { name: KAFKA_DEFAULT_REPLICATION_FACTOR,                value: "1" }
+            - { name: KAFKA_MIN_INSYNC_REPLICAS,                       value: "1" }
+            # The topic is created on first produce. Several partitions, not
+            # one: KEDA's kafka scaler computes desired replicas from lag but
+            # is CAPPED at the partition count, because a consumer group cannot
+            # usefully have more members than partitions. With one partition
+            # the worker would scale to exactly 1 no matter how deep the
+            # backlog, and the ScaledObject would look broken while behaving
+            # correctly. 12 partitions is the real ceiling behind
+            # maxReplicaCount: 20.
+            - { name: KAFKA_NUM_PARTITIONS,                            value: "12" }
+            - { name: KAFKA_AUTO_CREATE_TOPICS_ENABLE,                 value: "true" }
+            - { name: KAFKA_LOG_DIRS,                                  value: "/var/lib/kafka/data" }
+            - { name: CLUSTER_ID,                                      value: "taxcalc-dev-kraft-0001" }
+            # See the image comment above. Harmless on hardware that does
+            # report an SVE length; load-bearing on the VM this lab runs in.
+            - { name: KAFKA_OPTS,                                      value: "-XX:UseSVE=0" }
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/kafka/data }
+          readinessProbe:
+            # A TCP check on the client port, not an exec of a CLI tool. The
+            # broker binds 9092 only after the KRaft quorum has formed and the
+            # log directory is readable, so the port opening genuinely means
+            # "ready"; an exec probe would add a JVM launch per probe interval
+            # to a pod that is already the heaviest thing in this namespace.
+            tcpSocket: { port: kafka }
+            initialDelaySeconds: 10
+            periodSeconds:       5
+            timeoutSeconds:      3
+            failureThreshold:    12
+          livenessProbe:
+            tcpSocket: { port: kafka }
+            initialDelaySeconds: 60
+            periodSeconds:       20
+            timeoutSeconds:      3
+            failureThreshold:    3
+          resources:
+            requests: { cpu: 200m, memory: 512Mi }
+            limits:   { memory: 1Gi }
+      volumes:
+        - name: data
+          emptyDir: {}

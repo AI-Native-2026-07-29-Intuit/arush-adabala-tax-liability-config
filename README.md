@@ -7,17 +7,36 @@ This is the **config** half of a two-repo split created on W6 D2. The applicatio
 ## Repo layout
 
 ```
-base/                              W5 D3 manifests, copied verbatim, identical in every env
-  kustomization.yaml               + intra-Application sync waves (config/stores before workload)
-  05-dev-dependencies.yaml         postgres / redis / mongo Deployments + Services
-  10-taxcalc-api.deployment.yaml
-  20-taxcalc-api.service.yaml
-  30-taxcalc-api.configmap.yaml
-  50-taxcalc-api.hpa.yaml
-  60-taxcalc-api.ingress.yaml
-  70-taxcalc-api.servicemonitor.yaml
+k8s/taxcalc-api/                   the manifest set every environment shares. Named for the
+                                   W6 D5 deliverable's own paths; was `base/` with NN- ordering
+                                   prefixes until the prefixes turned out to order nothing -
+                                   apply order is the sync-wave patches in kustomization.yaml
+  kustomization.yaml               resource list + intra-Application sync waves (stores first)
+  dev-dependencies.yaml            postgres / redis / mongo Deployments + Services
+  kafka.yaml                       W6 D5 - a REAL KRaft broker; W5 D3 shipped a DNS placeholder
+  kafka-bootstrap.job.yaml         W6 D5 - wave-0 hook: creates the topic and seeds the consumer
+                                   group's offset, so a FRESH deploy rests at 0/0 instead of at
+                                   1 replica on an invalid offset
+  taxcalc-api.deployment.yaml
+  taxcalc-api.service.yaml
+  taxcalc-worker.deployment.yaml       W6 D5 - the KEDA scale target (same image, worker profile)
+  taxcalc-worker-scaledobject.yaml     W6 D5 - KEDA on taxpayers.events consumer-group lag
+  taxcalc-api.configmap.yaml
+  hpa.yaml                         W6 D5 - now on taxcalc_inflight_requests, no longer on CPU.
+                                   Object renamed taxcalc-api -> taxcalc-api-hpa: the old name made
+                                   the deliverable's own `get hpa taxcalc-api-hpa` return NotFound
+  pdb.yaml                         W6 D5 - minAvailable 2, paired with the HPA floor
+  taxcalc-api.ingress.yaml
+  taxcalc-api.servicemonitor.yaml
+  prometheus-adapter-values.yaml   W6 D5 - Helm VALUES, not a manifest; the rule the HPA reads
+k8s/aws-authored/                  W6 D5 - AUTHOR-AND-DEFEND. Never applied to k3d; each file
+  karpenter-nodepool.yaml          opens by saying why it cannot run here. A SIBLING of
+  adot-collector.yaml              k8s/taxcalc-api/, deliberately not a child: no kustomization.yaml
+  taxcalc-worker-scaledobject.sqs.yaml   lists these, and nothing under k8s/ is applied by
+  cfn/taxcalc-observability-dev.yaml     directory - the overlays name k8s/taxcalc-api explicitly
 overlays/
   dev/kustomization.yaml           namespace + replicas + image tag + Spring profile + log level + host
+  loadtest/kustomization.yaml      W6 D5 - applied by hand for a k6 run; NOT in the ApplicationSet
   staging/kustomization.yaml
   prod/kustomization.yaml
 argocd/
@@ -40,6 +59,41 @@ cfn/                               W6 D3 - the AWS substrate everything above ru
 taxcalc-api/
   INFRA.md                         the substrate write-up - stacks, ordering, ChangeSets, drift
 ```
+
+## W6 D5 — two autoscalers, and the one that is only as big as the quota
+
+`k8s/taxcalc-api/` gains a real Kafka broker, a worker Deployment, a KEDA `ScaledObject` on consumer-group
+lag, a `PodDisruptionBudget`, and an HPA that no longer scales on CPU. Measured on k3d: KEDA drove
+the worker `0 → 7 → 0` on 60,000 synthetic records, and the HPA logged
+`SuccessfulRescale … New size: 10`.
+
+**The api Deployment stops consuming `taxcalc-read-model-builder`, and that one env var is the
+load-bearing change here.** Lag is a property of a consumer group, not of a Deployment. The api
+runs the same image as the worker, so once a real broker existed the api pods drained the very lag
+KEDA scales the worker on — and two or three of them keep a dev-rate topic at zero however much is
+produced. The ScaledObject stays `READY=True`, the trigger is valid, the read model *is* updated by
+the wrong pods, and the worker simply never leaves `minReplicaCount: 0`.
+
+**The HPA scaled to 10 and got 2, and the reason is in `platform/00-namespaces.yaml`.** The
+ReplicaSet was refused with `exceeded quota: requested: limits.cpu=500m, used: limits.cpu=8`. No
+container in `k8s/taxcalc-api/` declares `limits.cpu` — W5 D3 omitted it on purpose to avoid CFS throttling —
+so that 500m is the LimitRange's `default` applied at admission. Every pod spends 500m of an 8-CPU
+quota, the namespace tops out near sixteen pods across all workloads, and `maxReplicas: 20` is
+unreachable by a factor of five. The HPA reports success, the Deployment reports `2/10` forever,
+and the only trace is a ReplicaSet event. An autoscaler's maximum is a request; the quota is the
+answer.
+
+`prometheus-adapter-values.yaml` is a Helm values file and is deliberately **not** in
+`k8s/taxcalc-api/kustomization.yaml`'s `resources` — the adapter is cluster infrastructure, but the *rule* is
+application-specific, and separating the rule from the HPA that reads it is how the two drift into
+naming different metrics.
+
+`overlays/loadtest/` is applied by hand for the duration of a k6 run and is deliberately not wired
+into the ApplicationSet: an environment Argo CD reconciles is one that can be left switched on by
+accident.
+
+`k8s/aws-authored/` is written and reviewed, never deployed. The full defence is in the application
+repo's [`SRE-CAPSTONE.md`](https://github.com/AI-Native-2026-07-29-Intuit/arush-adabala-tax-liability/blob/main/SRE-CAPSTONE.md).
 
 ## The reconcile loop
 
@@ -90,9 +144,9 @@ gem install cfn-nag -v 0.8.10 && cfn_nag_scan --input-path cfn --fail-on-warning
 
 **The drift asymmetry is worth knowing before trusting this layer.** The Kubernetes half of this repo self-heals: a drifted ConfigMap in `taxcalc-dev` is reverted in about 10 seconds, measured. The AWS half has no equivalent — `detect-stack-drift` is a point-in-time poll somebody runs, nothing schedules it, and unsupported resource types come back `NOT_CHECKED` rather than failing loudly. **This layer does not even alarm on drift, let alone correct it.** A scheduled detection job is on the W6 D5 list.
 
-## Four things that are deliberately not in `base/`
+## Four things that are deliberately not in `k8s/taxcalc-api/`
 
-**No `Namespace` object in `base/`.** The AppProject sets `clusterResourceWhitelist: []` — a full deny on every cluster-scoped kind. Argo CD classifies a resource as cluster- or namespace-scoped from the API server's discovery data, not from whether the manifest happens to carry a `namespace:` field, so a `Namespace` in the manifest set is rejected regardless of what `namespaceResourceWhitelist` says.
+**No `Namespace` object in `k8s/taxcalc-api/`.** The AppProject sets `clusterResourceWhitelist: []` — a full deny on every cluster-scoped kind. Argo CD classifies a resource as cluster- or namespace-scoped from the API server's discovery data, not from whether the manifest happens to carry a `namespace:` field, so a `Namespace` in the manifest set is rejected regardless of what `namespaceResourceWhitelist` says.
 
 **And `CreateNamespace=true` does not rescue that — it is denied by the same list.** Argo CD implements the option by injecting a Namespace into the sync task list, and the injected resource is checked against `clusterResourceWhitelist` like any other. Measured with a scratch project carrying the identical `[]` deny, pointed at a namespace that did not exist:
 
@@ -105,7 +159,7 @@ Error from server (NotFound): namespaces "taxcalc-nsproof" not found
 
 So **namespaces here are strictly platform-provisioned**: a new environment must be added to `platform/00-namespaces.yaml` *before* it is added to the ApplicationSet's element list, or its first sync fails. `CreateNamespace=true` stays in the syncOptions because it is the correct setting the moment the project is granted the `Namespace` kind — but nothing depends on it today.
 
-**No `ResourceQuota` or `LimitRange` in `base/`.** Both are named in the AppProject's `namespaceResourceBlacklist`. A team that can edit its own quota does not have a quota.
+**No `ResourceQuota` or `LimitRange` in `k8s/taxcalc-api/`.** Both are named in the AppProject's `namespaceResourceBlacklist`. A team that can edit its own quota does not have a quota.
 
 Both live in `platform/00-namespaces.yaml` and are applied out-of-band by the platform team:
 
@@ -115,7 +169,7 @@ kubectl apply -f platform/00-namespaces.yaml
 kubectl apply -f platform/secret/40-taxcalc-api.secret.yaml
 ```
 
-**No `Secret` in `base/`, and this one was learned the hard way.** The W5 D3 file carried a placeholder password. Under `kubectl apply -f manifests/` that placeholder was *inert* — CI reseeded the Secret from a real store after applying, so the last writer held a real value. Continuous reconciliation removes that ordering: on the first sync Argo CD wrote the placeholder over the seeded password and every api pod started failing `FATAL: password authentication failed for user "taxcalc_dev"`. With `selfHeal: true` a hand re-seed survives exactly one reconcile interval, so the failure returns a few minutes later — strictly harder to debug than failing outright. A placeholder secret inside a continuously-reconciled manifest set is worse than no secret in the set at all. The shape lives in `platform/secret/40-taxcalc-api.secret.yaml`; the value is seeded out-of-band with **`delete` then `create`, never `apply`** (see that file for why the tracking label matters).
+**No `Secret` in `k8s/taxcalc-api/`, and this one was learned the hard way.** The W5 D3 file carried a placeholder password. Under `kubectl apply -f manifests/` that placeholder was *inert* — CI reseeded the Secret from a real store after applying, so the last writer held a real value. Continuous reconciliation removes that ordering: on the first sync Argo CD wrote the placeholder over the seeded password and every api pod started failing `FATAL: password authentication failed for user "taxcalc_dev"`. With `selfHeal: true` a hand re-seed survives exactly one reconcile interval, so the failure returns a few minutes later — strictly harder to debug than failing outright. A placeholder secret inside a continuously-reconciled manifest set is worse than no secret in the set at all. The shape lives in `platform/secret/40-taxcalc-api.secret.yaml`; the value is seeded out-of-band with **`delete` then `create`, never `apply`** (see that file for why the tracking label matters).
 
 The Slack webhook that `argocd-system/notifications-cm.yaml` references lives in `argocd-notifications-secret`, created out-of-band and never committed. W6 D3 replaces both with External Secrets Operator + IRSA.
 
@@ -194,7 +248,7 @@ kubectl -n argocd rollout restart deploy/argocd-notifications-controller
 
 **A change freeze freezes self-healing too.** The AppProject's `syncWindows` deny block (Fri 17:00 → Mon 05:00 UTC) stops *all* automated sync to `taxcalc-api-prod`, `selfHeal` included. Patching a ConfigMap in `taxcalc-prod` during the window left the drift in place for 240 s with the controller logging `Sync prevented by sync window`; the identical patch in `taxcalc-dev` was reverted in **10 seconds**. That is not a bug, but it is a trade-off nobody mentions when adding a freeze: for its duration prod is unprotected against drift as well as against deploys, and only a human `manualSync` closes the gap.
 
-**`Deployment.spec.replicas` is in `ignoreDifferences`, so scaling is not drift here.** `base/50-taxcalc-api.hpa.yaml` sets `minReplicas: 2` while the overlays set 1 / 2 / 3 — Git owns the value the Deployment is *created* with, the HPA owns it thereafter. `kubectl scale` is therefore *not* reverted, and that is correct; use a ConfigMap value if you want to watch `selfHeal` work.
+**`Deployment.spec.replicas` is in `ignoreDifferences`, so scaling is not drift here.** `k8s/taxcalc-api/hpa.yaml` sets `minReplicas: 2` while the overlays set 1 / 2 / 3 — Git owns the value the Deployment is *created* with, the HPA owns it thereafter. `kubectl scale` is therefore *not* reverted, and that is correct; use a ConfigMap value if you want to watch `selfHeal` work.
 
 **Never add `finalizers:` to the ApplicationSet template.** It silently defeats `preserveResourcesOnDeletion: true` — dropping an env from the list generator would then take its whole workload with it. See that file's header.
 

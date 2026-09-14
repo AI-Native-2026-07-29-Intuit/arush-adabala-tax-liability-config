@@ -15,7 +15,7 @@
 # Application and asserts the specific refusal. The sixth is the positive
 # control that stops this script from passing by refusing everything. The last
 # three are static and run offline: they assert that nobody has put a denied
-# kind back into base/, which is the mistake most likely to be made in good
+# kind back into k8s/taxcalc-api/, which is the mistake most likely to be made in good
 # faith, since this deliverable's own reference layout puts 00-namespace.yaml
 # there.
 #
@@ -29,10 +29,10 @@
 #   7-9 STATIC           each overlay renders no denied kind       -> clean
 #
 # Checks 3-5 are driven from ONE scratch Application pointed at platform/,
-# which is exactly the set of objects deliberately excluded from base/. That
+# which is exactly the set of objects deliberately excluded from k8s/taxcalc-api/. That
 # is the point: platform/ is not an arbitrary bad input, it is the real
 # manifest set the project is supposed to refuse, so this script fails the
-# moment somebody "helpfully" moves those files back into base/.
+# moment somebody "helpfully" moves those files back into k8s/taxcalc-api/.
 #
 # WHY platform/secret/ IS A SUBDIRECTORY, AND WHY THAT MATTERS HERE.
 # Checks 3-5 work by asking Argo CD to SYNC that Application and reading the
@@ -214,7 +214,7 @@ esac
 # 7. STATIC CHECK - the overlays must not render a kind this project denies.
 #
 # Checks 1-5 prove the project refuses those kinds. This one proves nobody has
-# quietly put them back into base/, which is a different failure and a much
+# quietly put them back into k8s/taxcalc-api/, which is a different failure and a much
 # easier mistake to make: the reference layout for this deliverable puts
 # 00-namespace.yaml in base/, so "restoring" it looks like fixing a deviation
 # rather than breaking the sync.
