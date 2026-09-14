@@ -77,6 +77,16 @@ spec:
         app.kubernetes.io/part-of:    taxcalc
         app.kubernetes.io/managed-by: argocd
     spec:
+      # W6 D5: the batch tier. This is the line that makes the worker's scaling
+      # bounded by platform policy rather than by whatever memory happens to be
+      # free - it selects the taxcalc-dev-batch quota in
+      # platform/00-namespaces.yaml, which caps this Deployment at 4 pods.
+      #
+      # KEDA's maxReplicaCount stays 20 on purpose. That is an application
+      # statement about how much parallelism the work can use; the cap is a
+      # platform statement about who may starve whom. Lag is recoverable; the
+      # api's error budget is not.
+      priorityClassName: taxcalc-batch
       securityContext:
         runAsNonRoot: true
         runAsUser:    65532   # the distroless UID from W5 D1
